@@ -203,6 +203,28 @@ def test_run_training_profile_rejects_non_production_batch_partitioning(
         )
 
 
+def test_synchronize_uses_lazy_torch_import(monkeypatch: pytest.MonkeyPatch) -> None:
+    from toolkits.training_eval import run
+
+    calls: list[Any] = []
+
+    class FakeCuda:
+        @staticmethod
+        def synchronize(device: Any) -> None:
+            calls.append(device)
+
+    monkeypatch.setattr(
+        run,
+        "_import_torch",
+        lambda: SimpleNamespace(cuda=FakeCuda()),
+    )
+    device = SimpleNamespace(type="cuda")
+
+    run._synchronize(device)
+
+    assert calls == [device]
+
+
 def _mlp_profile_cfg(update_epoch: int) -> Any:
     return OmegaConf.create(
         {
