@@ -37,7 +37,10 @@ def run_orchestration(
             estimates.append(estimate_candidate(candidate, config_summary, throughput))
         except Exception as exc:
             failed_profiles.append(
-                {"candidate_id": candidate.candidate_id, "error": str(exc)}
+                {
+                    "candidate_id": candidate.candidate_id,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
             )
 
     plan_output_str = str(plan_output)

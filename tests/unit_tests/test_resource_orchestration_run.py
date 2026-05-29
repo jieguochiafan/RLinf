@@ -37,6 +37,17 @@ class FailingProfiler:
         raise RuntimeError(f"profile failed for {candidate.candidate_id}")
 
 
+class MixedProfiler:
+    def profile(self, candidate: CandidatePair) -> StageThroughput:
+        if (candidate.actor_sm, candidate.rollout_sm) == (30, 70):
+            raise RuntimeError("boom")
+        return StageThroughput(
+            env_chunk_steps_per_sec=10,
+            model_chunk_steps_per_sec=10,
+            actor_chunk_steps_per_sec=20,
+        )
+
+
 def _summary() -> ConfigSummary:
     return ConfigSummary(
         total_num_envs=8,
@@ -107,6 +118,36 @@ def test_run_orchestration_profiles_estimates_writes_plan_and_reports(
     assert plan["bindings"][1]["gpu"]["sm_percent"] == 70
 
 
+def test_run_orchestration_writes_plan_and_reports_mixed_profile_failures(
+    tmp_path,
+) -> None:
+    plan_output = tmp_path / "plan.json"
+
+    selection = run_orchestration(
+        config_summary=_summary(),
+        base_bindings=_base_bindings(),
+        candidates=[
+            CandidatePair(actor_sm=30, rollout_sm=70),
+            CandidatePair(actor_sm=70, rollout_sm=30),
+        ],
+        profiler=MixedProfiler(),
+        output_dir=tmp_path,
+        plan_output=plan_output,
+    )
+
+    summary = json.loads((tmp_path / "summary.json").read_text(encoding="utf-8"))
+
+    assert plan_output.exists()
+    assert selection.selected.candidate == CandidatePair(actor_sm=70, rollout_sm=30)
+    assert summary["selected"]["candidate_id"] == "actor70_rollout30"
+    assert summary["failed_profiles"] == [
+        {
+            "candidate_id": "actor30_rollout70",
+            "error": "RuntimeError: boom",
+        }
+    ]
+
+
 def test_run_orchestration_reports_failures_without_plan_when_all_candidates_fail(
     tmp_path,
 ) -> None:
@@ -132,10 +173,10 @@ def test_run_orchestration_reports_failures_without_plan_when_all_candidates_fai
     assert summary["failed_profiles"] == [
         {
             "candidate_id": "actor30_rollout70",
-            "error": "profile failed for actor30_rollout70",
+            "error": "RuntimeError: profile failed for actor30_rollout70",
         },
         {
             "candidate_id": "actor70_rollout30",
-            "error": "profile failed for actor70_rollout30",
+            "error": "RuntimeError: profile failed for actor70_rollout30",
         },
     ]
