@@ -21,8 +21,8 @@ def select_best_candidate(
         return (
             epoch_penalty,
             estimate.balance_gap_s,
-            estimate.epoch_time_s,
             -estimate.candidate.actor_sm,
+            estimate.epoch_time_s,
         )
 
     ranked = tuple(sorted(estimates, key=sort_key))
