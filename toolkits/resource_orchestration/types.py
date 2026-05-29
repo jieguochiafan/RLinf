@@ -35,7 +35,11 @@ class ConfigSummary:
 
 @dataclass(frozen=True)
 class StageThroughput:
-    """Measured throughput for each orchestration stage."""
+    """Measured throughput for each orchestration stage.
+
+    actor_chunk_steps_per_sec is full actor training-stage throughput and
+    already includes the repeated update_epoch training cost.
+    """
 
     env_chunk_steps_per_sec: float
     model_chunk_steps_per_sec: float

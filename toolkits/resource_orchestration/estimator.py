@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 from toolkits.resource_orchestration.types import (
     CandidateEstimate,
     CandidatePair,
@@ -8,18 +10,23 @@ from toolkits.resource_orchestration.types import (
 )
 
 
+def _require_positive(throughput: StageThroughput) -> None:
+    values = (
+        throughput.env_chunk_steps_per_sec,
+        throughput.model_chunk_steps_per_sec,
+        throughput.actor_chunk_steps_per_sec,
+    )
+    if any(not math.isfinite(value) or value <= 0 for value in values):
+        raise ValueError("stage throughput values must be finite and positive")
+
+
 def estimate_candidate(
     candidate: CandidatePair,
     summary: ConfigSummary,
     throughput: StageThroughput,
 ) -> CandidateEstimate:
     """Estimate rollout/training timing for a candidate allocation."""
-    if (
-        throughput.env_chunk_steps_per_sec <= 0
-        or throughput.model_chunk_steps_per_sec <= 0
-        or throughput.actor_chunk_steps_per_sec <= 0
-    ):
-        raise ValueError("stage throughput values must be positive")
+    _require_positive(throughput)
 
     rollout_bottleneck_tput = min(
         throughput.env_chunk_steps_per_sec,

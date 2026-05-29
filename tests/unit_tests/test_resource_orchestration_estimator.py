@@ -53,3 +53,17 @@ def test_estimate_candidate_rejects_zero_throughput() -> None:
 
     with pytest.raises(ValueError, match="throughput"):
         estimate_candidate(CandidatePair(actor_sm=30, rollout_sm=70), _summary(), throughput)
+
+
+@pytest.mark.parametrize("invalid_tput", [float("nan"), float("inf")])
+def test_estimate_candidate_rejects_non_finite_throughput(
+    invalid_tput: float,
+) -> None:
+    throughput = StageThroughput(
+        env_chunk_steps_per_sec=32,
+        model_chunk_steps_per_sec=invalid_tput,
+        actor_chunk_steps_per_sec=64,
+    )
+
+    with pytest.raises(ValueError, match="throughput"):
+        estimate_candidate(CandidatePair(actor_sm=30, rollout_sm=70), _summary(), throughput)
