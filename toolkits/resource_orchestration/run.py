@@ -8,6 +8,11 @@ from toolkits.resource_orchestration.config_loader import (
     load_base_bindings,
     load_hydra_config,
 )
+from toolkits.resource_orchestration.orchestrator import run_orchestration
+from toolkits.resource_orchestration.profilers import (
+    ToolkitThroughputProfiler,
+    default_profile_functions,
+)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -27,16 +32,32 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: list[str] | None = None) -> None:
-    """Validate resource orchestration inputs."""
+    """Run resource orchestration from CLI inputs."""
     args = parse_args(argv)
     cfg = load_hydra_config(
         args.config_path,
         args.config_name,
         overrides=tuple(args.override),
     )
-    build_config_summary(cfg)
-    parse_candidate_pairs(args.candidate_pairs)
-    load_base_bindings(cfg, args.base_plan)
+    summary = build_config_summary(cfg)
+    candidates = parse_candidate_pairs(args.candidate_pairs)
+    base_bindings = load_base_bindings(cfg=cfg, base_plan=args.base_plan)
+    profiler = ToolkitThroughputProfiler(
+        cfg=cfg,
+        summary=summary,
+        warmup_steps=args.warmup_steps,
+        measure_steps=args.measure_steps,
+        functions=default_profile_functions(),
+    )
+    run_orchestration(
+        config_summary=summary,
+        base_bindings=base_bindings,
+        candidates=candidates,
+        profiler=profiler,
+        output_dir=args.output_dir,
+        plan_output=args.plan_output,
+        selection_tolerance=args.selection_tolerance,
+    )
 
 
 if __name__ == "__main__":
