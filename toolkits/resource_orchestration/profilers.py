@@ -38,17 +38,22 @@ def combine_profile_metrics(
     model_infers_per_sec: float,
     actor_chunk_steps_per_sec: float,
     chunk_size: int,
+    total_num_envs: int,
     pipeline_samples_per_sec: float | None = None,
 ) -> StageThroughput:
     """Combine raw profiler metrics into orchestration stage throughput."""
     return StageThroughput(
-        env_chunk_steps_per_sec=float(env_steps_per_sec) / float(chunk_size),
-        model_chunk_steps_per_sec=float(model_infers_per_sec),
+        env_chunk_steps_per_sec=(
+            float(env_steps_per_sec) * float(total_num_envs) / float(chunk_size)
+        ),
+        model_chunk_steps_per_sec=(
+            float(model_infers_per_sec) * float(total_num_envs)
+        ),
         actor_chunk_steps_per_sec=float(actor_chunk_steps_per_sec),
         pipeline_samples_per_sec=(
             None
             if pipeline_samples_per_sec is None
-            else float(pipeline_samples_per_sec)
+            else float(pipeline_samples_per_sec) * float(total_num_envs)
         ),
     )
 
@@ -83,6 +88,7 @@ class ToolkitThroughputProfiler:
             model_infers_per_sec=rollout_metrics["model_infers_per_sec"],
             actor_chunk_steps_per_sec=training_metrics["actor_chunk_steps_per_sec"],
             chunk_size=self.summary.chunk_size,
+            total_num_envs=self.summary.total_num_envs,
             pipeline_samples_per_sec=rollout_metrics.get("pipeline_samples_per_sec"),
         )
 
@@ -129,7 +135,7 @@ def default_rollout_profile(
 
     try:
         _replace_environ(process_env)
-        env_adapter = build_env_adapter(cfg, split="eval", profile_output_dir=None)
+        env_adapter = build_env_adapter(cfg, split="train", profile_output_dir=None)
         env_result = run_env_only_case(
             env_adapter=env_adapter,
             warmup_steps=warmup_steps,
@@ -138,7 +144,7 @@ def default_rollout_profile(
 
         template_env_adapter = build_env_adapter(
             cfg,
-            split="eval",
+            split="train",
             profile_output_dir=None,
         )
         obs_batch, _ = template_env_adapter.reset()

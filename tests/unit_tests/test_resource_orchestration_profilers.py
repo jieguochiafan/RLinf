@@ -85,13 +85,14 @@ def test_combine_profile_metrics_converts_env_steps_to_chunk_steps() -> None:
         model_infers_per_sec=12.5,
         actor_chunk_steps_per_sec=7.0,
         chunk_size=4,
+        total_num_envs=8,
         pipeline_samples_per_sec=3.0,
     )
 
-    assert throughput.env_chunk_steps_per_sec == 20.0
-    assert throughput.model_chunk_steps_per_sec == 12.5
+    assert throughput.env_chunk_steps_per_sec == 160.0
+    assert throughput.model_chunk_steps_per_sec == 100.0
     assert throughput.actor_chunk_steps_per_sec == 7.0
-    assert throughput.pipeline_samples_per_sec == 3.0
+    assert throughput.pipeline_samples_per_sec == 24.0
 
 
 def test_toolkit_throughput_profiler_calls_injected_functions() -> None:
@@ -158,10 +159,10 @@ def test_toolkit_throughput_profiler_calls_injected_functions() -> None:
         ("rollout", cfg, candidate, None, 1, 3),
         ("training", cfg, candidate, summary, 1, 3),
     ]
-    assert throughput.env_chunk_steps_per_sec == 25.0
-    assert throughput.model_chunk_steps_per_sec == 25.0
+    assert throughput.env_chunk_steps_per_sec == 200.0
+    assert throughput.model_chunk_steps_per_sec == 200.0
     assert throughput.actor_chunk_steps_per_sec == 11.0
-    assert throughput.pipeline_samples_per_sec == 9.0
+    assert throughput.pipeline_samples_per_sec == 72.0
 
 
 def test_default_training_profile_rejects_unsupported_default_model() -> None:
@@ -206,11 +207,13 @@ def test_default_rollout_profile_uses_mps_env_and_returns_metrics(
         env["ROLL_OUT_TEST_MARKER"] = "active"
         return env
 
+    build_env_adapter_splits: list[str] = []
+
     def build_env_adapter(
         profile_cfg: Any, *, split: str, profile_output_dir: Any
     ) -> EnvAdapter:
         assert profile_cfg is cfg
-        assert split == "eval"
+        build_env_adapter_splits.append(split)
         assert profile_output_dir is None
         assert os.environ["ROLL_OUT_TEST_MARKER"] == "active"
         adapter = EnvAdapter()
@@ -268,6 +271,7 @@ def test_default_rollout_profile_uses_mps_env_and_returns_metrics(
     )
 
     assert build_process_env_calls == [35]
+    assert build_env_adapter_splits == ["train", "train"]
     assert metrics == {
         "env_steps_per_sec": 123.0,
         "model_infers_per_sec": 45.0,
