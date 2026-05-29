@@ -4,6 +4,7 @@ import math
 import os
 import time
 from collections.abc import Callable, Mapping
+from contextlib import contextmanager
 from typing import Any
 
 import torch
@@ -84,33 +85,31 @@ def _run_default_training_profile(
     if warmup_steps < 0:
         raise ValueError(f"warmup_steps must be >= 0, got {warmup_steps}")
 
-    if actor_sm > 0:
-        os.environ.setdefault("CUDA_MPS_ACTIVE_THREAD_PERCENTAGE", str(actor_sm))
+    with _temporary_mps_percentage(actor_sm):
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model = _build_mlp_policy(cfg).to(device=device, dtype=torch.float32)
+        model.train()
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=float(_select(cfg, "actor.optim.lr", default=1.0e-3)),
+            betas=(
+                float(_select(cfg, "actor.optim.adam_beta1", default=0.9)),
+                float(_select(cfg, "actor.optim.adam_beta2", default=0.999)),
+            ),
+            eps=float(_select(cfg, "actor.optim.adam_eps", default=1.0e-8)),
+            weight_decay=float(_select(cfg, "actor.optim.weight_decay", default=0.0)),
+        )
+        batch = _make_mlp_training_batch(cfg, rollout_chunk_count, device)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = _build_mlp_policy(cfg).to(device=device, dtype=torch.float32)
-    model.train()
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=float(_select(cfg, "actor.optim.lr", default=1.0e-3)),
-        betas=(
-            float(_select(cfg, "actor.optim.adam_beta1", default=0.9)),
-            float(_select(cfg, "actor.optim.adam_beta2", default=0.999)),
-        ),
-        eps=float(_select(cfg, "actor.optim.adam_eps", default=1.0e-8)),
-        weight_decay=float(_select(cfg, "actor.optim.weight_decay", default=0.0)),
-    )
-    batch = _make_mlp_training_batch(cfg, rollout_chunk_count, device)
+        for _ in range(warmup_steps):
+            _run_profile_iteration(cfg, model, optimizer, batch, rollout_chunk_count)
+        _synchronize(device)
 
-    for _ in range(warmup_steps):
-        _run_profile_iteration(cfg, model, optimizer, batch, rollout_chunk_count)
-    _synchronize(device)
-
-    start = time.perf_counter()
-    for _ in range(measure_steps):
-        _run_profile_iteration(cfg, model, optimizer, batch, rollout_chunk_count)
-    _synchronize(device)
-    elapsed_s = time.perf_counter() - start
+        start = time.perf_counter()
+        for _ in range(measure_steps):
+            _run_profile_iteration(cfg, model, optimizer, batch, rollout_chunk_count)
+        _synchronize(device)
+        elapsed_s = time.perf_counter() - start
 
     actor_chunk_steps_per_sec = (rollout_chunk_count * measure_steps) / elapsed_s
     return {"actor_chunk_steps_per_sec": actor_chunk_steps_per_sec}
@@ -255,6 +254,21 @@ def _select(cfg: Any, path: str, default: Any = None) -> Any:
     if value is None and default is None:
         raise ValueError(f"missing required config value: {path}")
     return value
+
+
+@contextmanager
+def _temporary_mps_percentage(actor_sm: int):
+    env_name = "CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"
+    original = os.environ.get(env_name)
+    if actor_sm > 0:
+        os.environ[env_name] = str(actor_sm)
+    try:
+        yield
+    finally:
+        if original is None:
+            os.environ.pop(env_name, None)
+        else:
+            os.environ[env_name] = original
 
 
 def _synchronize(device: torch.device) -> None:

@@ -88,6 +88,33 @@ def test_run_training_profile_runs_default_mlp_policy_backend(
     assert metrics["actor_chunk_steps_per_sec"] > 0.0
 
 
+def test_run_training_profile_restores_mps_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from toolkits.training_eval import run
+
+    monkeypatch.setattr(run, "TRAINING_PROFILE_RUNNER", None)
+    monkeypatch.setenv("CUDA_MPS_ACTIVE_THREAD_PERCENTAGE", "25")
+    observed_mps: list[str | None] = []
+
+    def fake_profile_iteration(*_args: Any, **_kwargs: Any) -> None:
+        observed_mps.append(run.os.environ.get("CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"))
+
+    monkeypatch.setattr(run, "_run_profile_iteration", fake_profile_iteration)
+
+    metrics = run.run_training_profile(
+        cfg=_mlp_profile_cfg(update_epoch=1),
+        actor_sm=70,
+        warmup_steps=0,
+        measure_steps=1,
+        rollout_chunk_count=4,
+    )
+
+    assert metrics["actor_chunk_steps_per_sec"] > 0.0
+    assert observed_mps == ["70"]
+    assert run.os.environ["CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"] == "25"
+
+
 def test_run_training_profile_default_backend_rejects_complex_model(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
