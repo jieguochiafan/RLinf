@@ -57,6 +57,29 @@ def test_select_best_candidate_uses_balance_within_tolerance() -> None:
     assert result.ranked == (balanced, faster_unbalanced)
 
 
+def test_select_best_candidate_uses_epoch_time_after_balance_tie() -> None:
+    faster_lower_actor = _estimate(
+        actor_sm=40,
+        rollout_sm=60,
+        rollout_time_s=10,
+        training_time_s=8,
+    )
+    slower_higher_actor = _estimate(
+        actor_sm=50,
+        rollout_sm=50,
+        rollout_time_s=10.2,
+        training_time_s=8.2,
+    )
+
+    result = select_best_candidate(
+        (faster_lower_actor, slower_higher_actor), tolerance=0.03
+    )
+
+    assert faster_lower_actor.balance_gap_s == slower_higher_actor.balance_gap_s
+    assert result.selected == faster_lower_actor
+    assert result.ranked == (faster_lower_actor, slower_higher_actor)
+
+
 def test_select_best_candidate_prefers_higher_actor_sm_after_ties() -> None:
     lower_actor = _estimate(
         actor_sm=40, rollout_sm=60, rollout_time_s=8, training_time_s=7

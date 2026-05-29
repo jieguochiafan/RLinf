@@ -15,10 +15,15 @@ def select_best_candidate(
 
     best_epoch_time_s = min(estimate.epoch_time_s for estimate in estimates)
 
-    def sort_key(estimate: CandidateEstimate) -> tuple[float, float, int]:
+    def sort_key(estimate: CandidateEstimate) -> tuple[float, float, float, int]:
         within_tolerance = estimate.epoch_time_s <= best_epoch_time_s * (1 + tolerance)
         epoch_penalty = 0.0 if within_tolerance else estimate.epoch_time_s
-        return (epoch_penalty, estimate.balance_gap_s, -estimate.candidate.actor_sm)
+        return (
+            epoch_penalty,
+            estimate.balance_gap_s,
+            estimate.epoch_time_s,
+            -estimate.candidate.actor_sm,
+        )
 
     ranked = tuple(sorted(estimates, key=sort_key))
     return SelectionResult(selected=ranked[0], ranked=ranked)
