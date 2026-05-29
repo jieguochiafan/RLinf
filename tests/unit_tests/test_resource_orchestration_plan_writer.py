@@ -31,6 +31,45 @@ def _binding(
     )
 
 
+def _base_bindings(actor_cpu: CpuBinding) -> dict[str, list[WorkerResourceBinding]]:
+    return {
+        "actor": [
+            _binding(
+                "actor",
+                rank=0,
+                cpu=actor_cpu,
+                gpu=GpuBinding(
+                    mode="mps",
+                    sm_percent=50,
+                    visible_devices=("0",),
+                    parent_gpu=0,
+                ),
+            )
+        ],
+        "rollout": [
+            _binding(
+                "rollout",
+                rank=1,
+                cpu=CpuBinding(process_cpu_cores=(2, 3)),
+                gpu=GpuBinding(
+                    mode="mps",
+                    sm_percent=50,
+                    visible_devices=("0",),
+                    parent_gpu=0,
+                ),
+            )
+        ],
+        "env": [
+            _binding(
+                "env",
+                rank=2,
+                cpu=CpuBinding(process_cpu_cores=(4, 5)),
+                gpu=None,
+            )
+        ],
+    }
+
+
 def test_write_mps_plan_updates_actor_and_rollout_sm_and_preserves_bindings(
     tmp_path,
 ) -> None:
@@ -38,37 +77,8 @@ def test_write_mps_plan_updates_actor_and_rollout_sm_and_preserves_bindings(
         process_cpu_cores=(0, 1),
         env_cpu_core_groups=((0,), (1,)),
     )
-    base_bindings = [
-        _binding(
-            "actor",
-            rank=0,
-            cpu=actor_cpu,
-            gpu=GpuBinding(
-                mode="mps",
-                sm_percent=50,
-                visible_devices=("0",),
-                parent_gpu=0,
-            ),
-        ),
-        _binding(
-            "rollout",
-            rank=1,
-            cpu=CpuBinding(process_cpu_cores=(2, 3)),
-            gpu=GpuBinding(
-                mode="mps",
-                sm_percent=50,
-                visible_devices=("0",),
-                parent_gpu=0,
-            ),
-        ),
-        _binding(
-            "env",
-            rank=2,
-            cpu=CpuBinding(process_cpu_cores=(4, 5)),
-            gpu=None,
-        ),
-    ]
-    output_path = tmp_path / "mps_plan.json"
+    base_bindings = _base_bindings(actor_cpu)
+    output_path = tmp_path / "nested" / "plans" / "mps_plan.json"
 
     write_mps_plan(output_path, base_bindings, CandidatePair(actor_sm=30, rollout_sm=70))
 
@@ -97,20 +107,22 @@ def test_write_mps_plan_updates_actor_and_rollout_sm_and_preserves_bindings(
 def test_build_mps_plan_payload_rejects_non_mps_actor_rollout_gpu(
     component: str,
 ) -> None:
-    base_bindings = [
-        _binding(
-            component,
-            rank=0,
-            cpu=None,
-            gpu=GpuBinding(
-                mode="mig",
-                sm_percent=50,
-                visible_devices=("MIG-0",),
-                mig_device_uuid="MIG-0",
-                parent_gpu=0,
-            ),
-        )
-    ]
+    base_bindings = {
+        component: [
+            _binding(
+                component,
+                rank=0,
+                cpu=None,
+                gpu=GpuBinding(
+                    mode="mig",
+                    sm_percent=50,
+                    visible_devices=("MIG-0",),
+                    mig_device_uuid="MIG-0",
+                    parent_gpu=0,
+                ),
+            )
+        ]
+    }
 
     with pytest.raises(ValueError, match="mps"):
         build_mps_plan_payload(
