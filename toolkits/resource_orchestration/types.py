@@ -31,3 +31,27 @@ class ConfigSummary:
     actor_micro_batch_size: int
     pipeline_stage_num: int
     resource_pool_mode: str
+
+
+@dataclass(frozen=True)
+class StageThroughput:
+    """Measured throughput for each orchestration stage."""
+
+    env_chunk_steps_per_sec: float
+    model_chunk_steps_per_sec: float
+    actor_chunk_steps_per_sec: float
+    pipeline_samples_per_sec: float | None = None
+
+
+@dataclass(frozen=True)
+class CandidateEstimate:
+    """Timing estimate for a resource orchestration candidate."""
+
+    candidate: CandidatePair
+    throughput: StageThroughput
+    rollout_chunk_count: int
+    rollout_time_s: float
+    training_time_s: float
+    epoch_time_s: float
+    balance_gap_s: float
+    bottleneck_stage: str
