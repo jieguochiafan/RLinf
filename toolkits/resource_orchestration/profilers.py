@@ -10,12 +10,6 @@ from toolkits.resource_orchestration.types import (
     ConfigSummary,
     StageThroughput,
 )
-from toolkits.rollout_eval.adapters import build_env_adapter, build_model_adapter
-from toolkits.rollout_eval.benchmark.resource_binding import build_process_env
-from toolkits.rollout_eval.benchmark.single_runner import (
-    run_env_only_case,
-    run_model_only_case,
-)
 
 RolloutProfileFn = Callable[[Any, CandidatePair, int, int], Mapping[str, float]]
 TrainingProfileFn = Callable[
@@ -104,6 +98,12 @@ def _replace_environ(env: Mapping[str, str]) -> None:
     os.environ.update({key: str(value) for key, value in env.items()})
 
 
+def _close_if_present(adapter: Any) -> None:
+    close = getattr(adapter, "close", None)
+    if close is not None:
+        close()
+
+
 def default_rollout_profile(
     cfg: Any,
     candidate: CandidatePair,
@@ -111,11 +111,21 @@ def default_rollout_profile(
     measure_steps: int,
 ) -> dict[str, float]:
     """Profile rollout env/model stages using rollout_eval toolkit adapters."""
+    from toolkits.rollout_eval.adapters import build_env_adapter, build_model_adapter
+    from toolkits.rollout_eval.benchmark.resource_binding import build_process_env
+    from toolkits.rollout_eval.benchmark.single_runner import (
+        run_env_only_case,
+        run_model_only_case,
+    )
+
     original_env = dict(os.environ)
     process_env = build_process_env(
         base_env=os.environ,
         mps_active_thread_percentage=candidate.rollout_sm,
     )
+    env_adapter = None
+    template_env_adapter = None
+    model_adapter = None
 
     try:
         _replace_environ(process_env)
@@ -132,8 +142,6 @@ def default_rollout_profile(
             profile_output_dir=None,
         )
         obs_batch, _ = template_env_adapter.reset()
-        if hasattr(template_env_adapter, "close"):
-            template_env_adapter.close()
 
         model_adapter = build_model_adapter(cfg, split_model_stages=False)
         model_result = run_model_only_case(
@@ -144,6 +152,9 @@ def default_rollout_profile(
             obs_batch=obs_batch,
         )
     finally:
+        _close_if_present(env_adapter)
+        _close_if_present(template_env_adapter)
+        _close_if_present(model_adapter)
         _replace_environ(original_env)
 
     return {

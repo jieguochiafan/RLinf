@@ -17,6 +17,18 @@ from toolkits.resource_orchestration.profilers import (
 from toolkits.resource_orchestration.types import CandidatePair, ConfigSummary
 
 
+class ClosableAdapter:
+    def __init__(self) -> None:
+        self.close_count = 0
+
+    @property
+    def closed(self) -> bool:
+        return self.close_count > 0
+
+    def close(self) -> None:
+        self.close_count += 1
+
+
 def _summary() -> ConfigSummary:
     return ConfigSummary(
         total_num_envs=8,
@@ -31,6 +43,41 @@ def _summary() -> ConfigSummary:
         pipeline_stage_num=1,
         resource_pool_mode="mps",
     )
+
+
+def _patch_rollout_dependencies(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    build_process_env: Any | None = None,
+    build_env_adapter: Any | None = None,
+    build_model_adapter: Any | None = None,
+    run_env_only_case: Any | None = None,
+    run_model_only_case: Any | None = None,
+) -> None:
+    from toolkits.resource_orchestration import profilers
+    from toolkits.rollout_eval import adapters
+    from toolkits.rollout_eval.benchmark import resource_binding, single_runner
+
+    patches = {
+        "build_process_env": build_process_env,
+        "build_env_adapter": build_env_adapter,
+        "build_model_adapter": build_model_adapter,
+        "run_env_only_case": run_env_only_case,
+        "run_model_only_case": run_model_only_case,
+    }
+    module_targets = {
+        "build_process_env": resource_binding,
+        "build_env_adapter": adapters,
+        "build_model_adapter": adapters,
+        "run_env_only_case": single_runner,
+        "run_model_only_case": single_runner,
+    }
+
+    for name, replacement in patches.items():
+        if replacement is None:
+            continue
+        monkeypatch.setattr(profilers, name, replacement, raising=False)
+        monkeypatch.setattr(module_targets[name], name, replacement)
 
 
 def test_combine_profile_metrics_converts_env_steps_to_chunk_steps() -> None:
@@ -143,8 +190,6 @@ def test_default_training_profile_raises_when_training_eval_missing(
 def test_default_rollout_profile_uses_mps_env_and_returns_metrics(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from toolkits.resource_orchestration import profilers
-
     cfg = SimpleNamespace()
     candidate = CandidatePair(actor_sm=65, rollout_sm=35)
     build_process_env_calls: list[int | None] = []
@@ -215,20 +260,13 @@ def test_default_rollout_profile_uses_mps_env_and_returns_metrics(
             )
         )
 
-    monkeypatch.setattr(
-        profilers, "build_process_env", build_process_env, raising=False
-    )
-    monkeypatch.setattr(
-        profilers, "build_env_adapter", build_env_adapter, raising=False
-    )
-    monkeypatch.setattr(
-        profilers, "build_model_adapter", build_model_adapter, raising=False
-    )
-    monkeypatch.setattr(
-        profilers, "run_env_only_case", run_env_only_case, raising=False
-    )
-    monkeypatch.setattr(
-        profilers, "run_model_only_case", run_model_only_case, raising=False
+    _patch_rollout_dependencies(
+        monkeypatch,
+        build_process_env=build_process_env,
+        build_env_adapter=build_env_adapter,
+        build_model_adapter=build_model_adapter,
+        run_env_only_case=run_env_only_case,
+        run_model_only_case=run_model_only_case,
     )
 
     metrics = default_rollout_profile(
@@ -246,3 +284,206 @@ def test_default_rollout_profile_uses_mps_env_and_returns_metrics(
     }
     assert os.environ["CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"] == "99"
     assert built_env_adapters[1].closed is True
+
+
+def test_default_rollout_profile_closes_first_env_when_env_only_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    env_adapter = ClosableAdapter()
+
+    def build_process_env(
+        *, base_env: Any, mps_active_thread_percentage: int | None
+    ) -> dict[str, str]:
+        return dict(base_env)
+
+    def build_env_adapter(
+        _cfg: Any, *, split: str, profile_output_dir: Any
+    ) -> ClosableAdapter:
+        return env_adapter
+
+    def run_env_only_case(
+        *, env_adapter: Any, warmup_steps: int, measure_steps: int
+    ) -> Any:
+        raise RuntimeError("env failed")
+
+    _patch_rollout_dependencies(
+        monkeypatch,
+        build_process_env=build_process_env,
+        build_env_adapter=build_env_adapter,
+        run_env_only_case=run_env_only_case,
+    )
+
+    with pytest.raises(RuntimeError, match="env failed"):
+        default_rollout_profile(
+            cfg=SimpleNamespace(),
+            candidate=CandidatePair(actor_sm=65, rollout_sm=35),
+            warmup_steps=1,
+            measure_steps=2,
+        )
+
+    assert env_adapter.closed is True
+
+
+def test_default_rollout_profile_closes_template_env_when_reset_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first_env = ClosableAdapter()
+
+    class ResetFailingAdapter(ClosableAdapter):
+        def reset(self) -> tuple[dict[str, int], dict[str, int]]:
+            raise RuntimeError("reset failed")
+
+    template_env = ResetFailingAdapter()
+    env_adapters = [first_env, template_env]
+
+    def build_process_env(
+        *, base_env: Any, mps_active_thread_percentage: int | None
+    ) -> dict[str, str]:
+        return dict(base_env)
+
+    def build_env_adapter(
+        _cfg: Any, *, split: str, profile_output_dir: Any
+    ) -> ClosableAdapter:
+        return env_adapters.pop(0)
+
+    def run_env_only_case(
+        *, env_adapter: Any, warmup_steps: int, measure_steps: int
+    ) -> Any:
+        return SimpleNamespace(metrics=SimpleNamespace(env_steps_per_sec=123.0))
+
+    _patch_rollout_dependencies(
+        monkeypatch,
+        build_process_env=build_process_env,
+        build_env_adapter=build_env_adapter,
+        run_env_only_case=run_env_only_case,
+    )
+
+    with pytest.raises(RuntimeError, match="reset failed"):
+        default_rollout_profile(
+            cfg=SimpleNamespace(),
+            candidate=CandidatePair(actor_sm=65, rollout_sm=35),
+            warmup_steps=1,
+            measure_steps=2,
+        )
+
+    assert template_env.closed is True
+
+
+def test_default_rollout_profile_closes_model_adapter_when_model_only_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class TemplateAdapter(ClosableAdapter):
+        def reset(self) -> tuple[dict[str, int], dict[str, int]]:
+            return {"obs": 1}, {}
+
+    model_adapter = ClosableAdapter()
+    env_adapters = [ClosableAdapter(), TemplateAdapter()]
+
+    def build_process_env(
+        *, base_env: Any, mps_active_thread_percentage: int | None
+    ) -> dict[str, str]:
+        return dict(base_env)
+
+    def build_env_adapter(
+        _cfg: Any, *, split: str, profile_output_dir: Any
+    ) -> ClosableAdapter:
+        return env_adapters.pop(0)
+
+    def build_model_adapter(_cfg: Any, *, split_model_stages: bool) -> ClosableAdapter:
+        return model_adapter
+
+    def run_env_only_case(
+        *, env_adapter: Any, warmup_steps: int, measure_steps: int
+    ) -> Any:
+        return SimpleNamespace(metrics=SimpleNamespace(env_steps_per_sec=123.0))
+
+    def run_model_only_case(
+        *,
+        env_adapter: Any,
+        model_adapter: Any,
+        warmup_steps: int,
+        measure_steps: int,
+        obs_batch: Any,
+    ) -> Any:
+        return SimpleNamespace(
+            metrics=SimpleNamespace(
+                model_infers_per_sec=45.0,
+                pipeline_samples_per_sec=6.0,
+            )
+        )
+
+    _patch_rollout_dependencies(
+        monkeypatch,
+        build_process_env=build_process_env,
+        build_env_adapter=build_env_adapter,
+        build_model_adapter=build_model_adapter,
+        run_env_only_case=run_env_only_case,
+        run_model_only_case=run_model_only_case,
+    )
+
+    default_rollout_profile(
+        cfg=SimpleNamespace(),
+        candidate=CandidatePair(actor_sm=65, rollout_sm=35),
+        warmup_steps=1,
+        measure_steps=2,
+    )
+
+    assert model_adapter.closed is True
+
+
+def test_default_rollout_profile_closes_model_adapter_when_model_only_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class TemplateAdapter(ClosableAdapter):
+        def reset(self) -> tuple[dict[str, int], dict[str, int]]:
+            return {"obs": 1}, {}
+
+    model_adapter = ClosableAdapter()
+    env_adapters = [ClosableAdapter(), TemplateAdapter()]
+
+    def build_process_env(
+        *, base_env: Any, mps_active_thread_percentage: int | None
+    ) -> dict[str, str]:
+        return dict(base_env)
+
+    def build_env_adapter(
+        _cfg: Any, *, split: str, profile_output_dir: Any
+    ) -> ClosableAdapter:
+        return env_adapters.pop(0)
+
+    def build_model_adapter(_cfg: Any, *, split_model_stages: bool) -> ClosableAdapter:
+        return model_adapter
+
+    def run_env_only_case(
+        *, env_adapter: Any, warmup_steps: int, measure_steps: int
+    ) -> Any:
+        return SimpleNamespace(metrics=SimpleNamespace(env_steps_per_sec=123.0))
+
+    def run_model_only_case(
+        *,
+        env_adapter: Any,
+        model_adapter: Any,
+        warmup_steps: int,
+        measure_steps: int,
+        obs_batch: Any,
+    ) -> Any:
+        raise RuntimeError("model failed")
+
+    _patch_rollout_dependencies(
+        monkeypatch,
+        build_process_env=build_process_env,
+        build_env_adapter=build_env_adapter,
+        build_model_adapter=build_model_adapter,
+        run_env_only_case=run_env_only_case,
+        run_model_only_case=run_model_only_case,
+    )
+
+    with pytest.raises(RuntimeError, match="model failed"):
+        default_rollout_profile(
+            cfg=SimpleNamespace(),
+            candidate=CandidatePair(actor_sm=65, rollout_sm=35),
+            warmup_steps=1,
+            measure_steps=2,
+        )
+
+    assert model_adapter.closed is True
