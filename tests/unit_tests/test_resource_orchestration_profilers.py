@@ -164,10 +164,10 @@ def test_toolkit_throughput_profiler_calls_injected_functions() -> None:
     assert throughput.pipeline_samples_per_sec == 9.0
 
 
-def test_default_training_profile_raises_when_training_backend_missing() -> None:
+def test_default_training_profile_rejects_unsupported_default_model() -> None:
     with pytest.raises(
         RuntimeError,
-        match="actor training profiling backend.*not implemented",
+        match="default training profile backend.*mlp_policy",
     ):
         default_training_profile(
             cfg=SimpleNamespace(),
