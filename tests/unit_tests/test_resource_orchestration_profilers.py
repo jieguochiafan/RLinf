@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import builtins
 import os
 from types import SimpleNamespace
 from typing import Any
@@ -165,19 +164,11 @@ def test_toolkit_throughput_profiler_calls_injected_functions() -> None:
     assert throughput.pipeline_samples_per_sec == 9.0
 
 
-def test_default_training_profile_raises_when_training_eval_missing(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    real_import = builtins.__import__
-
-    def blocked_import(name: str, *args: Any, **kwargs: Any) -> Any:
-        if name == "toolkits.training_eval.run":
-            raise ImportError("missing training_eval")
-        return real_import(name, *args, **kwargs)
-
-    monkeypatch.setattr(builtins, "__import__", blocked_import)
-
-    with pytest.raises(RuntimeError, match="toolkits.training_eval.*required"):
+def test_default_training_profile_raises_when_training_backend_missing() -> None:
+    with pytest.raises(
+        RuntimeError,
+        match="actor training profiling backend.*not implemented",
+    ):
         default_training_profile(
             cfg=SimpleNamespace(),
             candidate=CandidatePair(actor_sm=60, rollout_sm=40),
