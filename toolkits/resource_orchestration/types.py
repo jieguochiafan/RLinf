@@ -59,3 +59,11 @@ class CandidateEstimate:
     epoch_time_s: float
     balance_gap_s: float
     bottleneck_stage: str
+
+
+@dataclass(frozen=True)
+class SelectionResult:
+    """Ranked resource orchestration candidate selection."""
+
+    selected: CandidateEstimate
+    ranked: tuple[CandidateEstimate, ...]
