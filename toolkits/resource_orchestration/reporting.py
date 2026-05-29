@@ -12,7 +12,7 @@ def write_reports(
     estimates: tuple[CandidateEstimate, ...],
     selection: SelectionResult | None,
     plan_output: str,
-    failed_profiles: list[str],
+    failed_profiles: list[str] | list[dict[str, str]],
 ) -> dict[str, Path]:
     """Write resource orchestration profile and summary reports."""
     output_path = Path(output_dir)
