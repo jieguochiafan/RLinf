@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import builtins
+import importlib
 import math
+import sys
 from types import SimpleNamespace
 from typing import Any
 
@@ -46,6 +49,42 @@ def test_run_training_profile_calls_injected_runner(
         }
     ]
     assert metrics == {"actor_chunk_steps_per_sec": 12.5}
+
+
+def test_run_training_profile_injected_runner_does_not_require_torch_import(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = "toolkits.training_eval.run"
+    existing_module = sys.modules.pop(module_name, None)
+    original_import = builtins.__import__
+
+    def guarded_import(name: str, *args: Any, **kwargs: Any) -> Any:
+        if name == "torch" or name.startswith("torch."):
+            raise ModuleNotFoundError(name)
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
+    try:
+        run = importlib.import_module(module_name)
+        monkeypatch.setattr(
+            run,
+            "TRAINING_PROFILE_RUNNER",
+            lambda **_kwargs: {"actor_chunk_steps_per_sec": 3.0},
+        )
+
+        metrics = run.run_training_profile(
+            cfg=SimpleNamespace(),
+            actor_sm=70,
+            warmup_steps=1,
+            measure_steps=1,
+            rollout_chunk_count=4,
+        )
+    finally:
+        sys.modules.pop(module_name, None)
+        if existing_module is not None:
+            sys.modules[module_name] = existing_module
+
+    assert metrics == {"actor_chunk_steps_per_sec": 3.0}
 
 
 @pytest.mark.parametrize("throughput", [0.0, -1.0, math.inf, math.nan])
@@ -131,6 +170,36 @@ def test_run_training_profile_default_backend_rejects_complex_model(
             warmup_steps=1,
             measure_steps=1,
             rollout_chunk_count=8,
+        )
+
+
+@pytest.mark.parametrize(
+    ("global_batch_size", "micro_batch_size", "rollout_chunk_count"),
+    [
+        (3, 2, 6),
+        (4, 2, 6),
+    ],
+)
+def test_run_training_profile_rejects_non_production_batch_partitioning(
+    monkeypatch: pytest.MonkeyPatch,
+    global_batch_size: int,
+    micro_batch_size: int,
+    rollout_chunk_count: int,
+) -> None:
+    from toolkits.training_eval import run
+
+    cfg = _mlp_profile_cfg(update_epoch=1)
+    cfg.actor.global_batch_size = global_batch_size
+    cfg.actor.micro_batch_size = micro_batch_size
+    monkeypatch.setattr(run, "TRAINING_PROFILE_RUNNER", None)
+
+    with pytest.raises(ValueError, match="batch.*divisible|rollout_chunk_count"):
+        run.run_training_profile(
+            cfg=cfg,
+            actor_sm=70,
+            warmup_steps=0,
+            measure_steps=1,
+            rollout_chunk_count=rollout_chunk_count,
         )
 
 

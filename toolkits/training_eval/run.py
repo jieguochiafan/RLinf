@@ -5,10 +5,10 @@ import os
 import time
 from collections.abc import Callable, Mapping
 from contextlib import contextmanager
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-import torch
-from omegaconf import DictConfig, OmegaConf
+if TYPE_CHECKING:
+    import torch
 
 TrainingProfileRunner = Callable[..., Mapping[str, float]]
 
@@ -86,6 +86,7 @@ def _run_default_training_profile(
         raise ValueError(f"warmup_steps must be >= 0, got {warmup_steps}")
 
     with _temporary_mps_percentage(actor_sm):
+        torch = _import_torch()
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         model = _build_mlp_policy(cfg).to(device=device, dtype=torch.float32)
         model.train()
@@ -116,8 +117,11 @@ def _run_default_training_profile(
 
 
 def _build_mlp_policy(cfg: Any) -> torch.nn.Module:
+    from omegaconf import OmegaConf
+
     from rlinf.models.embodiment.mlp_policy import get_model
 
+    torch = _import_torch()
     loss_type = str(_select(cfg, "algorithm.loss_type", default="actor_critic"))
     model_cfg = OmegaConf.create(
         {
@@ -143,6 +147,7 @@ def _make_mlp_training_batch(
     rollout_chunk_count: int,
     device: torch.device,
 ) -> dict[str, torch.Tensor]:
+    torch = _import_torch()
     obs_dim = int(_select(cfg, "actor.model.obs_dim"))
     action_dim = int(_select(cfg, "actor.model.action_dim"))
     batch_shape = (rollout_chunk_count,)
@@ -182,6 +187,16 @@ def _run_profile_iteration(
     if micro_batch_size <= 0:
         raise ValueError(
             f"actor.micro_batch_size must be positive, got {micro_batch_size}"
+        )
+    if global_batch_size % micro_batch_size != 0:
+        raise ValueError(
+            "actor.global_batch_size must be divisible by "
+            "actor.micro_batch_size for default training profiling"
+        )
+    if rollout_chunk_count % global_batch_size != 0:
+        raise ValueError(
+            "rollout_chunk_count must be divisible by actor.global_batch_size "
+            "for default training profiling"
         )
 
     for _ in range(update_epoch):
@@ -240,6 +255,8 @@ def _compute_mlp_policy_loss(
 
 
 def _select(cfg: Any, path: str, default: Any = None) -> Any:
+    from omegaconf import DictConfig, OmegaConf
+
     if isinstance(cfg, DictConfig):
         value = OmegaConf.select(cfg, path, default=default)
     else:
@@ -254,6 +271,12 @@ def _select(cfg: Any, path: str, default: Any = None) -> Any:
     if value is None and default is None:
         raise ValueError(f"missing required config value: {path}")
     return value
+
+
+def _import_torch():
+    import torch
+
+    return torch
 
 
 @contextmanager
