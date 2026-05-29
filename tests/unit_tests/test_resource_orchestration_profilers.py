@@ -182,7 +182,7 @@ def test_default_training_profile_rejects_unsupported_default_model() -> None:
 def test_default_rollout_profile_uses_mps_env_and_returns_metrics(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    cfg = SimpleNamespace()
+    cfg = SimpleNamespace(actor=SimpleNamespace(model={"action_dim": 7}))
     candidate = CandidatePair(actor_sm=65, rollout_sm=35)
     build_process_env_calls: list[int | None] = []
     built_env_adapters: list[Any] = []
@@ -227,11 +227,16 @@ def test_default_rollout_profile_uses_mps_env_and_returns_metrics(
         return object()
 
     def run_env_only_case(
-        *, env_adapter: Any, warmup_steps: int, measure_steps: int
+        *,
+        env_adapter: Any,
+        warmup_steps: int,
+        measure_steps: int,
+        action_dim_override: int | None = None,
     ) -> Any:
         assert env_adapter is built_env_adapters[0]
         assert warmup_steps == 1
         assert measure_steps == 2
+        assert action_dim_override == 7
         return SimpleNamespace(metrics=SimpleNamespace(env_steps_per_sec=123.0))
 
     def run_model_only_case(
@@ -297,7 +302,11 @@ def test_default_rollout_profile_closes_first_env_when_env_only_raises(
         return env_adapter
 
     def run_env_only_case(
-        *, env_adapter: Any, warmup_steps: int, measure_steps: int
+        *,
+        env_adapter: Any,
+        warmup_steps: int,
+        measure_steps: int,
+        action_dim_override: int | None = None,
     ) -> Any:
         raise RuntimeError("env failed")
 
@@ -342,7 +351,11 @@ def test_default_rollout_profile_closes_template_env_when_reset_raises(
         return env_adapters.pop(0)
 
     def run_env_only_case(
-        *, env_adapter: Any, warmup_steps: int, measure_steps: int
+        *,
+        env_adapter: Any,
+        warmup_steps: int,
+        measure_steps: int,
+        action_dim_override: int | None = None,
     ) -> Any:
         return SimpleNamespace(metrics=SimpleNamespace(env_steps_per_sec=123.0))
 
@@ -388,7 +401,11 @@ def test_default_rollout_profile_closes_model_adapter_when_model_only_succeeds(
         return model_adapter
 
     def run_env_only_case(
-        *, env_adapter: Any, warmup_steps: int, measure_steps: int
+        *,
+        env_adapter: Any,
+        warmup_steps: int,
+        measure_steps: int,
+        action_dim_override: int | None = None,
     ) -> Any:
         return SimpleNamespace(metrics=SimpleNamespace(env_steps_per_sec=123.0))
 
@@ -450,7 +467,11 @@ def test_default_rollout_profile_closes_model_adapter_when_model_only_raises(
         return model_adapter
 
     def run_env_only_case(
-        *, env_adapter: Any, warmup_steps: int, measure_steps: int
+        *,
+        env_adapter: Any,
+        warmup_steps: int,
+        measure_steps: int,
+        action_dim_override: int | None = None,
     ) -> Any:
         return SimpleNamespace(metrics=SimpleNamespace(env_steps_per_sec=123.0))
 

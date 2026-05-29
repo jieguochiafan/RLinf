@@ -110,6 +110,20 @@ def _close_if_present(adapter: Any) -> None:
         close()
 
 
+def _actor_action_dim(cfg: Any) -> int | None:
+    try:
+        actor = cfg["actor"] if isinstance(cfg, Mapping) else getattr(cfg, "actor")
+        model = actor["model"] if isinstance(actor, Mapping) else getattr(actor, "model")
+        action_dim = model["action_dim"] if isinstance(model, Mapping) else getattr(model, "action_dim")
+    except Exception:
+        return None
+    try:
+        action_dim_int = int(action_dim)
+    except (TypeError, ValueError):
+        return None
+    return action_dim_int if action_dim_int > 0 else None
+
+
 def default_rollout_profile(
     cfg: Any,
     candidate: CandidatePair,
@@ -140,6 +154,7 @@ def default_rollout_profile(
             env_adapter=env_adapter,
             warmup_steps=warmup_steps,
             measure_steps=measure_steps,
+            action_dim_override=_actor_action_dim(cfg),
         )
 
         template_env_adapter = build_env_adapter(
