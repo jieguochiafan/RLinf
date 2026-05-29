@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import json
+from collections import defaultdict
 from pathlib import Path
 
 from hydra import compose, initialize_config_dir
 from omegaconf import DictConfig, OmegaConf
 
+from rlinf.scheduler.resource_pool.bindings import WorkerResourceBinding
 from toolkits.resource_orchestration.types import ConfigSummary
+
+ComponentBindings = dict[str, list[WorkerResourceBinding]]
 
 
 def _select_int(cfg: DictConfig, path: str, default: int | None = None) -> int:
@@ -66,3 +71,29 @@ def build_config_summary(cfg: DictConfig) -> ConfigSummary:
         pipeline_stage_num=_select_int(cfg, "rollout.pipeline_stage_num", default=1),
         resource_pool_mode=mode,
     )
+
+
+def load_plan_bindings(plan_path: str | Path) -> ComponentBindings:
+    """Load worker resource bindings from an allocation plan JSON file."""
+    payload = json.loads(Path(plan_path).read_text(encoding="utf-8"))
+    bindings: dict[str, list[WorkerResourceBinding]] = defaultdict(list)
+    for item in payload.get("bindings", []):
+        binding = WorkerResourceBinding.from_json(json.dumps(item))
+        bindings[binding.component].append(binding)
+    return {
+        component: sorted(component_bindings, key=lambda binding: binding.rank)
+        for component, component_bindings in sorted(bindings.items())
+    }
+
+
+def load_base_bindings(cfg: DictConfig, base_plan: str | None) -> ComponentBindings:
+    """Load the base binding plan from CLI input or config."""
+    plan_path = base_plan or OmegaConf.select(
+        cfg, "cluster.resource_pool.allocation_plan_path"
+    )
+    if not plan_path:
+        raise ValueError(
+            "base resource bindings require --base-plan or "
+            "cluster.resource_pool.allocation_plan_path"
+        )
+    return load_plan_bindings(plan_path)
