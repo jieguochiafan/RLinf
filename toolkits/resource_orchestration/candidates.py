@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from rlinf.scheduler.resource_pool.gpu_binding import validate_sm_percent
-
 from toolkits.resource_orchestration.types import CandidatePair
 
 
