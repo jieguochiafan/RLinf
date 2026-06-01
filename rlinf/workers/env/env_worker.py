@@ -14,8 +14,10 @@
 
 import asyncio
 import gc
+import json
 import os
 import re
+import time
 from collections import defaultdict
 from contextlib import contextmanager
 from typing import Any, Literal
@@ -125,6 +127,17 @@ class EnvWorker(Worker):
         self.only_eval = getattr(self.cfg.runner, "only_eval", False)
         train_env_cfg = self.cfg.env.get("train", None)
         eval_env_cfg = self.cfg.env.eval
+        self.log_sim_timestamps = bool(
+            train_env_cfg.get("log_sim_timestamps", False)
+            if train_env_cfg is not None
+            else False
+        )
+        self.log_sim_affinity_interval = int(
+            train_env_cfg.get("log_sim_affinity_interval", 0)
+            if train_env_cfg is not None
+            else 0
+        )
+        self._sim_timestamp_file = None
         self.enable_offload = (
             train_env_cfg.get("enable_offload", False)
             if train_env_cfg is not None
@@ -173,6 +186,7 @@ class EnvWorker(Worker):
 
         self.log_info(f"Env worker initialized with dst_rank_map: {self.dst_rank_map}")
         self.log_info(f"Env worker initialized with src_rank_map: {self.src_rank_map}")
+        self._log_cpu_binding_status("before env setup")
 
         # This is a barrier to ensure all envs' initial setup upon import is done
         # Essential for RealWorld env to ensure initial ROS node setup is done
@@ -222,12 +236,134 @@ class EnvWorker(Worker):
 
         if not self.only_eval:
             self._init_env()
+            self._log_cpu_binding_status("after train env setup")
+            self._validate_child_cpu_affinity()
             if self.reward_mode == "history_buffer":
                 self.train_history_managers = [
                     HistoryManager(self.cfg.reward, self.train_num_envs_per_stage)
                     for _ in range(self.stage_num)
                 ]
                 self.history_lengths = [{} for _ in range(self.stage_num)]
+
+    def _log_cpu_binding_status(self, phase: str) -> None:
+        binding = getattr(self, "_resource_binding", None)
+        if binding is None or binding.cpu is None:
+            return
+        process_affinity = (
+            tuple(sorted(os.sched_getaffinity(0)))
+            if hasattr(os, "sched_getaffinity")
+            else ()
+        )
+        env_groups = binding.cpu.env_cpu_core_groups
+        msg = (
+            f"Env CPU binding {phase}: process_cpu_cores="
+            f"{binding.cpu.process_cpu_cores}, process_affinity={process_affinity}, "
+            f"env_cpu_group_count={len(env_groups)}, "
+            f"first_env_cpu_groups={env_groups[: min(8, len(env_groups))]}"
+        )
+        child_affinities = self._collect_child_cpu_affinities(limit=8)
+        if child_affinities:
+            msg += f", first_child_affinities={child_affinities}"
+        self.log_info(msg)
+
+    def _collect_child_cpu_affinities(
+        self, limit: int
+    ) -> list[tuple[int, tuple[int, ...]]]:
+        child_affinities: list[tuple[int, tuple[int, ...]]] = []
+        for env in self.env_list:
+            for local_index, worker in enumerate(self._iter_env_subworkers(env)):
+                if len(child_affinities) >= limit:
+                    return child_affinities
+                if not hasattr(worker, "get_cpu_affinity"):
+                    continue
+                child_affinities.append((local_index, worker.get_cpu_affinity()))
+        return child_affinities
+
+    def _write_sim_timestamp_event(self, event: dict[str, Any]) -> None:
+        if self._sim_timestamp_file is None:
+            output_dir = os.path.join(
+                str(self.cfg.runner.logger.log_path), "env_sim_timestamps"
+            )
+            os.makedirs(output_dir, exist_ok=True)
+            path = os.path.join(output_dir, f"env_rank_{self._rank}.jsonl")
+            self._sim_timestamp_file = open(path, "a", encoding="utf-8", buffering=1)
+        self._sim_timestamp_file.write(json.dumps(event, sort_keys=True) + "\n")
+
+    def _iter_env_subworkers(self, env) -> list[Any]:
+        current = env
+        seen: set[int] = set()
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            workers = getattr(current, "workers", None)
+            if workers is not None:
+                return list(workers)
+            current = getattr(current, "env", None)
+        return []
+
+    def _set_subenv_timestamp_context(
+        self, env: Any, context: dict[str, Any] | None
+    ) -> None:
+        current = env
+        seen: set[int] = set()
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            setter = getattr(current, "set_sim_timestamp_context", None)
+            if setter is not None:
+                setter(context)
+                return
+            current = getattr(current, "env", None)
+
+    def _get_env_last_chunk_profile(self, env: Any) -> dict[str, Any] | None:
+        current = env
+        seen: set[int] = set()
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            getter = getattr(current, "get_last_chunk_profile", None)
+            if getter is not None:
+                return getter()
+            current = getattr(current, "env", None)
+        return None
+
+    def _validate_child_cpu_affinity(self) -> None:
+        binding = getattr(self, "_resource_binding", None)
+        if binding is None or binding.cpu is None:
+            return
+        expected_process_cores = tuple(binding.cpu.process_cpu_cores)
+        if expected_process_cores and hasattr(os, "sched_getaffinity"):
+            actual_process_cores = tuple(sorted(os.sched_getaffinity(0)))
+            if actual_process_cores != expected_process_cores:
+                raise RuntimeError(
+                    "EnvWorker CPU affinity mismatch: expected "
+                    f"{expected_process_cores}, got {actual_process_cores}"
+                )
+
+        expected_groups = tuple(binding.cpu.env_cpu_core_groups)
+        if not expected_groups:
+            return
+        checked_count = 0
+        mismatches = []
+        for env in self.env_list:
+            for worker in self._iter_env_subworkers(env):
+                if checked_count >= len(expected_groups):
+                    break
+                if not hasattr(worker, "get_cpu_affinity"):
+                    checked_count += 1
+                    continue
+                expected = tuple(expected_groups[checked_count])
+                actual = tuple(worker.get_cpu_affinity())
+                if actual != expected:
+                    mismatches.append((checked_count, expected, actual))
+                checked_count += 1
+        if checked_count != len(expected_groups):
+            raise RuntimeError(
+                "Env CPU binding validation checked "
+                f"{checked_count} envs, expected {len(expected_groups)} envs"
+            )
+        if mismatches:
+            preview = mismatches[:8]
+            raise RuntimeError(
+                f"Env subprocess CPU affinity mismatch. First mismatches: {preview}"
+            )
 
     def _validate_env_resource_binding_supported(self) -> None:
         binding = getattr(self, "_resource_binding", None)
@@ -530,6 +666,8 @@ class EnvWorker(Worker):
         chunk_actions: torch.Tensor,
         stage_id: int,
         forward_inputs=None,
+        epoch: int | None = None,
+        chunk_step_idx: int | None = None,
     ) -> tuple[EnvOutput, dict[str, Any]]:
         """
         This function is used to interact with the environment.
@@ -560,11 +698,83 @@ class EnvWorker(Worker):
             except Exception:
                 pass
 
-        obs_list, chunk_rewards, chunk_terminations, chunk_truncations, infos_list = (
-            self.env_list[stage_id].chunk_step(
+        log_sim_timestamps = self.log_sim_timestamps
+        process_affinity = ()
+        child_affinities = []
+        should_sample_child_affinity = (
+            self.log_sim_affinity_interval > 0
+            and chunk_step_idx is not None
+            and chunk_step_idx % self.log_sim_affinity_interval == 0
+        )
+        if log_sim_timestamps:
+            if hasattr(os, "sched_getaffinity"):
+                process_affinity = tuple(sorted(os.sched_getaffinity(0)))
+            if should_sample_child_affinity:
+                child_affinities = self._collect_child_cpu_affinities(limit=8)
+            wall_start_ns = time.time_ns()
+            perf_start = time.perf_counter()
+            self._write_sim_timestamp_event(
+                {
+                    "event": "start",
+                    "rank": self._rank,
+                    "pid": os.getpid(),
+                    "epoch": epoch,
+                    "chunk_step": chunk_step_idx,
+                    "stage": stage_id,
+                    "local_envs": self.train_num_envs_per_stage,
+                    "wall_ns": wall_start_ns,
+                    "process_affinity": process_affinity,
+                    "child_affinity_sample": child_affinities,
+                }
+            )
+
+        target_env = self.env_list[stage_id]
+        subenv_timestamp_context = None
+        if log_sim_timestamps:
+            subenv_timestamp_context = {
+                "output_dir": os.path.join(
+                    str(self.cfg.runner.logger.log_path), "env_sim_timestamps"
+                ),
+                "rank": self._rank,
+                "pid": os.getpid(),
+                "epoch": epoch,
+                "chunk_step": chunk_step_idx,
+                "stage": stage_id,
+                "stage_num": self.stage_num,
+                "local_envs": self.train_num_envs_per_stage,
+            }
+        self._set_subenv_timestamp_context(target_env, subenv_timestamp_context)
+        try:
+            (
+                obs_list,
+                chunk_rewards,
+                chunk_terminations,
+                chunk_truncations,
+                infos_list,
+            ) = target_env.chunk_step(
                 chunk_actions, denoising_curvature=denoising_curvature
             )
-        )
+        finally:
+            self._set_subenv_timestamp_context(target_env, None)
+        if log_sim_timestamps:
+            wall_end_ns = time.time_ns()
+            duration_s = time.perf_counter() - perf_start
+            end_event = {
+                "event": "end",
+                "rank": self._rank,
+                "pid": os.getpid(),
+                "epoch": epoch,
+                "chunk_step": chunk_step_idx,
+                "stage": stage_id,
+                "local_envs": self.train_num_envs_per_stage,
+                "wall_ns": wall_end_ns,
+                "duration_s": duration_s,
+                "process_affinity": process_affinity,
+            }
+            chunk_profile = self._get_env_last_chunk_profile(target_env)
+            if chunk_profile:
+                end_event["chunk_profile"] = chunk_profile
+            self._write_sim_timestamp_event(end_event)
         if isinstance(obs_list, (list, tuple)):
             extracted_obs = obs_list[-1] if obs_list else None
         if isinstance(infos_list, (list, tuple)):
@@ -1211,8 +1421,6 @@ class EnvWorker(Worker):
             v17_env_ep_start = [
                 np.zeros(n_envs, dtype=np.int32) for _ in range(self.stage_num)
             ]
-            # loss_mask: [n_chunk_steps, n_envs, num_action_chunks] per epoch, built at epoch end
-            v17_epoch_loss_masks = []  # list of per-epoch masks
             v17_global_chunk_idx = [
                 0 for _ in range(self.stage_num)
             ]  # total chunk index across epochs
@@ -1432,6 +1640,8 @@ class EnvWorker(Worker):
                             rollout_result.actions,
                             stage_id,
                             forward_inputs=rollout_result.forward_inputs,
+                            epoch=epoch,
+                            chunk_step_idx=chunk_step_idx,
                         )
                         _step_dt = _time.time() - _step_t0
                         if v17_enabled:
@@ -1743,7 +1953,7 @@ class EnvWorker(Worker):
 
                         self.record_env_metrics(env_metrics, env_info, epoch)
 
-                    env_batch = env_output.to_dict()  # noqa: this line starts the common path
+                    env_batch = env_output.to_dict()
                     send_dict = {
                         "obs": env_batch["obs"],
                         "final_obs": env_batch["final_obs"],
@@ -1863,23 +2073,13 @@ class EnvWorker(Worker):
                     n_success = sum(1 for e in eps if e[2] == "success")
                     n_timeout = sum(1 for e in eps if e[2] == "timeout")
                     n_probe_cut = sum(1 for e in eps if e[2] == "probe_cut")
-                    n_force_term = sum(1 for e in eps if e[2] == "force_term")
                     succ_lens = [e[5] for e in eps if e[2] == "success"]
-                    fail_lens = [e[5] for e in eps if e[2] in ("timeout", "probe_cut")]
-                    force_lens = [e[5] for e in eps if e[2] == "force_term"]
                     avg_succ = sum(succ_lens) / len(succ_lens) if succ_lens else 0
-                    avg_fail = sum(fail_lens) / len(fail_lens) if fail_lens else 0
-                    avg_force = sum(force_lens) / len(force_lens) if force_lens else 0
-                    # Per-env episode count
-                    ep_counts = v17_env_ep_count[stage_id]
                     # (autoreset-env summary merged into actprobe below)
                     # ── Probe performance stats (v14-style) ──
                     # missed = timeout (probe didn't catch), cut = probe_cut (probe caught)
                     # cut_rate = how many fails probe caught vs total fails
                     n_fail_total = n_timeout + n_probe_cut
-                    cut_rate = (
-                        n_probe_cut / n_fail_total * 100 if n_fail_total > 0 else 0
-                    )
                     cut_lens = [e[5] for e in eps if e[2] == "probe_cut"]
                     timeout_lens = [e[5] for e in eps if e[2] == "timeout"]
                     avg_cut_len = sum(cut_lens) / len(cut_lens) if cut_lens else 0
@@ -1935,10 +2135,12 @@ class EnvWorker(Worker):
                     # ground truth, so precision is measured on the spared (immune) set —
                     # random sparing makes the immune set an unbiased sample of all flagged
                     # episodes, so its precision/FP rate carries over to the cut ones.
-                    TP = n_probe_cut + immune_timeout  # flagged failures: cut + verified-immune-fail
-                    FP = immune_succ + flagged_succ    # flagged but actually succeeded
-                    FN = never_flagged_timeout         # failed but never flagged (a true miss)
-                    TN = max(0, n_success - FP)        # succeeded and never flagged
+                    TP = (
+                        n_probe_cut + immune_timeout
+                    )  # flagged failures: cut + verified-immune-fail
+                    FP = immune_succ + flagged_succ  # flagged but actually succeeded
+                    FN = never_flagged_timeout  # failed but never flagged (a true miss)
+                    TN = max(0, n_success - FP)  # succeeded and never flagged
                     recall = 100.0 * TP / (TP + FN) if (TP + FN) > 0 else 0.0
                     precision = (  # on immune set (unbiased; cut outcomes unobserved)
                         100.0 * immune_timeout / (immune_timeout + immune_succ)

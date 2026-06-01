@@ -26,6 +26,7 @@ from omegaconf import OmegaConf, open_dict
 from omegaconf.dictconfig import DictConfig
 
 from rlinf.envs import SupportedEnvType
+from rlinf.envs.chunk_runner import CHUNK_STEP_MODES
 from rlinf.scheduler.cluster import Cluster
 from rlinf.utils.placement import (
     HybridComponentPlacement,
@@ -831,6 +832,88 @@ def validate_embodied_cfg(cfg):
     stage_num = cfg.rollout.pipeline_stage_num
     env_world_size = component_placement.get_world_size("env")
 
+    def validate_chunk_step_cfg(env_cfg, cfg_path: str):
+        local_num_envs = env_cfg.total_num_envs // env_world_size // stage_num
+        env_type = SupportedEnvType(env_cfg.env_type)
+        if "chunk_step_mode" not in env_cfg:
+            mode = "sync_time_major"
+            if (
+                env_type == SupportedEnvType.BEHAVIOR
+                and int(env_cfg.get("num_env_subprocess", 1)) > 1
+            ):
+                mode = "parallel_shard"
+        else:
+            mode = env_cfg.chunk_step_mode
+        num_shards = int(
+            env_cfg.get(
+                "chunk_step_num_shards",
+                env_cfg.get("num_env_subprocess", 1)
+                if env_type == SupportedEnvType.BEHAVIOR
+                else 1,
+            )
+        )
+
+        assert mode in CHUNK_STEP_MODES, (
+            f"{cfg_path}.chunk_step_mode must be one of "
+            f"{sorted(CHUNK_STEP_MODES)}, got {mode!r}"
+        )
+        assert num_shards >= 1, (
+            f"{cfg_path}.chunk_step_num_shards must be >= 1, got {num_shards}"
+        )
+        assert num_shards <= local_num_envs, (
+            f"{cfg_path}.chunk_step_num_shards({num_shards}) must be <= local "
+            f"env num({local_num_envs})"
+        )
+        if mode == "latency_balanced_pair":
+            pair_cfg = env_cfg.get("latency_balanced_pair", {})
+            envs_per_core = int(pair_cfg.get("envs_per_core", 1))
+            pair_ema_alpha = float(pair_cfg.get("ema_alpha", 0.3))
+            dynamic_affinity = bool(pair_cfg.get("dynamic_affinity", True))
+            core_donation_enabled = bool(pair_cfg.get("core_donation_enabled", True))
+            assert envs_per_core == 1 and dynamic_affinity and core_donation_enabled, (
+                f"{cfg_path}.latency_balanced_pair only supports core donation "
+                "v2: envs_per_core=1, dynamic_affinity=True, "
+                "core_donation_enabled=True"
+            )
+            assert 0.0 < pair_ema_alpha <= 1.0, (
+                f"{cfg_path}.latency_balanced_pair.ema_alpha must be in (0, 1], "
+                f"got {pair_ema_alpha}"
+            )
+            initial_latency_ms = pair_cfg.get("initial_latency_ms", None)
+            if initial_latency_ms is not None:
+                assert float(initial_latency_ms) > 0.0, (
+                    f"{cfg_path}.latency_balanced_pair.initial_latency_ms must be "
+                    f"positive when set, got {initial_latency_ms}"
+                )
+            core_donation_max_extra_groups = int(
+                pair_cfg.get("core_donation_max_extra_groups", 1)
+            )
+            assert core_donation_max_extra_groups >= 0, (
+                f"{cfg_path}.latency_balanced_pair.core_donation_max_extra_groups "
+                f"must be >= 0, got {core_donation_max_extra_groups}"
+            )
+            with open_dict(env_cfg):
+                env_cfg.latency_balanced_pair = OmegaConf.create(
+                    {
+                        "envs_per_core": envs_per_core,
+                        "ema_alpha": pair_ema_alpha,
+                        "initial_latency_ms": initial_latency_ms,
+                        "dynamic_affinity": dynamic_affinity,
+                        "core_donation_enabled": core_donation_enabled,
+                        "core_donation_max_extra_groups": (
+                            core_donation_max_extra_groups
+                        ),
+                    }
+                )
+        if env_type == SupportedEnvType.MANISKILL and mode == "parallel_shard":
+            assert num_shards == 1, (
+                "ManiSkill parallel_shard chunk_step currently supports only "
+                f"chunk_step_num_shards=1, got {num_shards}"
+            )
+        with open_dict(env_cfg):
+            env_cfg.chunk_step_mode = mode
+            env_cfg.chunk_step_num_shards = num_shards
+
     if cfg.runner.val_check_interval > 0 or cfg.runner.get("only_eval", False):
         assert cfg.env.eval.total_num_envs > 0, (
             "Total number of parallel environments for evaluation must be greater than 0"
@@ -859,6 +942,7 @@ def validate_embodied_cfg(cfg):
         ), (
             "env.eval.max_steps_per_rollout_epoch must be divisible by actor.model.num_action_chunks"
         )
+        validate_chunk_step_cfg(cfg.env.eval, "env.eval")
 
     if not cfg.runner.get("only_eval", False):
         assert cfg.env.train.total_num_envs > 0, (
@@ -889,6 +973,7 @@ def validate_embodied_cfg(cfg):
         ), (
             "env.train.max_steps_per_rollout_epoch must be divisible by actor.model.num_action_chunks"
         )
+        validate_chunk_step_cfg(cfg.env.train, "env.train")
 
     with open_dict(cfg):
         weight_sync_interval = cfg.runner.get("weight_sync_interval", 1)

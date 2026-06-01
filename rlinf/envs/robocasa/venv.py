@@ -17,6 +17,7 @@
 Based on metaworld/venv.py implementation, adapted for Robocasa/Robosuite environments.
 """
 
+import os
 from multiprocessing import Pipe, connection
 from multiprocessing.context import Process
 from typing import Any, Callable, Optional, Union
@@ -34,6 +35,10 @@ from rlinf.envs.venv import (
     _setup_buf,
 )
 from rlinf.envs.venv.venv import _apply_subproc_env_cpu_affinity
+from rlinf.scheduler.resource_pool.cpu_binding import (
+    apply_process_cpu_affinity,
+    get_env_core_group_from_env,
+)
 
 
 def _json_list(value: Any) -> list:
@@ -172,6 +177,25 @@ def _worker(
                 if hasattr(env, "get_ep_meta"):
                     env_return = get_ep_meta(env, env_return)
                 p.send(env_return)
+            elif cmd == "chunk_step":
+                if obs_bufs is not None:
+                    raise NotImplementedError(
+                        "chunk_step does not support shared-memory observations"
+                    )
+                env_returns = []
+                for action in data:
+                    env_return = env.step(action)
+                    if hasattr(env, "_check_success"):
+                        env_return = _check_success(env, env_return)
+                    if hasattr(env, "get_ep_meta"):
+                        env_return = get_ep_meta(env, env_return)
+                    env_returns.append(env_return)
+                p.send(tuple(zip(*env_returns)))
+            elif cmd == "set_cpu_affinity":
+                apply_process_cpu_affinity(tuple(data))
+                p.send(tuple(sorted(os.sched_getaffinity(0))))
+            elif cmd == "get_cpu_affinity":
+                p.send(tuple(sorted(os.sched_getaffinity(0))))
             elif cmd == "reset":
                 # Robosuite reset can return just obs or (obs, info)
                 retval = env.reset(**data)
@@ -241,6 +265,7 @@ class RobocasaSubprocEnvWorker(SubprocEnvWorker):
         self.parent_remote, self.child_remote = Pipe()
         self.share_memory = share_memory
         self.buffer: Optional[Union[dict, tuple, ShArray]] = None
+        self._cpu_affinity = get_env_core_group_from_env(os.environ, local_env_index)
         if self.share_memory:
             dummy = env_fn()
             obs_space = dummy.observation_space

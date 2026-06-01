@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import multiprocessing
+import os
 import warnings
 from multiprocessing import connection
 from typing import Any, Callable, Optional, Union
@@ -31,6 +32,10 @@ from rlinf.envs.venv import (
     _setup_buf,
 )
 from rlinf.envs.venv.venv import _apply_subproc_env_cpu_affinity
+from rlinf.scheduler.resource_pool.cpu_binding import (
+    apply_process_cpu_affinity,
+    get_env_core_group_from_env,
+)
 
 # ---------------------------------------------------------------------------
 # Dynamic Module Import Logic for Libero Pro / Plus
@@ -114,6 +119,18 @@ def _worker(
                     _encode_obs(env_return[0], obs_bufs)
                     env_return = (None, *env_return[1:])
                 p.send(env_return)
+            elif cmd == "chunk_step":
+                if obs_bufs is not None:
+                    raise NotImplementedError(
+                        "chunk_step does not support shared-memory observations"
+                    )
+                env_returns = [env.step(action) for action in data]
+                p.send(tuple(zip(*env_returns)))
+            elif cmd == "set_cpu_affinity":
+                apply_process_cpu_affinity(tuple(data))
+                p.send(tuple(sorted(os.sched_getaffinity(0))))
+            elif cmd == "get_cpu_affinity":
+                p.send(tuple(sorted(os.sched_getaffinity(0))))
             elif cmd == "reset":
                 retval = env.reset(**data)
                 reset_returns_info = (
@@ -181,6 +198,7 @@ class ReconfigureSubprocEnvWorker(SubprocEnvWorker):
         self.parent_remote, self.child_remote = ctx.Pipe()
         self.share_memory = share_memory
         self.buffer: Optional[Union[dict, tuple, ShArray]] = None
+        self._cpu_affinity = get_env_core_group_from_env(os.environ, local_env_index)
         if self.share_memory:
             dummy = env_fn()
             obs_space = dummy.observation_space

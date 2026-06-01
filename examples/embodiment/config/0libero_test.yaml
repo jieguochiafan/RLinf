@@ -16,8 +16,7 @@ hydra:
 cluster:
   num_nodes: 1
   component_placement:
-    actor,rollout: all
-    env: 0-7:0
+    actor,env,rollout: all
 
 runner:
   task_type: embodied
@@ -27,7 +26,7 @@ runner:
     experiment_name: "libero_goal_ppo_openpi_pi05"
     logger_backends: ["tensorboard"] # wandb, swanlab
 
-  max_epochs: 2
+  max_epochs: 1
   max_steps: -1
 
   only_eval: False
@@ -90,9 +89,11 @@ env:
   # Override the default values in env/libero_goal
   train:
     total_num_envs: 112
-    subproc_gpu_round_robin: true
     max_episode_steps: 320 # max episode steps for truncation
     max_steps_per_rollout_epoch: 320
+
+    chunk_step_mode: parallel_shard
+
   eval:
     total_num_envs: 500
     auto_reset: True
@@ -111,7 +112,7 @@ rollout:
   generation_backend: "huggingface"
   recompute_logprobs: False
   unnorm_key: libero_10
-  enable_offload: False
+  enable_offload: True
   pipeline_stage_num: 1
 
   model:
@@ -124,7 +125,7 @@ actor:
   micro_batch_size: 128
   global_batch_size: 1024 # maximum : global batch size = micro batch size * actor num_processes.
   seed: 42
-  enable_offload: False
+  enable_offload: True
 
   # Override the default values in model/pi0_5
   model:

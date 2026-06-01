@@ -26,6 +26,20 @@ import numpy as np
 import torch
 from omegaconf.omegaconf import OmegaConf
 
+from rlinf.envs.chunk_runner import (
+    build_chunk_done_outputs,
+    maybe_apply_ignore_terminations,
+)
+from rlinf.envs.libero.utils import (
+    get_benchmark_overridden,
+    get_libero_image,
+    get_libero_type,
+    get_libero_wrist_image,
+    quat2axisangle,
+)
+from rlinf.envs.libero.venv import ReconfigureSubprocEnv
+from rlinf.envs.utils import list_of_dict_to_dict_of_list, to_tensor
+
 logger = logging.getLogger(__name__)
 
 
@@ -160,7 +174,9 @@ class ActProbe:
         ckpt = torch.load(cfg.checkpoint_path, map_location="cpu", weights_only=False)
         ckpt_tau = ckpt.get("sw_threshold", ckpt.get("tau", 0.5))
         self.tau = cfg.get("initial_tau", ckpt_tau)  # override if specified
-        self.norm_mean = np.asarray(ckpt["norm_mean"], dtype=np.float32)  # (11,) includes t/T
+        self.norm_mean = np.asarray(
+            ckpt["norm_mean"], dtype=np.float32
+        )  # (11,) includes t/T
         self.norm_std = np.asarray(ckpt["norm_std"], dtype=np.float32)  # (11,)
         if self.tau != ckpt_tau:
             logger.info(
@@ -218,9 +234,7 @@ class ActProbe:
                     f"[ActProbe] lang encoder loaded from {lang_model_path}, emb dim={self._lang_emb.shape[1]}"
                 )
             except Exception as e:
-                logger.warning(
-                    f"[ActProbe] lang encoder failed: {e}, using zero init"
-                )
+                logger.warning(f"[ActProbe] lang encoder failed: {e}, using zero init")
                 self._lang_emb = None
         else:
             self.model = _WholeModel(input_dim=11, hidden_dim=32, mlp_dims=(16, 8))
@@ -380,7 +394,6 @@ class ActProbe:
             features: (num_envs, 10) numpy
         """
         num_envs = chunk_actions.shape[0]
-        chunk_size = chunk_actions.shape[1]
 
         # 1. action_norm_mean
         action_norms = np.linalg.norm(chunk_actions, axis=-1)  # (E, C)
@@ -954,16 +967,6 @@ class ActProbe:
         return feat, tgt, mask, lengths
 
 
-from rlinf.envs.libero.utils import (
-    get_benchmark_overridden,
-    get_libero_image,
-    get_libero_type,
-    get_libero_wrist_image,
-    quat2axisangle,
-)
-from rlinf.envs.libero.venv import ReconfigureSubprocEnv
-from rlinf.envs.utils import list_of_dict_to_dict_of_list, to_tensor
-
 libero_type = get_libero_type()
 
 if libero_type in ["pro", "plus"]:
@@ -1029,6 +1032,8 @@ class LiberoEnv(gym.Env):
 
         self.ignore_terminations = cfg.ignore_terminations
         self.auto_reset = cfg.auto_reset
+        self.chunk_step_mode = cfg.get("chunk_step_mode", "sync_time_major")
+        self.chunk_step_num_shards = int(cfg.get("chunk_step_num_shards", 1))
 
         self._generator = np.random.default_rng(seed=self.seed)
         self._generator_ordered = np.random.default_rng(seed=0)
@@ -1070,10 +1075,13 @@ class LiberoEnv(gym.Env):
             os.makedirs(self._collect_save_dir, exist_ok=True)
             self._collect_max_eps = collect_cfg.get("max_episodes", 300)
             self._collect_rank = seed_offset  # use as rank identifier
-            self._collect_buffers = {i: self._new_collect_buf() for i in range(self.num_envs)}
+            self._collect_buffers = {
+                i: self._new_collect_buf() for i in range(self.num_envs)
+            }
             self._collect_done = np.zeros(self.num_envs, dtype=bool)
             self._collect_episodes = []
             import atexit
+
             atexit.register(self._save_collect_data)
             logger.info(
                 f"[LiberoEnv] Probe data collection ON: save_dir={self._collect_save_dir}, "
@@ -1491,15 +1499,24 @@ class LiberoEnv(gym.Env):
     # ── Probe data collection helpers ──────────────────────────────
 
     def _new_collect_buf(self):
-        return {"action_norms": [], "gripper_qpos": [], "eef_pos": [],
-                "denoising_curvature": [], "action_chunks": [], "success": False}
+        return {
+            "action_norms": [],
+            "gripper_qpos": [],
+            "eef_pos": [],
+            "denoising_curvature": [],
+            "action_chunks": [],
+            "success": False,
+        }
 
     def _collect_chunk(self, chunk_actions, obs_list, dc, raw_terms, raw_truncs):
         """Record probe features from one chunk_step call."""
         if not self._collecting or len(self._collect_episodes) >= self._collect_max_eps:
             return
-        chunk_actions_np = (chunk_actions.cpu().numpy()
-                            if isinstance(chunk_actions, torch.Tensor) else chunk_actions)
+        chunk_actions_np = (
+            chunk_actions.cpu().numpy()
+            if isinstance(chunk_actions, torch.Tensor)
+            else chunk_actions
+        )
         chunk_size = chunk_actions_np.shape[1]
         for ei in range(self.num_envs):
             if self._collect_done[ei]:
@@ -1514,18 +1531,32 @@ class LiberoEnv(gym.Env):
                 if isinstance(s, torch.Tensor):
                     s = s[ei].cpu().numpy()
                 elif isinstance(s, list):
-                    s = s[ei].cpu().numpy() if isinstance(s[ei], torch.Tensor) else np.array(s[ei])
+                    s = (
+                        s[ei].cpu().numpy()
+                        if isinstance(s[ei], torch.Tensor)
+                        else np.array(s[ei])
+                    )
                 else:
-                    s = np.array(s[ei]) if hasattr(s, '__getitem__') else np.array(s)
+                    s = np.array(s[ei]) if hasattr(s, "__getitem__") else np.array(s)
                 buf["gripper_qpos"].append(s[6:8].copy())
                 buf["eef_pos"].append(s[:3].copy())
             # Per chunk-step features
             if dc is not None:
-                buf["denoising_curvature"].append(float(dc[ei]) if not isinstance(dc[ei], float) else dc[ei])
+                buf["denoising_curvature"].append(
+                    float(dc[ei]) if not isinstance(dc[ei], float) else dc[ei]
+                )
             buf["action_chunks"].append(chunk_actions_np[ei].copy())
             # Episode boundary
-            term = raw_terms[ei].any().item() if isinstance(raw_terms, torch.Tensor) else bool(raw_terms[ei].any())
-            trunc = raw_truncs[ei].any().item() if isinstance(raw_truncs, torch.Tensor) else bool(raw_truncs[ei].any())
+            term = (
+                raw_terms[ei].any().item()
+                if isinstance(raw_terms, torch.Tensor)
+                else bool(raw_terms[ei].any())
+            )
+            trunc = (
+                raw_truncs[ei].any().item()
+                if isinstance(raw_truncs, torch.Tensor)
+                else bool(raw_truncs[ei].any())
+            )
             if term:
                 buf["success"] = True
             if term or trunc:
@@ -1542,7 +1573,9 @@ class LiberoEnv(gym.Env):
         if length > 1:
             eef_vel[1:] = np.diff(eef_pos, axis=0)
         task_id = int(self.task_ids[ei]) if hasattr(self, "task_ids") else 0
-        task_desc = self.task_descriptions[ei] if hasattr(self, "task_descriptions") else ""
+        task_desc = (
+            self.task_descriptions[ei] if hasattr(self, "task_descriptions") else ""
+        )
         episode = {
             "episode_id": len(self._collect_episodes),
             "task_id": task_id,
@@ -1556,14 +1589,18 @@ class LiberoEnv(gym.Env):
             "gripper_qpos": np.array(buf["gripper_qpos"], dtype=np.float32),
             "eef_pos": eef_pos,
             "eef_vel": eef_vel,
-            "denoising_curvature": np.array(buf["denoising_curvature"], dtype=np.float32),
+            "denoising_curvature": np.array(
+                buf["denoising_curvature"], dtype=np.float32
+            ),
             "failure_type": None if buf["success"] else "timeout",
         }
         self._collect_episodes.append(episode)
         self._collect_done[ei] = True
         self._collect_buffers[ei] = self._new_collect_buf()
         if len(self._collect_episodes) % 20 == 0:
-            logger.info(f"[ProbeCollect] rank={self._collect_rank} collected {len(self._collect_episodes)}/{self._collect_max_eps} episodes")
+            logger.info(
+                f"[ProbeCollect] rank={self._collect_rank} collected {len(self._collect_episodes)}/{self._collect_max_eps} episodes"
+            )
         if len(self._collect_episodes) >= self._collect_max_eps:
             self._save_collect_data()
 
@@ -1572,13 +1609,16 @@ class LiberoEnv(gym.Env):
         if not self._collect_episodes:
             return
         import pickle
-        path = os.path.join(self._collect_save_dir, f"probe_data_rank{self._collect_rank}.pkl")
+
+        path = os.path.join(
+            self._collect_save_dir, f"probe_data_rank{self._collect_rank}.pkl"
+        )
         with open(path, "wb") as f:
             pickle.dump(self._collect_episodes, f)
         n_s = sum(1 for e in self._collect_episodes if e["success"])
         logger.info(
             f"[ProbeCollect] Saved {len(self._collect_episodes)} episodes "
-            f"({n_s}S/{len(self._collect_episodes)-n_s}F) to {path}"
+            f"({n_s}S/{len(self._collect_episodes) - n_s}F) to {path}"
         )
 
     def reset_collect_state(self):
@@ -1751,6 +1791,15 @@ class LiberoEnv(gym.Env):
         )
 
     def chunk_step(self, chunk_actions, denoising_curvature=None):
+        if self.chunk_step_mode == "latency_balanced_pair":
+            return self._chunk_step_latency_balanced_pair(chunk_actions)
+        if self.chunk_step_mode == "parallel_shard":
+            return self._chunk_step_parallel_shard(chunk_actions)
+        return self._chunk_step_sync_time_major(
+            chunk_actions, denoising_curvature=denoising_curvature
+        )
+
+    def _chunk_step_sync_time_major(self, chunk_actions, denoising_curvature=None):
         # chunk_actions: [num_envs, chunk_step, action_dim]
         chunk_size = chunk_actions.shape[1]
         obs_list = []
@@ -1782,8 +1831,13 @@ class LiberoEnv(gym.Env):
 
         # ── Probe data collection (before auto_reset modifies terminations) ──
         if self._collecting:
-            self._collect_chunk(chunk_actions, obs_list, denoising_curvature,
-                                raw_chunk_terminations, raw_chunk_truncations)
+            self._collect_chunk(
+                chunk_actions,
+                obs_list,
+                denoising_curvature,
+                raw_chunk_terminations,
+                raw_chunk_truncations,
+            )
 
         past_terminations = raw_chunk_terminations.any(dim=1)
         past_truncations = raw_chunk_truncations.any(dim=1)
@@ -1818,6 +1872,161 @@ class LiberoEnv(gym.Env):
             )
             self.probe.predict(features)
             # probe.predicted_fail is updated in-place; env_worker reads it directly
+
+        return (
+            obs_list,
+            chunk_rewards,
+            chunk_terminations,
+            chunk_truncations,
+            infos_list,
+        )
+
+    def _chunk_step_parallel_shard(self, chunk_actions):
+        # chunk_actions: [num_envs, chunk_step, action_dim]
+        if isinstance(chunk_actions, torch.Tensor):
+            chunk_actions = chunk_actions.detach().cpu().numpy()
+
+        (
+            raw_obs_list,
+            _reward_list,
+            terminations_list,
+            info_lists_list,
+        ) = self.env.chunk_step(chunk_actions)
+
+        obs_list = []
+        infos_list = []
+        chunk_rewards = []
+        raw_chunk_terminations = []
+        raw_chunk_truncations = []
+
+        for raw_obs, terminations, info_lists in zip(
+            raw_obs_list, terminations_list, info_lists_list
+        ):
+            self._elapsed_steps += 1
+            self.current_raw_obs = raw_obs
+            infos = list_of_dict_to_dict_of_list(info_lists)
+            terminations = np.asarray(terminations).astype(bool)
+            truncations = self.elapsed_steps >= self.cfg.max_episode_steps
+            obs = self._wrap_obs(raw_obs)
+
+            step_reward = self._calc_step_reward(terminations)
+            infos = self._record_metrics(step_reward, terminations, infos)
+            if self.ignore_terminations:
+                infos["episode"]["success_at_end"] = to_tensor(terminations)
+                terminations[:] = False
+
+            obs_list.append(obs)
+            infos_list.append(infos)
+            chunk_rewards.append(to_tensor(step_reward))
+            raw_chunk_terminations.append(to_tensor(terminations))
+            raw_chunk_truncations.append(to_tensor(truncations))
+
+        chunk_rewards = torch.stack(chunk_rewards, dim=1)
+        raw_chunk_terminations = torch.stack(raw_chunk_terminations, dim=1)
+        raw_chunk_truncations = torch.stack(raw_chunk_truncations, dim=1)
+
+        raw_chunk_terminations = maybe_apply_ignore_terminations(
+            raw_chunk_terminations, self.ignore_terminations
+        )
+        (
+            chunk_terminations,
+            chunk_truncations,
+            past_terminations,
+            past_truncations,
+            past_dones,
+        ) = build_chunk_done_outputs(
+            raw_chunk_terminations,
+            raw_chunk_truncations,
+            collapse_to_last_step=self.auto_reset or self.ignore_terminations,
+        )
+
+        if past_dones.any() and self.auto_reset:
+            obs_list[-1], infos_list[-1] = self._handle_auto_reset(
+                past_dones.cpu().numpy(), obs_list[-1], infos_list[-1]
+            )
+
+        return (
+            obs_list,
+            chunk_rewards,
+            chunk_terminations,
+            chunk_truncations,
+            infos_list,
+        )
+
+    def _chunk_step_latency_balanced_pair(self, chunk_actions):
+        # chunk_actions: [num_envs, chunk_step, action_dim]
+        if isinstance(chunk_actions, torch.Tensor):
+            chunk_actions = chunk_actions.detach().cpu().numpy()
+
+        pair_cfg = self.cfg.get("latency_balanced_pair", {})
+        (
+            raw_obs_list,
+            _reward_list,
+            terminations_list,
+            info_lists_list,
+        ) = self.env.latency_balanced_pair_chunk_step(
+            chunk_actions,
+            envs_per_core=int(pair_cfg.get("envs_per_core", 1)),
+            ema_alpha=float(pair_cfg.get("ema_alpha", 0.3)),
+            initial_latency_ms=pair_cfg.get("initial_latency_ms", None),
+            dynamic_affinity=bool(pair_cfg.get("dynamic_affinity", True)),
+            core_donation_enabled=bool(pair_cfg.get("core_donation_enabled", True)),
+            core_donation_max_extra_groups=int(
+                pair_cfg.get("core_donation_max_extra_groups", 1)
+            ),
+        )
+
+        obs_list = []
+        infos_list = []
+        chunk_rewards = []
+        raw_chunk_terminations = []
+        raw_chunk_truncations = []
+
+        for raw_obs, terminations, info_lists in zip(
+            raw_obs_list, terminations_list, info_lists_list
+        ):
+            self._elapsed_steps += 1
+            self.current_raw_obs = raw_obs
+            infos = list_of_dict_to_dict_of_list(info_lists)
+            terminations = np.asarray(terminations).astype(bool)
+            truncations = self.elapsed_steps >= self.cfg.max_episode_steps
+            obs = self._wrap_obs(raw_obs)
+
+            step_reward = self._calc_step_reward(terminations)
+            infos = self._record_metrics(step_reward, terminations, infos)
+            if self.ignore_terminations:
+                infos["episode"]["success_at_end"] = to_tensor(terminations)
+                terminations[:] = False
+
+            obs_list.append(obs)
+            infos_list.append(infos)
+            chunk_rewards.append(to_tensor(step_reward))
+            raw_chunk_terminations.append(to_tensor(terminations))
+            raw_chunk_truncations.append(to_tensor(truncations))
+
+        chunk_rewards = torch.stack(chunk_rewards, dim=1)
+        raw_chunk_terminations = torch.stack(raw_chunk_terminations, dim=1)
+        raw_chunk_truncations = torch.stack(raw_chunk_truncations, dim=1)
+
+        raw_chunk_terminations = maybe_apply_ignore_terminations(
+            raw_chunk_terminations, self.ignore_terminations
+        )
+        (
+            chunk_terminations,
+            chunk_truncations,
+            past_terminations,
+            past_truncations,
+            past_dones,
+        ) = build_chunk_done_outputs(
+            raw_chunk_terminations,
+            raw_chunk_truncations,
+            collapse_to_last_step=self.auto_reset or self.ignore_terminations,
+        )
+
+        if past_dones.any() and self.auto_reset:
+            obs_list[-1], infos_list[-1] = self._handle_auto_reset(
+                past_dones.cpu().numpy(), obs_list[-1], infos_list[-1]
+            )
 
         return (
             obs_list,
