@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import asyncio
+import contextlib
 import gc
 import json
 import os
@@ -47,6 +48,7 @@ from rlinf.utils.nested_dict_process import (
     update_nested_cfg,
 )
 from rlinf.utils.placement import HybridComponentPlacement
+from rlinf.utils.profile_timeline import write_time_anchor
 from rlinf.workers.env.history_manager import HistoryManager
 
 
@@ -138,6 +140,9 @@ class EnvWorker(Worker):
             else 0
         )
         self._sim_timestamp_file = None
+        self._torch_profiler = None
+        self._torch_profiler_dir = None
+        self._torch_profiler_step_enabled = False
         self.enable_offload = (
             train_env_cfg.get("enable_offload", False)
             if train_env_cfg is not None
@@ -288,6 +293,63 @@ class EnvWorker(Worker):
             path = os.path.join(output_dir, f"env_rank_{self._rank}.jsonl")
             self._sim_timestamp_file = open(path, "a", encoding="utf-8", buffering=1)
         self._sim_timestamp_file.write(json.dumps(event, sort_keys=True) + "\n")
+
+    def _start_torch_profiler(self) -> None:
+        if self._torch_profiler is not None:
+            return
+        if os.environ.get("RLINF_TORCH_PROFILE") != "1":
+            return
+        from torch.profiler import (
+            ProfilerActivity,
+            profile,
+            schedule,
+            tensorboard_trace_handler,
+        )
+
+        output_dir = os.path.join(
+            os.environ.get("RLINF_TORCH_PROFILE_DIR", "torch_prof"),
+            f"env_rank{self._rank}",
+        )
+        os.makedirs(output_dir, exist_ok=True)
+        self._torch_profiler_dir = output_dir
+        write_time_anchor(output_dir, component="env", rank=self._rank)
+        self._torch_profiler = profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            schedule=schedule(wait=5, warmup=3, active=10, repeat=1),
+            on_trace_ready=tensorboard_trace_handler(output_dir),
+            record_shapes=False,
+            profile_memory=False,
+            with_stack=False,
+        )
+        self._torch_profiler.start()
+        self._torch_profiler_step_enabled = True
+
+    def _step_torch_profiler(self) -> None:
+        if self._torch_profiler is not None and self._torch_profiler_step_enabled:
+            self._torch_profiler.step()
+
+    def _stop_torch_profiler(self) -> None:
+        if self._torch_profiler is None:
+            return
+        self._torch_profiler.stop()
+        if self._torch_profiler_dir is not None:
+            with open(
+                os.path.join(self._torch_profiler_dir, "op_summary.txt"),
+                "w",
+                encoding="utf-8",
+            ) as f:
+                f.write(
+                    self._torch_profiler.key_averages().table(
+                        sort_by="cuda_time_total", row_limit=40
+                    )
+                )
+        self._torch_profiler = None
+        self._torch_profiler_step_enabled = False
+
+    def _profile_env_step_context(self):
+        if self._torch_profiler is None:
+            return contextlib.nullcontext()
+        return torch.profiler.record_function("env.step")
 
     def _iter_env_subworkers(self, env) -> list[Any]:
         current = env
@@ -745,17 +807,19 @@ class EnvWorker(Worker):
             }
         self._set_subenv_timestamp_context(target_env, subenv_timestamp_context)
         try:
-            (
-                obs_list,
-                chunk_rewards,
-                chunk_terminations,
-                chunk_truncations,
-                infos_list,
-            ) = target_env.chunk_step(
-                chunk_actions, denoising_curvature=denoising_curvature
-            )
+            with self._profile_env_step_context():
+                (
+                    obs_list,
+                    chunk_rewards,
+                    chunk_terminations,
+                    chunk_truncations,
+                    infos_list,
+                ) = target_env.chunk_step(
+                    chunk_actions, denoising_curvature=denoising_curvature
+                )
         finally:
             self._set_subenv_timestamp_context(target_env, None)
+        self._step_torch_profiler()
         if log_sim_timestamps:
             wall_end_ns = time.time_ns()
             duration_s = time.perf_counter() - perf_start
@@ -2499,31 +2563,35 @@ class EnvWorker(Worker):
         reward_channel: Channel | None,
         actor_channel: Channel | None = None,
     ):
-        self._interact_step_count += 1
+        self._start_torch_profiler()
+        try:
+            self._interact_step_count += 1
 
-        # Apply pending probe retrain before step starts (avoid 1-step lag)
-        v10_cfg = self.cfg.env.train.get("v10_dynamic_stop", {})
-        if v10_cfg.get("enabled", False):
-            for stage_id in range(self.stage_num):
-                env_obj = self.env_list[stage_id]
-                while hasattr(env_obj, "env") and not hasattr(env_obj, "probe"):
-                    env_obj = env_obj.env
-                if hasattr(env_obj, "probe") and env_obj.probe is not None:
-                    env_obj.probe.apply_pending()
+            # Apply pending probe retrain before step starts (avoid 1-step lag)
+            v10_cfg = self.cfg.env.train.get("v10_dynamic_stop", {})
+            if v10_cfg.get("enabled", False):
+                for stage_id in range(self.stage_num):
+                    env_obj = self.env_list[stage_id]
+                    while hasattr(env_obj, "env") and not hasattr(env_obj, "probe"):
+                        env_obj = env_obj.env
+                    if hasattr(env_obj, "probe") and env_obj.probe is not None:
+                        env_obj.probe.apply_pending()
 
-        env_metrics = await self._run_interact_once(
-            input_channel,
-            rollout_channel,
-            reward_channel,
-            actor_channel,
-            cooperative_yield=False,
-        )
+            env_metrics = await self._run_interact_once(
+                input_channel,
+                rollout_channel,
+                reward_channel,
+                actor_channel,
+                cooperative_yield=False,
+            )
 
-        for env in self.env_list:
-            if self.enable_offload and hasattr(env, "offload"):
-                env.offload()
+            for env in self.env_list:
+                if self.enable_offload and hasattr(env, "offload"):
+                    env.offload()
 
-        return env_metrics
+            return env_metrics
+        finally:
+            self._stop_torch_profiler()
 
     def evaluate(self, input_channel: Channel, rollout_channel: Channel):
         eval_metrics = defaultdict(list)

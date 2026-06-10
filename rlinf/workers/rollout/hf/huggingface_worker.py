@@ -12,8 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import copy
 import gc
+import json
+import os
+import time
 from typing import Any, Literal
 
 import numpy as np
@@ -31,6 +35,7 @@ from rlinf.models.embodiment.base_policy import BasePolicy
 from rlinf.scheduler import Channel, Cluster, Worker
 from rlinf.utils.comm_mapping import CommMapper
 from rlinf.utils.placement import HybridComponentPlacement
+from rlinf.utils.profile_timeline import write_time_anchor
 
 
 class MultiStepRolloutWorker(Worker):
@@ -39,6 +44,19 @@ class MultiStepRolloutWorker(Worker):
 
         self.cfg = cfg
         self.should_stop = False
+        train_env_cfg = cfg.env.get("train", None)
+        self.log_generation_timestamps = bool(
+            self.cfg.rollout.get(
+                "log_generation_timestamps",
+                train_env_cfg.get("log_sim_timestamps", False)
+                if train_env_cfg is not None
+                else False,
+            )
+        )
+        self._generation_timestamp_file = None
+        self._torch_profiler = None
+        self._torch_profiler_dir = None
+        self._torch_profiler_step_enabled = False
 
         # Fix global RNG for reproducibility (per-rank seed)
         import random
@@ -222,6 +240,98 @@ class MultiStepRolloutWorker(Worker):
                 f"Beta schedule {self._dagger_sampling_params['beta_schedule']} is not implemented"
             )
 
+    def _write_generation_timestamp_event(self, event: dict[str, Any]) -> None:
+        if self._generation_timestamp_file is None:
+            output_dir = os.path.join(
+                str(self.cfg.runner.logger.log_path), "rollout_generation_timestamps"
+            )
+            os.makedirs(output_dir, exist_ok=True)
+            path = os.path.join(output_dir, f"rollout_rank_{self._rank}.jsonl")
+            self._generation_timestamp_file = open(
+                path, "a", encoding="utf-8", buffering=1
+            )
+        self._generation_timestamp_file.write(
+            json.dumps(event, sort_keys=True) + "\n"
+        )
+
+    def _build_generation_timestamp_event(
+        self,
+        event: str,
+        mode: str,
+        profile_context: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        payload = {
+            "event": event,
+            "rank": self._rank,
+            "pid": os.getpid(),
+            "mode": mode,
+            "wall_ns": time.time_ns(),
+        }
+        if profile_context:
+            payload.update(profile_context)
+        return payload
+
+    def _start_torch_profiler(self) -> None:
+        if self._torch_profiler is not None:
+            return
+        if os.environ.get("RLINF_TORCH_PROFILE") != "1":
+            return
+        from torch.profiler import (
+            ProfilerActivity,
+            profile,
+            schedule,
+            tensorboard_trace_handler,
+        )
+
+        output_dir = os.path.join(
+            os.environ.get("RLINF_TORCH_PROFILE_DIR", "torch_prof"),
+            f"rollout_rank{self._rank}",
+        )
+        os.makedirs(output_dir, exist_ok=True)
+        self._torch_profiler_dir = output_dir
+        write_time_anchor(output_dir, component="generation", rank=self._rank)
+        self._torch_profiler = profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            schedule=schedule(wait=5, warmup=3, active=10, repeat=1),
+            on_trace_ready=tensorboard_trace_handler(output_dir),
+            record_shapes=False,
+            profile_memory=False,
+            with_stack=False,
+        )
+        self._torch_profiler.start()
+        self._torch_profiler_step_enabled = True
+
+    def _step_torch_profiler(self) -> None:
+        if self._torch_profiler is not None and self._torch_profiler_step_enabled:
+            self._torch_profiler.step()
+
+    def _stop_torch_profiler(self) -> None:
+        if self._torch_profiler is None:
+            return
+        self._torch_profiler.stop()
+        if self._torch_profiler_dir is not None:
+            with open(
+                os.path.join(self._torch_profiler_dir, "op_summary.txt"),
+                "w",
+                encoding="utf-8",
+            ) as f:
+                f.write(
+                    self._torch_profiler.key_averages().table(
+                        sort_by="cuda_time_total", row_limit=40
+                    )
+                )
+        self._torch_profiler = None
+        self._torch_profiler_step_enabled = False
+
+    def _profile_generation_context(self, profile_context: dict[str, Any] | None):
+        if (
+            self._torch_profiler is None
+            or profile_context is None
+            or profile_context.get("phase") != "action_generation"
+        ):
+            return contextlib.nullcontext()
+        return torch.profiler.record_function("generation")
+
     def _setup_dst_ranks(self, batch_size: int) -> list[tuple[int, int]]:
         """Compute env peer ranks for this rollout worker.
 
@@ -258,8 +368,20 @@ class MultiStepRolloutWorker(Worker):
 
     @Worker.timer("predict")
     def predict(
-        self, env_obs: dict[str, Any], mode: Literal["train", "eval"] = "train"
+        self,
+        env_obs: dict[str, Any],
+        mode: Literal["train", "eval"] = "train",
+        profile_context: dict[str, Any] | None = None,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
+        perf_start = None
+        if self.log_generation_timestamps:
+            perf_start = time.perf_counter()
+            self._write_generation_timestamp_event(
+                self._build_generation_timestamp_event(
+                    "start", mode, profile_context
+                )
+            )
+
         kwargs = (
             self._train_sampling_params
             if mode == "train"
@@ -298,45 +420,69 @@ class MultiStepRolloutWorker(Worker):
         with torch.no_grad():
             expert_label_flag = False
             # Decide which model to act via use_expert
-            if use_expert:
-                actions, result = self.expert_model.predict_action_batch(
-                    env_obs=env_obs,
-                    **kwargs,
-                )
-                expert_label_flag = True
-            else:
-                actions, result = self.hf_model.predict_action_batch(
-                    env_obs=env_obs,
-                    **kwargs,
-                )
+            with self._profile_generation_context(profile_context):
+                if use_expert:
+                    actions, result = self.expert_model.predict_action_batch(
+                        env_obs=env_obs,
+                        **kwargs,
+                    )
+                    expert_label_flag = True
+                else:
+                    actions, result = self.hf_model.predict_action_batch(
+                        env_obs=env_obs,
+                        **kwargs,
+                    )
 
-            # Decide re-label or not
-            if (
-                not only_save_expert  # only re-label in classic dagger mode
-                and not use_expert  # only re-label if not using expert
-                and self.expert_model is not None  # only re-label if expert exists
-                and mode == "train"  # only re-label in train mode
+                # Decide re-label or not
+                if (
+                    not only_save_expert  # only re-label in classic dagger mode
+                    and not use_expert  # only re-label if not using expert
+                    and self.expert_model is not None  # only re-label if expert exists
+                    and mode == "train"  # only re-label in train mode
+                ):
+                    _, expert_result = self.expert_model.predict_action_batch(
+                        env_obs=env_obs,
+                        **kwargs,
+                    )
+                    expert_forward_inputs = expert_result["forward_inputs"]
+                    expert_target = expert_forward_inputs.get(
+                        "model_action", expert_forward_inputs.get("action")
+                    )
+                    if expert_target is not None:
+                        result["forward_inputs"]["model_action"] = expert_target
+                    expert_label_flag = True
+
+                if self._torch_profiler is not None and torch.cuda.is_available():
+                    torch.cuda.synchronize()
+
+            if self._torch_profiler is not None and (
+                profile_context is None
+                or profile_context.get("phase") == "action_generation"
             ):
-                _, expert_result = self.expert_model.predict_action_batch(
-                    env_obs=env_obs,
-                    **kwargs,
-                )
-                expert_forward_inputs = expert_result["forward_inputs"]
-                expert_target = expert_forward_inputs.get(
-                    "model_action", expert_forward_inputs.get("action")
-                )
-                if expert_target is not None:
-                    result["forward_inputs"]["model_action"] = expert_target
-                expert_label_flag = True
+                self._step_torch_profiler()
 
         if isinstance(actions, np.ndarray):
             actions = torch.from_numpy(actions)
+
+        if self.log_generation_timestamps and perf_start is not None:
+            end_event = self._build_generation_timestamp_event(
+                "end", mode, profile_context
+            )
+            end_event.update(
+                {
+                    "duration_s": time.perf_counter() - perf_start,
+                    "batch_size": int(actions.shape[0]) if actions.ndim > 0 else 1,
+                }
+            )
+            self._write_generation_timestamp_event(end_event)
 
         result["expert_label_flag"] = bool(expert_label_flag)
         return actions, result
 
     def get_bootstrap_values(
-        self, final_obs: dict[str, Any] | None
+        self,
+        final_obs: dict[str, Any] | None,
+        profile_context: dict[str, Any] | None = None,
     ) -> torch.Tensor | None:
         if final_obs is None:
             return None
@@ -345,7 +491,7 @@ class MultiStepRolloutWorker(Worker):
         ):
             return None
         with torch.no_grad():
-            actions, result = self.predict(final_obs)
+            actions, result = self.predict(final_obs, profile_context=profile_context)
             if "prev_values" in result and result["prev_values"] is not None:
                 final_values = result["prev_values"]
             else:
@@ -398,11 +544,16 @@ class MultiStepRolloutWorker(Worker):
         self.torch_platform.empty_cache()
 
     @Worker.timer("generate_one_epoch")
-    async def generate_one_epoch(self, input_channel: Channel, output_channel: Channel):
+    async def generate_one_epoch(
+        self,
+        input_channel: Channel,
+        output_channel: Channel,
+        epoch_idx: int | None = None,
+    ):
         self.update_dagger_beta()
         _last_rollout_result = None  # cache for dummy reuse when all envs done
-        for _ in range(self.n_train_chunk_steps):
-            for _ in range(self.num_pipeline_stages):
+        for chunk_step_idx in range(self.n_train_chunk_steps):
+            for stage_id in range(self.num_pipeline_stages):
                 env_output = await self.recv_env_output(input_channel)
 
                 # v10: skip predict if all envs done
@@ -423,7 +574,15 @@ class MultiStepRolloutWorker(Worker):
                         versions=_last_rollout_result.versions,
                     )
                 else:
-                    actions, result = self.predict(env_output["obs"])
+                    profile_context = {
+                        "epoch": epoch_idx,
+                        "chunk_step": chunk_step_idx,
+                        "stage": stage_id,
+                        "phase": "action_generation",
+                    }
+                    actions, result = self.predict(
+                        env_output["obs"], profile_context=profile_context
+                    )
 
                     save_flags = None
                     if result.get("expert_label_flag", False):
@@ -442,7 +601,11 @@ class MultiStepRolloutWorker(Worker):
                         if self.collect_prev_infos
                         else None,
                         bootstrap_values=self.get_bootstrap_values(
-                            env_output.get("final_obs", None)
+                            env_output.get("final_obs", None),
+                            profile_context={
+                                **profile_context,
+                                "phase": "bootstrap_value_generation",
+                            },
                         ),
                         save_flags=save_flags,
                         forward_inputs=result["forward_inputs"],
@@ -454,7 +617,7 @@ class MultiStepRolloutWorker(Worker):
                     )
                     _last_rollout_result = rollout_result
                 self.send_rollout_result(output_channel, rollout_result, mode="train")
-        for _ in range(self.num_pipeline_stages):
+        for stage_id in range(self.num_pipeline_stages):
             env_output = await self.recv_env_output(input_channel)
 
             # v10: skip predict for final bootstrap too
@@ -470,14 +633,26 @@ class MultiStepRolloutWorker(Worker):
                     bootstrap_values=_last_rollout_result.bootstrap_values,
                 )
             else:
-                actions, result = self.predict(env_output["obs"])
+                profile_context = {
+                    "epoch": epoch_idx,
+                    "chunk_step": "bootstrap",
+                    "stage": stage_id,
+                    "phase": "action_generation",
+                }
+                actions, result = self.predict(
+                    env_output["obs"], profile_context=profile_context
+                )
                 rollout_result = RolloutResult(
                     actions=actions,
                     prev_values=result["prev_values"]
                     if self.collect_prev_infos
                     else None,
                     bootstrap_values=self.get_bootstrap_values(
-                        env_output.get("final_obs", None)
+                        env_output.get("final_obs", None),
+                        profile_context={
+                            **profile_context,
+                            "phase": "bootstrap_value_generation",
+                        },
                     ),
                 )
             self.send_rollout_result(output_channel, rollout_result, mode="train")
@@ -487,23 +662,27 @@ class MultiStepRolloutWorker(Worker):
         input_channel: Channel,
         output_channel: Channel,
     ):
-        if self.enable_offload:
-            self.reload_model()
+        self._start_torch_profiler()
+        try:
+            if self.enable_offload:
+                self.reload_model()
 
-        # v17: collect in 1 long epoch (env_worker splits later for actor)
-        v17_enabled = self.cfg.env.train.get("v17_continuous_collect", {}).get(
-            "enabled", False
-        )
-        actual_rollout_epoch = 1 if v17_enabled else self.rollout_epoch
-        for _ in tqdm(
-            range(actual_rollout_epoch),
-            desc="Generating Rollout Epochs",
-            disable=(self._rank != 0),
-        ):
-            await self.generate_one_epoch(input_channel, output_channel)
+            # v17: collect in 1 long epoch (env_worker splits later for actor)
+            v17_enabled = self.cfg.env.train.get("v17_continuous_collect", {}).get(
+                "enabled", False
+            )
+            actual_rollout_epoch = 1 if v17_enabled else self.rollout_epoch
+            for epoch_idx in tqdm(
+                range(actual_rollout_epoch),
+                desc="Generating Rollout Epochs",
+                disable=(self._rank != 0),
+            ):
+                await self.generate_one_epoch(input_channel, output_channel, epoch_idx)
 
-        if self.enable_offload:
-            self.offload_model()
+            if self.enable_offload:
+                self.offload_model()
+        finally:
+            self._stop_torch_profiler()
 
     async def evaluate(self, input_channel: Channel, output_channel: Channel):
         if self.enable_offload:

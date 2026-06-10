@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import os
 import sys
 import time
@@ -1472,147 +1473,209 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         )
         metrics = {}
         update_epoch = self.cfg.algorithm.get("update_epoch", 1)
-        for _ in range(update_epoch):
-            rollout_dataloader_iter = split_dict_to_chunk(
-                self.rollout_batch,
-                rollout_size // batch_size_per_rank,
+        # === RLINF_TORCH_PROFILE begin ===
+        import os as _os, torch as _torch
+
+        _PROF = None
+        if _os.environ.get("RLINF_TORCH_PROFILE") == "1":
+            from torch.profiler import (
+                ProfilerActivity as _A,
+                profile as _p,
+                schedule as _s,
+                tensorboard_trace_handler as _h,
             )
-            for train_global_batch in rollout_dataloader_iter:
-                # split batch into micro_batches
-                train_global_batch_size = train_global_batch["prev_logprobs"].shape[0]
-                assert (
-                    train_global_batch_size
-                    == self.cfg.actor.global_batch_size
-                    // torch.distributed.get_world_size()
-                )
-                assert train_global_batch_size % self.cfg.actor.micro_batch_size == 0, (
-                    f"{train_global_batch_size=}, {self.cfg.actor.micro_batch_size}"
-                )
 
-                train_micro_batch = split_dict_to_chunk(
-                    train_global_batch,
-                    train_global_batch_size // self.cfg.actor.micro_batch_size,
+            _rk = (
+                _torch.distributed.get_rank()
+                if _torch.distributed.is_initialized()
+                else 0
+            )
+            _od = _os.path.join(
+                _os.environ.get("RLINF_TORCH_PROFILE_DIR", "torch_prof"), f"rank{_rk}"
+            )
+            _os.makedirs(_od, exist_ok=True)
+            _PROF = _p(
+                activities=[_A.CPU, _A.CUDA],
+                schedule=_s(wait=5, warmup=3, active=10, repeat=1),
+                on_trace_ready=_h(_od),
+                record_shapes=False,
+                profile_memory=False,
+                with_stack=False,
+            )
+            _PROF.start()
+        _prof_section = (
+            _torch.profiler.record_function
+            if _PROF is not None
+            else lambda _name: contextlib.nullcontext()
+        )
+        # === end ===
+        try:
+            for _ in range(update_epoch):
+                rollout_dataloader_iter = split_dict_to_chunk(
+                    self.rollout_batch,
+                    rollout_size // batch_size_per_rank,
                 )
-
-                self.optimizer.zero_grad()
-                for idx, batch in enumerate(train_micro_batch):
-                    batch = put_tensor_device(
-                        batch,
-                        f"{Worker.torch_device_type}:{int(os.environ['LOCAL_RANK'])}",
+                for train_global_batch in rollout_dataloader_iter:
+                    # split batch into micro_batches
+                    train_global_batch_size = train_global_batch["prev_logprobs"].shape[
+                        0
+                    ]
+                    assert (
+                        train_global_batch_size
+                        == self.cfg.actor.global_batch_size
+                        // torch.distributed.get_world_size()
                     )
-                    backward_ctx = self.before_micro_batch(
-                        self.model,
-                        is_last_micro_batch=(idx + 1) == self.gradient_accumulation,
+                    assert (
+                        train_global_batch_size % self.cfg.actor.micro_batch_size == 0
+                    ), f"{train_global_batch_size=}, {self.cfg.actor.micro_batch_size}"
+
+                    train_micro_batch = split_dict_to_chunk(
+                        train_global_batch,
+                        train_global_batch_size // self.cfg.actor.micro_batch_size,
                     )
-                    advantages = batch["advantages"]
-                    prev_logprobs = batch["prev_logprobs"]
-                    returns = batch.get("returns", None)
-                    prev_values = batch.get("prev_values", None)
-                    loss_mask = batch.get("loss_mask", None)
-                    loss_mask_sum = batch.get("loss_mask_sum", None)
 
-                    forward_inputs = batch.get("forward_inputs", None)
-
-                    kwargs = {}
-                    if SupportedModel(self.cfg.actor.model.model_type) in [
-                        SupportedModel.OPENVLA,
-                        SupportedModel.OPENVLA_OFT,
-                    ]:
-                        kwargs["temperature"] = (
-                            self.cfg.algorithm.sampling_params.temperature_train
+                    self.optimizer.zero_grad()
+                    for idx, batch in enumerate(train_micro_batch):
+                        batch = put_tensor_device(
+                            batch,
+                            f"{Worker.torch_device_type}:{int(os.environ['LOCAL_RANK'])}",
                         )
-                        kwargs["top_k"] = self.cfg.algorithm.sampling_params.top_k
-                    elif (
-                        SupportedModel(self.cfg.actor.model.model_type)
-                        == SupportedModel.GR00T
-                    ):
-                        kwargs["prev_logprobs"] = prev_logprobs
+                        backward_ctx = self.before_micro_batch(
+                            self.model,
+                            is_last_micro_batch=(idx + 1) == self.gradient_accumulation,
+                        )
+                        advantages = batch["advantages"]
+                        prev_logprobs = batch["prev_logprobs"]
+                        returns = batch.get("returns", None)
+                        prev_values = batch.get("prev_values", None)
+                        loss_mask = batch.get("loss_mask", None)
+                        loss_mask_sum = batch.get("loss_mask_sum", None)
 
-                    compute_values = (
-                        True if self.cfg.algorithm.adv_type == "gae" else False
-                    )
+                        forward_inputs = batch.get("forward_inputs", None)
 
-                    with self.amp_context:
-                        output_dict = self.model(
-                            forward_inputs=forward_inputs,
-                            compute_logprobs=True,
-                            compute_entropy=self.cfg.algorithm.entropy_bonus > 0,
-                            compute_values=compute_values,
-                            use_cache=False,
-                            **kwargs,
+                        kwargs = {}
+                        if SupportedModel(self.cfg.actor.model.model_type) in [
+                            SupportedModel.OPENVLA,
+                            SupportedModel.OPENVLA_OFT,
+                        ]:
+                            kwargs["temperature"] = (
+                                self.cfg.algorithm.sampling_params.temperature_train
+                            )
+                            kwargs["top_k"] = self.cfg.algorithm.sampling_params.top_k
+                        elif (
+                            SupportedModel(self.cfg.actor.model.model_type)
+                            == SupportedModel.GR00T
+                        ):
+                            kwargs["prev_logprobs"] = prev_logprobs
+
+                        compute_values = (
+                            True if self.cfg.algorithm.adv_type == "gae" else False
                         )
 
-                    if (
-                        SupportedModel(self.cfg.actor.model.model_type)
-                        == SupportedModel.GR00T
-                    ):
-                        prev_logprobs = output_dict["prev_logprobs"]
+                        with _prof_section("fwd"):
+                            with self.amp_context:
+                                output_dict = self.model(
+                                    forward_inputs=forward_inputs,
+                                    compute_logprobs=True,
+                                    compute_entropy=self.cfg.algorithm.entropy_bonus > 0,
+                                    compute_values=compute_values,
+                                    use_cache=False,
+                                    **kwargs,
+                                )
 
-                    kwargs = {
-                        "loss_type": self.cfg.algorithm.loss_type,
-                        "logprob_type": self.cfg.algorithm.logprob_type,
-                        "reward_type": self.cfg.algorithm.reward_type,
-                        "single_action_dim": self.cfg.actor.model.get("action_dim", 7),
-                        "logprobs": output_dict["logprobs"],
-                        "values": output_dict.get("values", None),
-                        "old_logprobs": prev_logprobs,
-                        "advantages": advantages,
-                        "returns": returns,
-                        "prev_values": prev_values,
-                        "clip_ratio_high": self.cfg.algorithm.clip_ratio_high,
-                        "clip_ratio_low": self.cfg.algorithm.clip_ratio_low,
-                        "value_clip": self.cfg.algorithm.get("value_clip", None),
-                        "huber_delta": self.cfg.algorithm.get("huber_delta", None),
-                        "loss_mask": loss_mask,
-                        "loss_mask_sum": loss_mask_sum,
-                        "max_episode_steps": self.cfg.env.train.max_episode_steps,
-                        "task_type": self.cfg.runner.task_type,
-                        "critic_warmup": self.optimizer_steps
-                        < self.critic_warmup_steps,
+                        with _prof_section("loss"):
+                            if (
+                                SupportedModel(self.cfg.actor.model.model_type)
+                                == SupportedModel.GR00T
+                            ):
+                                prev_logprobs = output_dict["prev_logprobs"]
+
+                            kwargs = {
+                                "loss_type": self.cfg.algorithm.loss_type,
+                                "logprob_type": self.cfg.algorithm.logprob_type,
+                                "reward_type": self.cfg.algorithm.reward_type,
+                                "single_action_dim": self.cfg.actor.model.get(
+                                    "action_dim", 7
+                                ),
+                                "logprobs": output_dict["logprobs"],
+                                "values": output_dict.get("values", None),
+                                "old_logprobs": prev_logprobs,
+                                "advantages": advantages,
+                                "returns": returns,
+                                "prev_values": prev_values,
+                                "clip_ratio_high": self.cfg.algorithm.clip_ratio_high,
+                                "clip_ratio_low": self.cfg.algorithm.clip_ratio_low,
+                                "value_clip": self.cfg.algorithm.get("value_clip", None),
+                                "huber_delta": self.cfg.algorithm.get(
+                                    "huber_delta", None
+                                ),
+                                "loss_mask": loss_mask,
+                                "loss_mask_sum": loss_mask_sum,
+                                "max_episode_steps": self.cfg.env.train.max_episode_steps,
+                                "task_type": self.cfg.runner.task_type,
+                                "critic_warmup": self.optimizer_steps
+                                < self.critic_warmup_steps,
+                            }
+                            loss, metrics_data = policy_loss(**kwargs)
+
+                            entropy_loss = torch.tensor(
+                                0.0, device=Worker.torch_platform.current_device()
+                            )
+                            if (
+                                self.cfg.algorithm.entropy_bonus > 0
+                                and not kwargs["critic_warmup"]
+                            ):
+                                entropy = output_dict["entropy"]
+                                entropy = reshape_entropy(
+                                    entropy,
+                                    entropy_type=self.cfg.algorithm.entropy_type,
+                                    action_dim=self.cfg.actor.model.get("action_dim", 7),
+                                    batch_size=output_dict["logprobs"].shape[0],
+                                )
+                                entropy_loss = masked_mean(entropy, mask=loss_mask)
+                                loss -= self.cfg.algorithm.entropy_bonus * entropy_loss
+                            metrics_data["actor/entropy_loss"] = (
+                                entropy_loss.detach().item()
+                            )
+
+                            if self.enable_sft_co_train:
+                                self._train_sft_epoch(metrics_data, loss)
+
+                            loss /= self.gradient_accumulation
+                        with _prof_section("backward"):
+                            with backward_ctx:
+                                self.grad_scaler.scale(loss).backward()
+
+                        metrics_data["actor/total_loss"] = loss.detach().item()
+                        append_to_dict(metrics, metrics_data)
+                        # avoid gpu memory leak
+                        train_micro_batch[idx] = None
+                        del batch, output_dict, forward_inputs, loss, metrics_data
+                        if _PROF is not None:
+                            _PROF.step()
+
+                    self.torch_platform.empty_cache()
+
+                    with _prof_section("optimizer.step"):
+                        grad_norm, lr_list = self.optimizer_step()
+                    data = {
+                        "actor/grad_norm": grad_norm,
+                        "actor/lr": lr_list[0],
                     }
-                    loss, metrics_data = policy_loss(**kwargs)
-
-                    entropy_loss = torch.tensor(
-                        0.0, device=Worker.torch_platform.current_device()
-                    )
-                    if (
-                        self.cfg.algorithm.entropy_bonus > 0
-                        and not kwargs["critic_warmup"]
-                    ):
-                        entropy = output_dict["entropy"]
-                        entropy = reshape_entropy(
-                            entropy,
-                            entropy_type=self.cfg.algorithm.entropy_type,
-                            action_dim=self.cfg.actor.model.get("action_dim", 7),
-                            batch_size=output_dict["logprobs"].shape[0],
+                    if len(lr_list) > 1:
+                        data["critic/lr"] = lr_list[1]
+                    append_to_dict(metrics, data)
+        finally:
+            # === RLINF_TORCH_PROFILE finalize ===
+            if _PROF is not None:
+                _PROF.stop()
+                with open(_os.path.join(_od, "op_summary.txt"), "w") as _f:
+                    _f.write(
+                        _PROF.key_averages().table(
+                            sort_by="cuda_time_total", row_limit=40
                         )
-                        entropy_loss = masked_mean(entropy, mask=loss_mask)
-                        loss -= self.cfg.algorithm.entropy_bonus * entropy_loss
-                    metrics_data["actor/entropy_loss"] = entropy_loss.detach().item()
-
-                    if self.enable_sft_co_train:
-                        self._train_sft_epoch(metrics_data, loss)
-
-                    loss /= self.gradient_accumulation
-                    with backward_ctx:
-                        self.grad_scaler.scale(loss).backward()
-
-                    metrics_data["actor/total_loss"] = loss.detach().item()
-                    append_to_dict(metrics, metrics_data)
-                    # avoid gpu memory leak
-                    train_micro_batch[idx] = None
-                    del batch, output_dict, forward_inputs, loss, metrics_data
-
-                self.torch_platform.empty_cache()
-
-                grad_norm, lr_list = self.optimizer_step()
-                data = {
-                    "actor/grad_norm": grad_norm,
-                    "actor/lr": lr_list[0],
-                }
-                if len(lr_list) > 1:
-                    data["critic/lr"] = lr_list[1]
-                append_to_dict(metrics, data)
+                    )
+            # === end ===
         # put LR scheduler step here
         self.lr_scheduler.step()
         self.optimizer.zero_grad()
