@@ -14,10 +14,10 @@
 
 import os
 import types
+from pathlib import Path
 from unittest import mock
 
 import pytest
-import torch
 
 from rlinf.scheduler import (
     Cluster,
@@ -26,6 +26,29 @@ from rlinf.scheduler import (
     Worker,
     WorkerAddress,
 )
+from rlinf.scheduler.hardware import AcceleratorType
+from rlinf.scheduler.manager.coll_manager import CollectiveManager
+from rlinf.scheduler.manager.manager import Manager
+from rlinf.scheduler.placement import Placement
+
+
+def accelerator_is_available():
+    """Return whether the Worker accelerator backend is available."""
+    return (
+        Worker.torch_platform is not None
+        and hasattr(Worker.torch_platform, "is_available")
+        and Worker.torch_platform.is_available()
+    )
+
+
+def _worker_runtime_env_vars() -> dict[str, str]:
+    """Return env vars needed for Ray workers to import this test module."""
+    tests_root = Path(__file__).resolve().parent
+    python_path_entries = [str(tests_root)]
+    existing_pythonpath = os.environ.get("PYTHONPATH")
+    if existing_pythonpath:
+        python_path_entries.append(existing_pythonpath)
+    return {"PYTHONPATH": os.pathsep.join(python_path_entries)}
 
 
 # Fixture to provide a ClusterResource instance for the test session
@@ -72,6 +95,9 @@ class DistributedTestWorker(Worker):
             "node_local_rank": self._node_local_rank,
         }
 
+    def get_env_marker(self, key: str):
+        return os.environ.get(key)
+
     def sum_with_rank(self, value):
         """Adds the worker's rank to the given value."""
         return value + self._rank
@@ -83,7 +109,7 @@ class TestClusterResource:
     def test_cluster_initialization(self, cluster: Cluster):
         """Verify that the cluster is initialized with correct properties."""
         assert cluster._num_nodes == 1
-        if torch.cuda.is_available():
+        if accelerator_is_available():
             assert cluster.num_accelerators >= 1
 
 
@@ -98,17 +124,39 @@ class TestWorkerAddress:
         assert addr.get_name() == "MyWorkerGroup:5"
 
 
+class TestManagerNamespace:
+    """Tests for manager namespace propagation."""
+
+    def test_manager_runtime_env_vars_include_cluster_namespace(self):
+        """Verify manager runtime env always includes the cluster namespace."""
+        with mock.patch.object(Cluster, "NAMESPACE", "test-namespace"):
+            runtime_env = Manager.get_runtime_env_vars()
+
+        assert runtime_env["CLUSTER_NAMESPACE"] == "test-namespace"
+
+    def test_sync_cluster_namespace_from_env(self):
+        """Verify manager syncs the cluster namespace from its runtime env."""
+        with mock.patch.object(Cluster, "NAMESPACE", "original-namespace"):
+            with mock.patch.dict(
+                os.environ, {"CLUSTER_NAMESPACE": "env-namespace"}, clear=False
+            ):
+                CollectiveManager()
+                assert Cluster.NAMESPACE == "env-namespace"
+
+
 class TestWorkerGroup:
     """Tests for the WorkerGroup class and its interactions."""
 
     def test_worker_group_creation(self, cluster: Cluster):
         """Verify that a WorkerGroup can be created successfully."""
-        if torch.cuda.is_available():
+        if accelerator_is_available():
             num_workers = cluster.num_accelerators
         else:
             num_workers = 1
         worker_group = DistributedTestWorker.create_group().launch(
-            cluster=cluster, name="dist_test_1"
+            cluster=cluster,
+            name="dist_test_1",
+            env_vars=_worker_runtime_env_vars(),
         )
 
         # Check that the correct number of actors were created
@@ -122,12 +170,14 @@ class TestWorkerGroup:
 
     def test_execute_on_all_workers(self, cluster: Cluster):
         """Test calling a method on all workers in a group."""
-        if torch.cuda.is_available():
+        if accelerator_is_available():
             num_workers = cluster.num_accelerators
         else:
             num_workers = 1
         worker_group = DistributedTestWorker.create_group().launch(
-            cluster=cluster, name="dist_test_2"
+            cluster=cluster,
+            name="dist_test_2",
+            env_vars=_worker_runtime_env_vars(),
         )
 
         base_value = 10
@@ -139,12 +189,15 @@ class TestWorkerGroup:
 
     def test_execute_on_specific_ranks(self, cluster: Cluster):
         """Test calling a method on a subset of workers in a group."""
-        if torch.cuda.is_available():
+        if accelerator_is_available():
             placement = PackedPlacementStrategy(0, cluster.num_accelerators - 1)
         else:
             placement = NodePlacementStrategy([0] * 8)
         worker_group = DistributedTestWorker.create_group().launch(
-            cluster=cluster, placement_strategy=placement, name="dist_test_3"
+            cluster=cluster,
+            placement_strategy=placement,
+            name="dist_test_3",
+            env_vars=_worker_runtime_env_vars(),
         )
 
         target_ranks = (0, 1)
@@ -159,15 +212,19 @@ class TestWorkerGroup:
 
     def test_multiple_worker_groups(self, cluster: Cluster):
         """Test the creation and operation of multiple independent worker groups."""
-        if torch.cuda.is_available():
+        if accelerator_is_available():
             num_workers = cluster.num_accelerators
         else:
             num_workers = 1
         group1 = DistributedTestWorker.create_group().launch(
-            cluster=cluster, name="multi_group_1"
+            cluster=cluster,
+            name="multi_group_1",
+            env_vars=_worker_runtime_env_vars(),
         )
         group2 = DistributedTestWorker.create_group().launch(
-            cluster=cluster, name="multi_group_2"
+            cluster=cluster,
+            name="multi_group_2",
+            env_vars=_worker_runtime_env_vars(),
         )
 
         # Call a method on group 1
@@ -179,6 +236,76 @@ class TestWorkerGroup:
         results2 = group2.sum_with_rank(200).wait()
         assert len(results2) == num_workers
         assert sorted(results2) == [200 + i for i in range(num_workers)]
+
+    def test_worker_group_launch_applies_extra_env_vars(self):
+        """Test per-launch worker env vars are forwarded to allocation."""
+        from rlinf.scheduler.worker.worker_group import WorkerGroup
+
+        env_key = "RLINF_TEST_WORKER_GROUP_EXTRA_ENV"
+
+        class _PlacementStrategy:
+            def get_placement(self, cluster, isolate_gpu):
+                return [
+                    Placement(
+                        rank=0,
+                        cluster_node_rank=0,
+                        placement_node_rank=0,
+                        local_accelerator_rank=0,
+                        accelerator_type=str(AcceleratorType.NO_ACCEL.value),
+                        local_rank=0,
+                        local_world_size=1,
+                        visible_accelerators=[],
+                        isolate_accelerator=False,
+                        local_hardware_ranks=[],
+                        node_group_label="cluster",
+                    )
+                ]
+
+        class _NodeInfo:
+            accelerator_type = AcceleratorType.NO_ACCEL
+            accelerator_model = "NO_ACCEL"
+            python_interpreter_path = None
+
+        class _NodeGroup:
+            def get_node_env_vars(self, node_rank):
+                return {}
+
+            def get_node_python_interpreter_path(self, node_rank):
+                return None
+
+        class _Cluster:
+            num_accelerators = 0
+
+            def __init__(self):
+                self.allocations = []
+
+            def get_node_ip(self, node_rank):
+                return "127.0.0.1"
+
+            def get_node_info(self, node_rank):
+                return _NodeInfo()
+
+            def get_node_group(self, label):
+                return _NodeGroup()
+
+            def allocate(self, **kwargs):
+                self.allocations.append(kwargs)
+                return object()
+
+        cluster = _Cluster()
+        worker_group = WorkerGroup(DistributedTestWorker, (), {})
+        worker_group._cluster = cluster
+        worker_group._placement_strategy = _PlacementStrategy()
+        worker_group._isolate_gpu = True
+        worker_group._catch_system_failure = False
+        worker_group._max_concurrency = None
+        worker_group._disable_distributed_log = False
+        worker_group._extra_env_vars = {env_key: "extra-value"}
+        worker_group._worker_group_name = "extra_env_group"
+
+        worker_group._create_workers()
+
+        assert cluster.allocations[0]["env_vars"][env_key] == "extra-value"
 
 
 class TestLoadUserExtensions:

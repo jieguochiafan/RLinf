@@ -18,7 +18,10 @@ from .collective import CollectiveGroupOptions
 from .hardware import (
     AcceleratorType,
     AcceleratorUtil,
+    DOSW1HWInfo,
+    DualFrankaHWInfo,
     FrankaHWInfo,
+    GimArmHWInfo,
     HardwareInfo,
     Turtle2HWInfo,
 )
@@ -30,13 +33,17 @@ from .placement import (
     PackedPlacementStrategy,
     PlacementStrategy,
 )
+from .resource_pool import FineGrainedResourcePool
 from .worker import Worker, WorkerAddress, WorkerGroupFuncResult
 
 __all__ = [
     "AcceleratorUtil",
     "AcceleratorType",
     "HardwareInfo",
+    "DOSW1HWInfo",
+    "DualFrankaHWInfo",
     "FrankaHWInfo",
+    "GimArmHWInfo",
     "Turtle2HWInfo",
     "CollectiveGroupOptions",
     "Cluster",
@@ -44,6 +51,7 @@ __all__ = [
     "ComponentPlacement",
     "PlacementStrategy",
     "FlexiblePlacementStrategy",
+    "FineGrainedResourcePool",
     "NodePlacementStrategy",
     "PackedPlacementStrategy",
     "Worker",

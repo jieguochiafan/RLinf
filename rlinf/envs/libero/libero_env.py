@@ -24,6 +24,10 @@ import numpy as np
 import torch
 from omegaconf.omegaconf import OmegaConf
 
+from rlinf.envs.chunk_runner import (
+    build_chunk_done_outputs,
+    maybe_apply_ignore_terminations,
+)
 from rlinf.envs.libero.utils import (
     get_benchmark_overridden,
     get_libero_image,
@@ -90,9 +94,14 @@ class LiberoEnv(gym.Env):
         self.num_group = self.num_envs // self.group_size
         self.use_fixed_reset_state_ids = cfg.use_fixed_reset_state_ids
         self.specific_reset_id = cfg.get("specific_reset_id", None)
+        self.task_id_filter = cfg.get("task_id_filter", None)
+        if self.task_id_filter is not None:
+            self.task_id_filter = list(self.task_id_filter)
 
         self.ignore_terminations = cfg.ignore_terminations
         self.auto_reset = cfg.auto_reset
+        self.chunk_step_mode = cfg.get("chunk_step_mode", "sync_time_major")
+        self.chunk_step_num_shards = int(cfg.get("chunk_step_num_shards", 1))
 
         self._generator = np.random.default_rng(seed=self.seed)
         self._generator_ordered = np.random.default_rng(seed=0)
@@ -233,15 +242,27 @@ class LiberoEnv(gym.Env):
             if variant == "pro":
                 pro_suffix = raw_suffix.replace(".bddl", "") if raw_suffix else None
 
+                valid_perts = ["_lan", "_object", "_swap", "_task"]
                 if pro_suffix == "all":
-                    valid_perts = ["_lan", "_object", "_swap", "_task"]
+                    filter_perts = valid_perts
+                elif pro_suffix is not None:
+                    # Map bare name (e.g. "task") to directory suffix (e.g. "_task")
+                    normalized = (
+                        f"_{pro_suffix}"
+                        if not pro_suffix.startswith("_")
+                        else pro_suffix
+                    )
+                    filter_perts = [normalized] if normalized in valid_perts else []
+                else:
+                    filter_perts = []
 
+                if filter_perts:
                     all_sub_dirs = [
                         d
                         for d in os.listdir(bddl_root)
                         if os.path.isdir(os.path.join(bddl_root, d))
                         and suite_keyword in d
-                        and any(d.endswith(pert) for pert in valid_perts)
+                        and any(d.endswith(pert) for pert in filter_perts)
                     ]
 
                     core_task_name = file_name.replace(".bddl", "")
@@ -347,6 +368,33 @@ class LiberoEnv(gym.Env):
             self.total_num_group_envs += task_num_trials
         self.cumsum_trial_id_bins = np.cumsum(self.trial_id_bins)
 
+        if self.task_id_filter is not None:
+            num_tasks = len(self.trial_id_bins)
+            validated_tids = []
+            for tid in self.task_id_filter:
+                if not isinstance(tid, (int, np.integer)):
+                    raise ValueError(
+                        f"task_id_filter must contain ints, got "
+                        f"{type(tid).__name__}: {tid}"
+                    )
+                tid_int = int(tid)
+                if tid_int < 0 or tid_int >= num_tasks:
+                    raise ValueError(
+                        f"task_id {tid_int} in task_id_filter is out of range "
+                        f"[0, {num_tasks - 1}]"
+                    )
+                validated_tids.append(tid_int)
+            validated_tids = sorted(set(validated_tids))
+
+            self._valid_reset_state_ids = []
+            for tid in validated_tids:
+                start = self.cumsum_trial_id_bins[tid - 1] if tid > 0 else 0
+                end = self.cumsum_trial_id_bins[tid]
+                self._valid_reset_state_ids.extend(range(start, end))
+            self._valid_reset_state_ids = np.array(self._valid_reset_state_ids)
+        else:
+            self._valid_reset_state_ids = None
+
     def update_reset_state_ids(self):
         if self.cfg.is_eval or self.cfg.use_ordered_reset_state_ids:
             reset_state_ids = self._get_ordered_reset_state_ids(self.num_group)
@@ -364,6 +412,11 @@ class LiberoEnv(gym.Env):
             reset_state_ids = self.specific_reset_id * np.ones(
                 (num_reset_states,), dtype=int
             )
+        elif self._valid_reset_state_ids is not None:
+            indices = self._generator.integers(
+                low=0, high=len(self._valid_reset_state_ids), size=(num_reset_states,)
+            )
+            reset_state_ids = self._valid_reset_state_ids[indices]
         else:
             reset_state_ids = self._generator.integers(
                 low=0, high=self.total_num_group_envs, size=(num_reset_states,)
@@ -371,11 +424,22 @@ class LiberoEnv(gym.Env):
         return reset_state_ids
 
     def get_reset_state_ids_all(self):
-        reset_state_ids = np.arange(self.total_num_group_envs)
+        if self._valid_reset_state_ids is not None:
+            reset_state_ids = self._valid_reset_state_ids.copy()
+        else:
+            reset_state_ids = np.arange(self.total_num_group_envs)
+
+        if not self.cfg.is_eval:
+            self._generator_ordered.shuffle(reset_state_ids)
+
+        # Ensure we have enough IDs for all processes by tiling if needed
+        if len(reset_state_ids) < self.total_num_processes:
+            repeats = (self.total_num_processes // len(reset_state_ids)) + 1
+            reset_state_ids = np.tile(reset_state_ids, repeats)
+
         valid_size = len(reset_state_ids) - (
             len(reset_state_ids) % self.total_num_processes
         )
-        self._generator_ordered.shuffle(reset_state_ids)
         reset_state_ids = reset_state_ids[:valid_size]
         reset_state_ids = reset_state_ids.reshape(self.total_num_processes, -1)
         return reset_state_ids
@@ -441,6 +505,7 @@ class LiberoEnv(gym.Env):
         self.success_once = np.zeros(self.num_envs, dtype=bool)
         self.fail_once = np.zeros(self.num_envs, dtype=bool)
         self.returns = np.zeros(self.num_envs)
+        self.success_episode_len = np.zeros(self.num_envs, dtype=np.int32)
 
     def _reset_metrics(self, env_idx=None):
         if env_idx is not None:
@@ -450,22 +515,39 @@ class LiberoEnv(gym.Env):
             self.success_once[mask] = False
             self.fail_once[mask] = False
             self.returns[mask] = 0
+            self.success_episode_len[mask] = 0
             self._elapsed_steps[env_idx] = 0
         else:
             self.prev_step_reward[:] = 0
             self.success_once[:] = False
             self.fail_once[:] = False
             self.returns[:] = 0.0
+            self.success_episode_len[:] = 0
             self._elapsed_steps[:] = 0
 
     def _record_metrics(self, step_reward, terminations, infos):
         episode_info = {}
-        self.returns += step_reward
+        # Only accumulate returns while not yet succeeded
+        self.returns += step_reward * (~self.success_once)
+        # Record episode_len at first success
+        new_success_mask = terminations & ~self.success_once
+        if new_success_mask.any():
+            self.success_episode_len[new_success_mask] = self.elapsed_steps[
+                new_success_mask
+            ]
+
         self.success_once = self.success_once | terminations
         episode_info["success_once"] = self.success_once.copy()
         episode_info["return"] = self.returns.copy()
         episode_info["episode_len"] = self.elapsed_steps.copy()
-        episode_info["reward"] = episode_info["return"] / episode_info["episode_len"]
+
+        # Use success episode_len for reward if already succeeded, else current elapsed
+        episode_len_for_reward = np.where(
+            self.success_once, self.success_episode_len, self.elapsed_steps
+        )
+        episode_info["reward"] = episode_info["return"] / np.maximum(
+            episode_len_for_reward, 1
+        )
         infos["episode"] = to_tensor(episode_info)
         return infos
 
@@ -603,6 +685,13 @@ class LiberoEnv(gym.Env):
         )
 
     def chunk_step(self, chunk_actions):
+        if self.chunk_step_mode == "latency_balanced_pair":
+            return self._chunk_step_latency_balanced_pair(chunk_actions)
+        if self.chunk_step_mode == "parallel_shard":
+            return self._chunk_step_parallel_shard(chunk_actions)
+        return self._chunk_step_sync_time_major(chunk_actions)
+
+    def _chunk_step_sync_time_major(self, chunk_actions):
         # chunk_actions: [num_envs, chunk_step, action_dim]
         chunk_size = chunk_actions.shape[1]
         obs_list = []
@@ -650,6 +739,161 @@ class LiberoEnv(gym.Env):
         else:
             chunk_terminations = raw_chunk_terminations.clone()
             chunk_truncations = raw_chunk_truncations.clone()
+        return (
+            obs_list,
+            chunk_rewards,
+            chunk_terminations,
+            chunk_truncations,
+            infos_list,
+        )
+
+    def _chunk_step_parallel_shard(self, chunk_actions):
+        # chunk_actions: [num_envs, chunk_step, action_dim]
+        if isinstance(chunk_actions, torch.Tensor):
+            chunk_actions = chunk_actions.detach().cpu().numpy()
+
+        (
+            raw_obs_list,
+            _reward_list,
+            terminations_list,
+            info_lists_list,
+        ) = self.env.chunk_step(chunk_actions)
+
+        obs_list = []
+        infos_list = []
+        chunk_rewards = []
+        raw_chunk_terminations = []
+        raw_chunk_truncations = []
+
+        for raw_obs, terminations, info_lists in zip(
+            raw_obs_list, terminations_list, info_lists_list
+        ):
+            self._elapsed_steps += 1
+            self.current_raw_obs = raw_obs
+            infos = list_of_dict_to_dict_of_list(info_lists)
+            terminations = np.asarray(terminations).astype(bool)
+            truncations = self.elapsed_steps >= self.cfg.max_episode_steps
+            obs = self._wrap_obs(raw_obs)
+
+            step_reward = self._calc_step_reward(terminations)
+            infos = self._record_metrics(step_reward, terminations, infos)
+            if self.ignore_terminations:
+                infos["episode"]["success_at_end"] = to_tensor(terminations)
+                terminations[:] = False
+
+            obs_list.append(obs)
+            infos_list.append(infos)
+            chunk_rewards.append(to_tensor(step_reward))
+            raw_chunk_terminations.append(to_tensor(terminations))
+            raw_chunk_truncations.append(to_tensor(truncations))
+
+        chunk_rewards = torch.stack(chunk_rewards, dim=1)
+        raw_chunk_terminations = torch.stack(raw_chunk_terminations, dim=1)
+        raw_chunk_truncations = torch.stack(raw_chunk_truncations, dim=1)
+
+        raw_chunk_terminations = maybe_apply_ignore_terminations(
+            raw_chunk_terminations, self.ignore_terminations
+        )
+        (
+            chunk_terminations,
+            chunk_truncations,
+            past_terminations,
+            past_truncations,
+            past_dones,
+        ) = build_chunk_done_outputs(
+            raw_chunk_terminations,
+            raw_chunk_truncations,
+            collapse_to_last_step=self.auto_reset or self.ignore_terminations,
+        )
+
+        if past_dones.any() and self.auto_reset:
+            obs_list[-1], infos_list[-1] = self._handle_auto_reset(
+                past_dones.cpu().numpy(), obs_list[-1], infos_list[-1]
+            )
+
+        return (
+            obs_list,
+            chunk_rewards,
+            chunk_terminations,
+            chunk_truncations,
+            infos_list,
+        )
+
+    def _chunk_step_latency_balanced_pair(self, chunk_actions):
+        # chunk_actions: [num_envs, chunk_step, action_dim]
+        if isinstance(chunk_actions, torch.Tensor):
+            chunk_actions = chunk_actions.detach().cpu().numpy()
+
+        pair_cfg = self.cfg.get("latency_balanced_pair", {})
+        (
+            raw_obs_list,
+            _reward_list,
+            terminations_list,
+            info_lists_list,
+        ) = self.env.latency_balanced_pair_chunk_step(
+            chunk_actions,
+            envs_per_core=int(pair_cfg.get("envs_per_core", 1)),
+            ema_alpha=float(pair_cfg.get("ema_alpha", 0.3)),
+            initial_latency_ms=pair_cfg.get("initial_latency_ms", None),
+            dynamic_affinity=bool(pair_cfg.get("dynamic_affinity", True)),
+            core_donation_enabled=bool(pair_cfg.get("core_donation_enabled", True)),
+            core_donation_max_extra_groups=int(
+                pair_cfg.get("core_donation_max_extra_groups", 1)
+            ),
+        )
+
+        obs_list = []
+        infos_list = []
+        chunk_rewards = []
+        raw_chunk_terminations = []
+        raw_chunk_truncations = []
+
+        for raw_obs, terminations, info_lists in zip(
+            raw_obs_list, terminations_list, info_lists_list
+        ):
+            self._elapsed_steps += 1
+            self.current_raw_obs = raw_obs
+            infos = list_of_dict_to_dict_of_list(info_lists)
+            terminations = np.asarray(terminations).astype(bool)
+            truncations = self.elapsed_steps >= self.cfg.max_episode_steps
+            obs = self._wrap_obs(raw_obs)
+
+            step_reward = self._calc_step_reward(terminations)
+            infos = self._record_metrics(step_reward, terminations, infos)
+            if self.ignore_terminations:
+                infos["episode"]["success_at_end"] = to_tensor(terminations)
+                terminations[:] = False
+
+            obs_list.append(obs)
+            infos_list.append(infos)
+            chunk_rewards.append(to_tensor(step_reward))
+            raw_chunk_terminations.append(to_tensor(terminations))
+            raw_chunk_truncations.append(to_tensor(truncations))
+
+        chunk_rewards = torch.stack(chunk_rewards, dim=1)
+        raw_chunk_terminations = torch.stack(raw_chunk_terminations, dim=1)
+        raw_chunk_truncations = torch.stack(raw_chunk_truncations, dim=1)
+
+        raw_chunk_terminations = maybe_apply_ignore_terminations(
+            raw_chunk_terminations, self.ignore_terminations
+        )
+        (
+            chunk_terminations,
+            chunk_truncations,
+            past_terminations,
+            past_truncations,
+            past_dones,
+        ) = build_chunk_done_outputs(
+            raw_chunk_terminations,
+            raw_chunk_truncations,
+            collapse_to_last_step=self.auto_reset or self.ignore_terminations,
+        )
+
+        if past_dones.any() and self.auto_reset:
+            obs_list[-1], infos_list[-1] = self._handle_auto_reset(
+                past_dones.cpu().numpy(), obs_list[-1], infos_list[-1]
+            )
+
         return (
             obs_list,
             chunk_rewards,

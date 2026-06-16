@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import multiprocessing
+import os
 import warnings
 from multiprocessing import connection
 from typing import Any, Callable, Optional, Union
@@ -29,6 +30,11 @@ from rlinf.envs.venv import (
     SubprocEnvWorker,
     SubprocVectorEnv,
     _setup_buf,
+)
+from rlinf.envs.venv.venv import _apply_subproc_env_cpu_affinity
+from rlinf.scheduler.resource_pool.cpu_binding import (
+    apply_process_cpu_affinity,
+    get_env_core_group_from_env,
 )
 
 # ---------------------------------------------------------------------------
@@ -81,6 +87,7 @@ def _worker(
     p: connection.Connection,
     env_fn_wrapper: CloudpickleWrapper,
     obs_bufs: Optional[Union[dict, tuple, ShArray]] = None,
+    local_env_index: int = -1,
 ) -> None:
     def _encode_obs(
         obs: Union[dict, tuple, np.ndarray], buffer: Union[dict, tuple, ShArray]
@@ -96,6 +103,8 @@ def _worker(
         return None
 
     parent.close()
+    if local_env_index >= 0:
+        _apply_subproc_env_cpu_affinity(local_env_index)
     env = env_fn_wrapper.data()
     try:
         while True:
@@ -110,6 +119,31 @@ def _worker(
                     _encode_obs(env_return[0], obs_bufs)
                     env_return = (None, *env_return[1:])
                 p.send(env_return)
+            elif cmd == "chunk_step":
+                if obs_bufs is not None:
+                    raise NotImplementedError(
+                        "chunk_step does not support shared-memory observations"
+                    )
+                action_repeat = 1
+                if isinstance(data, tuple):
+                    data, action_repeat = data
+                action_repeat = int(action_repeat)
+                if action_repeat < 1:
+                    raise ValueError(
+                        "action_repeat_per_chunk_step must be >= 1, "
+                        f"got {action_repeat}"
+                    )
+                env_returns = []
+                for action in data:
+                    for _ in range(action_repeat):
+                        env_return = env.step(action)
+                    env_returns.append(env_return)
+                p.send(tuple(zip(*env_returns)))
+            elif cmd == "set_cpu_affinity":
+                apply_process_cpu_affinity(tuple(data))
+                p.send(tuple(sorted(os.sched_getaffinity(0))))
+            elif cmd == "get_cpu_affinity":
+                p.send(tuple(sorted(os.sched_getaffinity(0))))
             elif cmd == "reset":
                 retval = env.reset(**data)
                 reset_returns_info = (
@@ -167,11 +201,17 @@ def _worker(
 
 
 class ReconfigureSubprocEnvWorker(SubprocEnvWorker):
-    def __init__(self, env_fn: Callable[[], gym.Env], share_memory: bool = False):
+    def __init__(
+        self,
+        env_fn: Callable[[], gym.Env],
+        share_memory: bool = False,
+        local_env_index: int = -1,
+    ):
         ctx = multiprocessing.get_context("spawn")
         self.parent_remote, self.child_remote = ctx.Pipe()
         self.share_memory = share_memory
         self.buffer: Optional[Union[dict, tuple, ShArray]] = None
+        self._cpu_affinity = get_env_core_group_from_env(os.environ, local_env_index)
         if self.share_memory:
             dummy = env_fn()
             obs_space = dummy.observation_space
@@ -183,6 +223,7 @@ class ReconfigureSubprocEnvWorker(SubprocEnvWorker):
             self.child_remote,
             CloudpickleWrapper(env_fn),
             self.buffer,
+            local_env_index,
         )
         self.process = ctx.Process(target=_worker, args=args, daemon=True)
         self.process.start()
@@ -196,8 +237,14 @@ class ReconfigureSubprocEnvWorker(SubprocEnvWorker):
 
 class ReconfigureSubprocEnv(SubprocVectorEnv):
     def __init__(self, env_fns: list[Callable[[], gym.Env]], **kwargs: Any) -> None:
+        env_index = {"value": 0}
+
         def worker_fn(fn: Callable[[], gym.Env]) -> ReconfigureSubprocEnvWorker:
-            return ReconfigureSubprocEnvWorker(fn, share_memory=False)
+            local_env_index = env_index["value"]
+            env_index["value"] += 1
+            return ReconfigureSubprocEnvWorker(
+                fn, share_memory=False, local_env_index=local_env_index
+            )
 
         BaseVectorEnv.__init__(self, env_fns, worker_fn, **kwargs)
 

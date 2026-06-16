@@ -59,6 +59,8 @@ class ManiskillEnv(gym.Env):
         self.auto_reset = cfg.auto_reset
         self.use_rel_reward = cfg.use_rel_reward
         self.ignore_terminations = cfg.ignore_terminations
+        self.chunk_step_mode = cfg.get("chunk_step_mode", "sync_time_major")
+        self.chunk_step_num_shards = int(cfg.get("chunk_step_num_shards", 1))
         self.use_full_state = bool(getattr(cfg, "use_full_state", False))
         self.num_group = num_envs // cfg.group_size
         self.group_size = cfg.group_size
@@ -79,6 +81,7 @@ class ManiskillEnv(gym.Env):
         self._is_start = True
         self._init_reset_state_ids()
         self.info_logging_keys = ["is_src_obj_grasped", "consecutive_grasp", "success"]
+        self._show_goal_site_visual()
         if self.record_metrics:
             self._init_metrics()
 
@@ -130,6 +133,18 @@ class ManiskillEnv(gym.Env):
             repeats=self.group_size
         ).to(self.device)
 
+    def _show_goal_site_visual(self):
+        """Keep ManiSkill goal-site visualization visible for reward-model RGB input."""
+        if not hasattr(self.env.unwrapped, "goal_site"):
+            return
+
+        goal_site = self.env.unwrapped.goal_site
+        if hasattr(self.env.unwrapped, "_hidden_objects"):
+            while goal_site in self.env.unwrapped._hidden_objects:
+                self.env.unwrapped._hidden_objects.remove(goal_site)
+        if hasattr(goal_site, "show_visual"):
+            goal_site.show_visual()
+
     def _wrap_obs(self, raw_obs, infos=None):
         wrap_obs_mode = getattr(self.cfg, "wrap_obs_mode", "default")
         if wrap_obs_mode == "raw":
@@ -149,19 +164,19 @@ class ManiskillEnv(gym.Env):
                         raw_obs, use_torch=True, device=self.device
                     )
 
-            main_images = sensor_data["base_camera"]["rgb"]
-            sorted_images = OrderedDict(sorted(sensor_data.items()))
-            sorted_images.pop("base_camera")
-            extra_view_images = (
-                torch.stack([v["rgb"] for v in sorted_images.values()], dim=1)
-                if sorted_images
-                else None
-            )
-            return {
-                "main_images": main_images,
-                "extra_view_images": extra_view_images,
-                "states": state,
-            }
+                main_images = sensor_data["base_camera"]["rgb"]
+                sorted_images = OrderedDict(sorted(sensor_data.items()))
+                sorted_images.pop("base_camera")
+                extra_view_images = (
+                    torch.stack([v["rgb"] for v in sorted_images.values()], dim=1)
+                    if sorted_images
+                    else None
+                )
+                return {
+                    "main_images": main_images,
+                    "extra_view_images": extra_view_images,
+                    "states": state,
+                }
 
         # Default
         obs_image = raw_obs["sensor_data"]["3rd_view_camera"]["rgb"].to(
@@ -269,6 +284,7 @@ class ManiskillEnv(gym.Env):
                 else {}
             )
         raw_obs, infos = self.env.reset(seed=seed, options=options)
+        self._show_goal_site_visual()
         extracted_obs = self._wrap_obs(raw_obs, infos=infos)
         if "env_idx" in options:
             env_idx = options["env_idx"]
@@ -306,6 +322,15 @@ class ManiskillEnv(gym.Env):
         return extracted_obs, step_reward, terminations, truncations, infos
 
     def chunk_step(self, chunk_actions):
+        if (
+            self.chunk_step_mode == "parallel_shard"
+            and self.chunk_step_num_shards > 1
+        ):
+            raise NotImplementedError(
+                "ManiSkill parallel_shard chunk_step with more than one shard "
+                "requires separate simulator shards and is not enabled in this "
+                "wrapper yet. Use sync_time_major or chunk_step_num_shards=1."
+            )
         # chunk_actions: [num_envs, chunk_step, action_dim]
         chunk_size = chunk_actions.shape[1]
         obs_list = []

@@ -19,7 +19,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
-from typing import Generic, Optional, TypeVar
+from typing import TYPE_CHECKING, Generic, Optional, TypeVar
 
 import numpy as np
 import ray
@@ -33,6 +33,9 @@ from ..placement import (
     PlacementStrategy,
 )
 from .worker import Worker, WorkerAddress, WorkerClsType
+
+if TYPE_CHECKING:
+    from ..resource_pool.bindings import WorkerResourceBinding
 
 ClsType = TypeVar("ClsType")
 
@@ -72,6 +75,7 @@ class WorkerGroup(Generic[WorkerClsType]):
         self._execution_ranks = None
 
         self._data_io_ranks = None
+        self._resource_bindings_by_rank = {}
 
     @property
     def worker_cls_name(self) -> str:
@@ -150,6 +154,8 @@ class WorkerGroup(Generic[WorkerClsType]):
         isolate_gpu: bool = True,
         catch_system_failure: Optional[bool] = None,
         disable_distributed_log: bool = False,
+        env_vars: Optional[dict[str, str]] = None,
+        resource_bindings: Optional[list["WorkerResourceBinding"]] = None,
     ) -> "WorkerGroup[WorkerClsType] | WorkerClsType":
         """Create a worker group with the specified cluster and options.
 
@@ -161,6 +167,8 @@ class WorkerGroup(Generic[WorkerClsType]):
             isolate_gpu (bool): Whether a worker should only see the GPUs that it's assigned via controlling CUDA_VISIBLE_DEVICES. Defaults to True.
             catch_system_failure (Optional[bool]): Whether to catch system exit and signals in the worker process. If None, the environment variable RLINF_CATCH_FAILURE will take effect, whose default value is True. If set, then it will override the environment variable.
             disable_distributed_log (bool): Whether to disable distributed log for the worker group.
+            env_vars (Optional[dict[str, str]]): Additional environment variables to pass to each worker process.
+            resource_bindings (Optional[list[WorkerResourceBinding]]): Fine-grained resource bindings to inject into matching worker ranks.
 
         Returns:
             WorkerGroup: An instance of WorkerGroup with the specified configuration.
@@ -173,6 +181,15 @@ class WorkerGroup(Generic[WorkerClsType]):
         self._catch_system_failure = catch_system_failure
         self._max_concurrency = max_concurrency
         self._disable_distributed_log = disable_distributed_log
+        self._extra_env_vars = dict(env_vars or {})
+        self._resource_bindings_by_rank = {}
+        if resource_bindings is not None:
+            self._resource_bindings_by_rank = {
+                binding.rank: binding for binding in resource_bindings
+            }
+            assert len(self._resource_bindings_by_rank) == len(resource_bindings), (
+                "Duplicate resource binding ranks are not allowed."
+            )
         if self._catch_system_failure is None:
             self._catch_system_failure = (
                 Cluster.get_sys_env_var(ClusterEnvVar.CATCH_FAILURE, "0") == "1"
@@ -225,6 +242,12 @@ class WorkerGroup(Generic[WorkerClsType]):
         placements = self._placement_strategy.get_placement(
             self._cluster, self._isolate_gpu
         )
+        placement_ranks = {placement.rank for placement in placements}
+        binding_ranks = set(self._resource_bindings_by_rank)
+        assert binding_ranks.issubset(placement_ranks), (
+            f"Resource binding ranks {binding_ranks} are not a subset of "
+            f"placement ranks {placement_ranks}."
+        )
         master_addr = next(
             self._cluster.get_node_ip(p.cluster_node_rank)
             for p in placements
@@ -271,6 +294,20 @@ class WorkerGroup(Generic[WorkerClsType]):
                     accelerator_type, placement.visible_accelerators
                 )
             )
+            binding = self._resource_bindings_by_rank.get(placement.rank)
+            if binding is not None:
+                assert binding.cluster_node_rank == placement.cluster_node_rank, (
+                    f"Resource binding rank {binding.rank} targets cluster node "
+                    f"{binding.cluster_node_rank}, but placement rank {placement.rank} "
+                    f"is on cluster node {placement.cluster_node_rank}."
+                )
+                assert binding.node_group_label == placement.node_group_label, (
+                    f"Resource binding rank {binding.rank} targets node group "
+                    f"{binding.node_group_label}, but placement rank {placement.rank} "
+                    f"is in node group {placement.node_group_label}."
+                )
+                env_vars.update(binding.to_env_vars())
+            env_vars.update(self._extra_env_vars)
 
             worker = self._cluster.allocate(
                 cls=self._worker_cls,

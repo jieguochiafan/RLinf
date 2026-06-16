@@ -14,6 +14,7 @@
 
 import numpy as np
 import torch
+import os
 
 from rlinf.config import SupportedModel
 from rlinf.envs import SupportedEnvType
@@ -66,8 +67,25 @@ def prepare_actions_for_maniskill(
 def prepare_actions_for_libero(
     raw_chunk_actions,
     model_type,
+    env_action_dim: int = 7,
 ) -> np.ndarray:
     chunk_actions = raw_chunk_actions
+    env_action_dim = int(env_action_dim)
+    if (
+        SupportedModel(model_type) == SupportedModel.DREAMZERO
+        and chunk_actions.ndim == 3
+        and chunk_actions.shape[-2] == env_action_dim
+        and chunk_actions.shape[-1] != env_action_dim
+    ):
+        chunk_actions = np.swapaxes(chunk_actions, -1, -2)
+    if os.getenv("DREAMZERO_DEBUG_ACTIONS", "0").lower() in ("1", "true", "yes"):
+        print(
+            "[prepare_actions_for_libero] "
+            f"model_type={model_type} env_action_dim={env_action_dim} "
+            f"raw_shape={getattr(raw_chunk_actions, 'shape', None)} "
+            f"out_shape={getattr(chunk_actions, 'shape', None)}",
+            flush=True,
+        )
     if SupportedModel(model_type) in [
         SupportedModel.OPENVLA,
         SupportedModel.OPENVLA_OFT,
@@ -183,12 +201,37 @@ def prepare_actions_for_mujoco(raw_chunk_actions, model_type):
     return chunk_actions
 
 
+def prepare_actions_for_d4rl(
+    raw_chunk_actions,
+    action_dim: int,
+    model_type,
+) -> np.ndarray:
+    # D4RL: take first action_dim dims from policy output
+    raw = np.asarray(raw_chunk_actions, dtype=np.float32)
+    chunk_actions = raw[..., :action_dim].copy()
+    # OPENPI: clip last dim to match continuous action space
+    if SupportedModel(model_type) == SupportedModel.OPENPI:
+        chunk_actions[..., -1] = np.clip(chunk_actions[..., -1], -1.0, 1.0)
+    return chunk_actions
+
+
+def prepare_actions_for_roboverse(
+    raw_chunk_actions,
+    model_type,
+) -> np.ndarray:
+    chunk_actions = raw_chunk_actions
+    if SupportedModel(model_type) == SupportedModel.OPENPI:
+        chunk_actions[..., -1] = np.where(chunk_actions[..., -1] < 0.0, 1.0, 0.0)
+    return chunk_actions
+
+
 def prepare_actions(
     raw_chunk_actions,
     env_type: str,
     model_type: str,
     num_action_chunks,
     action_dim,
+    env_action_dim=None,
     action_scale: float = 1.0,
     policy: str = "widowx_bridge",
     wm_env_type=None,
@@ -204,6 +247,7 @@ def prepare_actions(
         chunk_actions = prepare_actions_for_libero(
             raw_chunk_actions=raw_chunk_actions,
             model_type=model_type,
+            env_action_dim=env_action_dim or action_dim,
         )
     elif env_type == SupportedEnvType.OPENSORAWM or env_type == SupportedEnvType.WANWM:
         # TODO: Implement prepare_actions_for_opensora_wm
@@ -211,6 +255,7 @@ def prepare_actions(
             chunk_actions = prepare_actions_for_libero(
                 raw_chunk_actions=raw_chunk_actions,
                 model_type=model_type,
+                env_action_dim=env_action_dim or action_dim,
             )
         else:
             raise NotImplementedError(f"Env type {wm_env_type} not implemented")
@@ -223,6 +268,8 @@ def prepare_actions(
             policy=policy,
         )
     elif env_type == SupportedEnvType.ROBOTWIN:
+        chunk_actions = raw_chunk_actions
+    elif env_type == SupportedEnvType.EMBODICHAIN:
         chunk_actions = raw_chunk_actions
     elif env_type == SupportedEnvType.METAWORLD:
         chunk_actions = prepare_actions_for_metaworld(
@@ -254,7 +301,18 @@ def prepare_actions(
             raw_chunk_actions=raw_chunk_actions,
             model_type=model_type,
         )
+    elif env_type == SupportedEnvType.D4RL:
+        chunk_actions = prepare_actions_for_d4rl(
+            raw_chunk_actions=raw_chunk_actions,
+            action_dim=action_dim,
+            model_type=model_type,
+        )
+    elif env_type == SupportedEnvType.ROBOVERSE:
+        chunk_actions = prepare_actions_for_roboverse(
+            raw_chunk_actions=raw_chunk_actions,
+            model_type=model_type,
+        )
     else:
-        raise NotImplementedError
+        chunk_actions = raw_chunk_actions
 
     return chunk_actions

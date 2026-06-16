@@ -29,6 +29,12 @@ from rlinf.algorithms.utils import (
 
 ADV_REGISTRY: dict[str, Callable] = {}
 
+DREAMZERO_RAW_LOSS_TYPES = {
+    "dreamzero",
+    "dreamzero_action_head_rl",
+    "dreamzero_world_model_proxy",
+}
+
 
 def register_advantage(name: str):
     """Decorator to register advantage & returns function."""
@@ -82,7 +88,7 @@ def policy_loss(**kwargs) -> tuple[torch.Tensor, dict]:
     loss_fn = get_policy_loss(loss_type)
 
     task_type = kwargs["task_type"]
-    if task_type == "embodied":
+    if task_type == "embodied" and loss_type not in DREAMZERO_RAW_LOSS_TYPES:
         kwargs = preprocess_loss_inputs(**kwargs)
 
     loss, metrics_data = loss_fn(**kwargs)
@@ -150,6 +156,9 @@ def register_toolcall_parser(name: str):
 
 
 def get_toolcall_parser(name: str) -> Callable:
+    if not TOOLCALL_PARSER_REGISTRY:
+        from rlinf.algorithms import toolcall_parsers  # noqa: F401
+
     if name not in TOOLCALL_PARSER_REGISTRY:
         raise ValueError(f"Toolcall parser {name} not registered")
     cls = TOOLCALL_PARSER_REGISTRY[name]
