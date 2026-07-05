@@ -13,10 +13,16 @@
 # limitations under the License.
 
 import asyncio
+import time
+from typing import Any
 
+import torch
 from omegaconf.omegaconf import DictConfig
 
+from rlinf.data.embodied_async import InferenceRequest, InferenceResponse
+from rlinf.data.embodied_io_struct import RolloutResult
 from rlinf.scheduler import Channel
+from rlinf.workers.rollout.hf.async_batching import DynamicBatchState
 from rlinf.workers.rollout.hf.huggingface_worker import MultiStepRolloutWorker
 
 
@@ -141,3 +147,105 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
             self._weight_sync_coalesced_total += 1
         self._weight_sync_requested = True
         self._start_background_weight_sync_if_needed()
+
+    def _split_gipo_rollout_result_by_sizes(
+        self, rollout_result: RolloutResult, sizes: list[int]
+    ) -> list[RolloutResult]:
+        return self._split_rollout_result(rollout_result, sizes)
+
+    def _merge_gipo_request_obs(
+        self, requests: list[InferenceRequest]
+    ) -> dict[str, Any]:
+        obs_batches = [{"obs": request.obs, "final_obs": None} for request in requests]
+        return self._merge_obs_batches(obs_batches)["obs"]
+
+    async def _flush_gipo_inference_requests(
+        self,
+        requests: list[InferenceRequest],
+        response_channel: Channel,
+    ) -> None:
+        if not requests:
+            return
+        merged_obs = self._merge_gipo_request_obs(requests)
+        actions, result = self.predict(
+            merged_obs,
+            profile_context={"phase": "gipo_action_generation"},
+        )
+        rollout_result = RolloutResult(
+            actions=actions,
+            prev_logprobs=result.get("prev_logprobs"),
+            prev_values=result.get("prev_values"),
+            forward_inputs=result.get("forward_inputs", {}),
+            versions=torch.full_like(
+                result["prev_logprobs"],
+                float(self.version),
+                dtype=torch.float32,
+            ),
+        )
+        sizes = [len(request.env_ids) for request in requests]
+        pieces = self._split_gipo_rollout_result_by_sizes(rollout_result, sizes)
+        for request, piece in zip(requests, pieces, strict=True):
+            response_channel.put(
+                InferenceResponse(
+                    request_id=request.request_id,
+                    rollout_rank=self._rank,
+                    actions=piece.actions,
+                    rollout_result=piece,
+                    policy_version=int(self.version),
+                ),
+                key=request.response_key,
+                async_op=True,
+            )
+
+    async def serve_inference_gipo(
+        self,
+        request_channel: Channel,
+        response_channel: Channel,
+        metric_channel: Channel,
+    ):
+        assert self._generate_task is None, "GIPO inference service is already running."
+        self._generate_task = asyncio.create_task(
+            self._serve_inference_gipo(
+                request_channel,
+                response_channel,
+                metric_channel,
+            )
+        )
+        try:
+            await self._generate_task
+        except asyncio.CancelledError:
+            pass
+        finally:
+            self._generate_task = None
+
+    async def _serve_inference_gipo(
+        self,
+        request_channel: Channel,
+        response_channel: Channel,
+        metric_channel: Channel,
+    ) -> None:
+        async_cfg = self.cfg.algorithm.get("async_inference", {})
+        batch_state = DynamicBatchState(
+            target_batch_size=async_cfg.get("target_batch_size", 1),
+            max_wait_time_s=async_cfg.get("max_wait_time_s", 0.0),
+        )
+        pending: list[InferenceRequest] = []
+        while True:
+            if self._background_weight_sync_active:
+                await self._poll_background_weight_sync()
+            try:
+                request = request_channel.get_nowait()
+            except asyncio.QueueEmpty:
+                if batch_state.should_flush(len(pending), time.perf_counter()):
+                    await self._flush_gipo_inference_requests(pending, response_channel)
+                    pending.clear()
+                    batch_state.reset()
+                await asyncio.sleep(0)
+                continue
+
+            pending.append(request)
+            batch_state.mark_first_request(time.perf_counter())
+            if batch_state.should_flush(len(pending), time.perf_counter()):
+                await self._flush_gipo_inference_requests(pending, response_channel)
+                pending.clear()
+                batch_state.reset()
