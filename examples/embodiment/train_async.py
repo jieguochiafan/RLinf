@@ -83,6 +83,14 @@ def main(cfg) -> None:
 
         runner_cls = AsyncPPOEmbodiedRunner
         actor_worker_cls = AsyncPPOEmbodiedFSDPActor
+    elif cfg.algorithm.loss_type == "gipo_actor_critic":
+        from rlinf.runners.async_gipo_embodied_runner import AsyncGIPOEmbodiedRunner
+        from rlinf.workers.actor.async_gipo_fsdp_worker import (
+            AsyncGIPOEmbodiedFSDPActor,
+        )
+
+        runner_cls = AsyncGIPOEmbodiedRunner
+        actor_worker_cls = AsyncGIPOEmbodiedFSDPActor
     else:
         raise ValueError(
             f"Unsupported loss type {cfg.algorithm.loss_type} for async embodied runner"

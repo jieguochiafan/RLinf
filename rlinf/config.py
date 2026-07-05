@@ -817,8 +817,12 @@ def validate_embodied_cfg(cfg):
     # This will be updated in the future to support more algorithms and critic models.
     # Check that actor_critic loss requires value_head (training only; eval does not need critic)
     if not cfg.runner.get("only_eval", False) and (
-        cfg.algorithm.loss_type == "actor_critic"
-        or cfg.algorithm.loss_type == "decoupled_actor_critic"
+        cfg.algorithm.loss_type
+        in (
+            "actor_critic",
+            "decoupled_actor_critic",
+            "gipo_actor_critic",
+        )
     ):
         add_value_head = cfg.actor.model.get("add_value_head", False)
         assert add_value_head, (
