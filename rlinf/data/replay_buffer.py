@@ -288,6 +288,7 @@ class TrajectoryReplayBuffer:
         # }
         self._trajectory_index: dict[int, dict] = {}
         self._trajectory_id_list: list[int] = []  # Ordered list of trajectory IDs
+        self._trajectory_object_cache: dict[int, Trajectory] = {}
 
         # Trajectory file path: dict mapping trajectory_id to trajectory file path
         # this enables each trajectory to be saved to or loaded from a separate file
@@ -497,6 +498,13 @@ class TrajectoryReplayBuffer:
                 self._total_samples += num_samples
                 self._index_version += 1
 
+                self._trajectory_object_cache[trajectory_id] = trajectory
+                while len(self._trajectory_object_cache) > max(
+                    1, int(self.sample_window_size)
+                ):
+                    oldest_id = next(iter(self._trajectory_object_cache))
+                    self._trajectory_object_cache.pop(oldest_id, None)
+
             if self._flat_trajectory_cache is not None:
                 self._flat_trajectory_cache.put(
                     trajectory_id,
@@ -548,6 +556,46 @@ class TrajectoryReplayBuffer:
         """
         assert num_chunks > 0
         return self.sample_chunks(num_chunks)
+
+    def _get_trajectory_object(self, trajectory_id: int) -> Trajectory:
+        cached = self._trajectory_object_cache.get(trajectory_id)
+        if cached is not None:
+            return cached
+        info = self._trajectory_index[trajectory_id]
+        return self._load_trajectory(trajectory_id, info["model_weights_id"])
+
+    def sample_trajectories(self, num_trajectories: int) -> list[Trajectory]:
+        """Sample whole trajectories from the recent replay window."""
+        if self.size == 0:
+            return []
+        window_size = max(0, int(self.sample_window_size))
+        with self._index_lock:
+            candidate_ids = (
+                list(self._trajectory_id_list[-window_size:])
+                if window_size > 0
+                else list(self._trajectory_id_list)
+            )
+        if not candidate_ids:
+            return []
+        sample_count = min(int(num_trajectories), len(candidate_ids))
+        indices = torch.randint(
+            low=0,
+            high=len(candidate_ids),
+            size=(sample_count,),
+            generator=self.random_generator,
+        )
+        return [
+            self._get_trajectory_object(candidate_ids[int(index)])
+            for index in indices
+        ]
+
+    def sample_trajectory_batch(self, num_trajectories: int) -> dict[str, torch.Tensor]:
+        """Sample whole trajectories and concatenate them as a [T, B, ...] batch."""
+        from rlinf.data.embodied_io_struct import convert_trajectories_to_batch
+
+        return convert_trajectories_to_batch(
+            self.sample_trajectories(num_trajectories)
+        )
 
     def sample_chunks(self, num_chunks: int) -> dict[str, torch.Tensor]:
         """

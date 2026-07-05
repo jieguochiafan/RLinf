@@ -309,6 +309,56 @@ def compute_ppo_actor_loss(
     return policy_loss, metrics_data
 
 
+def compute_gipo_actor_loss(
+    logprobs: torch.Tensor,
+    old_logprobs: torch.Tensor,
+    advantages: torch.Tensor,
+    loss_mask: Optional[torch.Tensor] = None,
+    loss_agg_func: Optional[Callable[..., torch.Tensor]] = masked_mean,
+    max_episode_steps: Optional[int] = None,
+    loss_mask_sum: Optional[torch.Tensor] = None,
+    critic_warmup: Optional[bool] = False,
+    gipo_sigma: float = 1.0,
+    gipo_rho_min: float = 0.0067,
+    gipo_rho_max: float = 148.0,
+    **kwargs,
+) -> tuple[torch.Tensor, dict]:
+    """Compute GIPO actor loss for stale-policy replay samples."""
+    assert gipo_sigma > 0, "gipo_sigma must be positive"
+    if loss_mask is None:
+        loss_mask = torch.ones_like(logprobs, dtype=torch.bool)
+
+    loss_mask_ratio = None
+    if max_episode_steps is not None and loss_mask_sum is not None:
+        loss_mask_ratio = (loss_mask_sum * 1.0) / max_episode_steps
+        loss_agg_func = masked_mean_ratio
+
+    log_ratio = logprobs.float() - old_logprobs.float()
+    ratio = torch.exp(log_ratio)
+    rho_bar = torch.clamp(ratio.detach(), min=gipo_rho_min, max=gipo_rho_max)
+    trust_weight = torch.exp(-0.5 * (torch.log(rho_bar) / gipo_sigma).square())
+    pg_loss = -trust_weight * ratio * advantages.float()
+    policy_loss_abs = loss_agg_func(pg_loss.abs(), loss_mask, loss_mask_ratio)
+    policy_loss = loss_agg_func(pg_loss, loss_mask, loss_mask_ratio)
+    if critic_warmup:
+        policy_loss = torch.tensor(0.0, device=logprobs.device)
+
+    valid_count = loss_mask.count_nonzero() or 1
+    approx_kl = -torch.where(loss_mask, log_ratio.detach(), 0.0).sum() / valid_count
+    metrics_data = {
+        "actor/policy_loss": policy_loss.detach(),
+        "actor/policy_loss_abs": policy_loss_abs.detach(),
+        "actor/gipo_ratio": masked_mean(ratio.detach(), loss_mask),
+        "actor/gipo_log_ratio_mean": masked_mean(log_ratio.detach(), loss_mask),
+        "actor/gipo_weight_mean": masked_mean(trust_weight.detach(), loss_mask),
+        "actor/gipo_weight_min": trust_weight.detach()[loss_mask].min()
+        if loss_mask.any()
+        else torch.tensor(0.0, device=logprobs.device),
+        "actor/approx_kl": approx_kl.detach(),
+    }
+    return policy_loss, metrics_data
+
+
 def compute_ppo_critic_loss(
     values: torch.Tensor,
     returns: torch.Tensor,
@@ -392,6 +442,19 @@ def compute_decoupled_ppo_actor_critic_loss(**kwargs) -> tuple[torch.Tensor, dic
     """Compute decoupled PPO actor+critic loss."""
     metrics_data = {}
     actor_loss, actor_metrics_data = compute_decoupled_ppo_actor_loss(**kwargs)
+    critic_loss, critic_metrics_data = compute_ppo_critic_loss(**kwargs)
+
+    loss = actor_loss + critic_loss
+    metrics_data.update(actor_metrics_data)
+    metrics_data.update(critic_metrics_data)
+    return loss, metrics_data
+
+
+@register_policy_loss("gipo_actor_critic")
+def compute_gipo_actor_critic_loss(**kwargs) -> tuple[torch.Tensor, dict]:
+    """Compute GIPO actor loss plus PPO critic loss."""
+    metrics_data = {}
+    actor_loss, actor_metrics_data = compute_gipo_actor_loss(**kwargs)
     critic_loss, critic_metrics_data = compute_ppo_critic_loss(**kwargs)
 
     loss = actor_loss + critic_loss
