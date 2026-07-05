@@ -155,3 +155,23 @@ def test_async_gipo_runner_starts_and_stops_services():
     assert runner.actor.trained == 1
     assert runner.env.stopped == 1
     assert runner.rollout.stopped == 1
+
+
+def test_gipo_services_expose_stop_safe_methods():
+    from rlinf.workers.env.async_env_worker import AsyncEnvWorker
+    from rlinf.workers.rollout.hf.async_huggingface_worker import (
+        AsyncMultiStepRolloutWorker,
+    )
+
+    rollout = object.__new__(AsyncMultiStepRolloutWorker)
+    rollout._generate_task = None
+    assert rollout.stop() is None
+
+    env = object.__new__(AsyncEnvWorker)
+    env._interact_task = None
+    assert asyncio.run(env.stop()) is None
+
+    actor = object.__new__(AsyncGIPOEmbodiedFSDPActor)
+    actor.should_stop = False
+    assert asyncio.run(actor.stop()) is None
+    assert actor.should_stop
