@@ -33,11 +33,63 @@ RoboCasa/robosuite 环境时，显式绑核相对 OS 默认调度能提升吞吐
 分配策略。若 profile 发现实现 bug 或明显低成本优化点，后续实现计划可以把
 修复或优化作为独立任务处理。
 
+本轮新增 profile 代码必须是可插拔模块。默认训练路径保持关闭状态；开启后也应
+通过稳定的小接口接入，避免把 profile 逻辑散落到 EnvWorker、RolloutWorker 和
+RoboCasa 环境实现中。
+
 使用环境为当前仓库路径下虚拟环境：
 
 ```bash
 source /data1/miliang/RLinf/robocasa_openpi/bin/activate
 ```
+
+## 可插拔 Profile 模块
+
+新增代码建议集中在一个独立模块中，例如
+`rlinf/utils/rollout_profile/` 或 `rlinf/utils/profiling/rollout/`。业务代码只
+持有一个 profiler 对象，不直接处理文件路径、JSONL schema、聚合逻辑或 profile
+开关。
+
+模块需要提供以下能力：
+
+- `RolloutProfilerConfig`：从 Hydra config 或环境变量解析开关、输出目录、
+  采样策略和记录级别。
+- `RolloutProfiler`：运行时对象，提供 `event(...)`、`span(...)`、
+  `record_metrics(...)`、`flush()` 等接口。
+- `NoopRolloutProfiler`：默认实现，所有接口为 no-op，保证关闭 profile 时只产生
+  极低额外开销。
+- `JsonlTraceWriter`：负责统一写入 Env、Rollout、RoboCasa child、chunk profile
+  事件，隐藏文件句柄和 schema 细节。
+- `ProfileAggregator` 或后处理脚本：读取 JSONL，生成 `summary.json`、
+  `timeline.csv` 和 `bottleneck_report.md`。
+
+业务路径接入原则：
+
+- EnvWorker、RolloutWorker 和 RoboCasa env 只调用 profiler 的通用接口，例如
+  `with profiler.span("env.recv_rollout_results", **tags): ...`。
+- RoboCasa 子进程仍可记录 step timing，但事件 schema 和写文件逻辑由模块统一
+  定义；子进程只传递必要字段。
+- profile 配置默认关闭；关闭时不创建输出目录、不写文件、不改变现有指标。
+- 新增埋点应优先包裹边界函数和等待点，避免在内层 tight loop 中放置高频 Python
+  逻辑；必须记录子进程 step 时，通过采样或已有 step timing 批量写出控制开销。
+- 模块接口应能被单元测试用 fake writer 或 in-memory writer 验证，不依赖真实
+  RoboCasa、Ray 或 GPU。
+
+配置建议：
+
+```yaml
+profiling:
+  rollout:
+    enabled: false
+    output_dir: ${runner.logger.log_path}/rollout_profile
+    record_child_steps: true
+    child_step_sample_interval: 1
+    record_channel_wait: true
+    record_chunk_profile: true
+```
+
+如果现有 config 层级已有 profiling/nsight 约定，实现计划应优先沿用现有命名和
+配置风格；上面的 YAML 只定义需要的语义。
 
 ## 总体策略
 
@@ -240,6 +292,9 @@ logs/robocasa_cpu_binding_profile/<case>/<timestamp>/
 - `timeline.csv`
 - `bottleneck_report.md`
 
+这些文件由 profile 模块或后处理脚本统一生成，调用方不直接拼接文件名或写
+JSONL。
+
 `summary.json` 至少包含：
 
 - end-to-end step time
@@ -322,7 +377,10 @@ logs/robocasa_cpu_binding_profile/<case>/<timestamp>/
 ## 预期交付物
 
 - 一组 profile 配置或运行脚本，覆盖 A/B 实验矩阵。
-- 轻量 profile 埋点，优先复用现有 `Worker.timer` 和 JSONL timestamp。
+- 可插拔 profile 模块，默认 no-op，开启后统一管理事件、span、JSONL writer 和
+  输出 schema。
+- 轻量 profile 埋点，通过 profile 模块接入，优先复用现有 `Worker.timer` 和
+  JSONL timestamp。
 - 后处理脚本，将 Env/Rollout/Actor 内部事件对齐成 summary 和 timeline。
 - 图表：
   - end-to-end phase breakdown
@@ -346,6 +404,7 @@ logs/robocasa_cpu_binding_profile/<case>/<timestamp>/
 
 | 风险 | 缓解 |
 |---|---|
+| profile 逻辑侵入业务代码 | 使用可插拔 profiler 接口和 no-op 默认实现，业务代码只保留少量边界调用 |
 | profile 埋点改变时序 | 默认使用轻量 `perf_counter` 和 JSONL，torch profiler 只在短窗口启用 |
 | 日志过大 | 子进程 step 事件按 profile 开关启用，控制子进程事件采样频率 |
 | Ray worker 日志分散 | 输出统一 run dir，并保存 resource pool plan 和 resolved config |
@@ -365,3 +424,5 @@ logs/robocasa_cpu_binding_profile/<case>/<timestamp>/
    weight sync 覆盖。
 5. 当前 resource pool 配置中，收益较少的主因排序是什么。
 6. 后续最值得优化的 1 到 3 个点是什么，以及每个点的理论收益上限。
+7. 新增 profile 能力可以通过一个配置开关启停；关闭时 profile 模块为 no-op，
+   不产生输出文件，也不改变现有训练行为。
