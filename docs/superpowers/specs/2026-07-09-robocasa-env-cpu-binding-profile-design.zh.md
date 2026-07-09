@@ -22,7 +22,8 @@ RoboCasa/robosuite 环境时，显式绑核相对 OS 默认调度能提升吞吐
 
 1. 确认单环境绑核收益是否在 RLinf/RoboCasa 子进程路径中仍然存在。
 2. 确认多环境 rollout 后收益在哪个边界被抵消。
-3. 回到真实端到端配置，解释 resource pool 收益较少的主要原因。
+3. 回到真实端到端配置，从 rollout 内部时序解释 resource pool 收益较少的
+   主要原因。
 4. 产出可复现 profile 方法和 bottleneck 判定规则。
 
 ## 范围
@@ -219,26 +220,6 @@ batch merge/split 耗时。否则无法区分“模型推理慢”和“rollout 
 - 每个 CPU core/group 上的 env 分布
 - 每个 chunk 的尾延迟占比
 
-### 系统层
-
-需要采集并对齐：
-
-- CPU per-core utilization
-- worker role CPU utilization，至少区分 EnvWorker、RoboCasa child、RolloutWorker、
-  ActorWorker、Ray system process
-- GPU utilization
-- GPU memory
-- 可选 GPU SM/MPS 利用率
-- process RSS
-- context switch rate，若采集成本可控
-
-系统层不是主指标，但用于判断：
-
-- CPU 是否已经满载。
-- GPU 渲染或模型推理是否成为瓶颈。
-- Ray system process 是否异常占用 CPU。
-- 绑核后是否导致部分 core 过热而其他 core 空闲。
-
 ## 输出数据
 
 每次运行输出到独立目录，例如：
@@ -255,8 +236,6 @@ logs/robocasa_cpu_binding_profile/<case>/<timestamp>/
 - `env_rank_<rank>.jsonl`
 - `rollout_rank_<rank>.jsonl`
 - `worker_timer_metrics.jsonl`
-- `system_cpu_highres.csv`
-- `system_gpu_highres.csv`
 - `summary.json`
 - `timeline.csv`
 - `bottleneck_report.md`
@@ -287,7 +266,6 @@ logs/robocasa_cpu_binding_profile/<case>/<timestamp>/
 - EnvWorker chunk
 - RoboCasa 子进程 step
 - Rollout predict
-- CPU/GPU utilization
 
 关键视图：
 
@@ -295,8 +273,6 @@ logs/robocasa_cpu_binding_profile/<case>/<timestamp>/
 - Env child step latency CDF
 - SubprocVectorEnv breakdown stacked bar
 - Rollout vs Env wait ratio
-- CPU core utilization heatmap
-- GPU utilization timeline
 
 ## Bottleneck 判定规则
 
@@ -310,8 +286,6 @@ logs/robocasa_cpu_binding_profile/<case>/<timestamp>/
 | `time_to_first_ready_s` 很低，`first_ready_to_last_recv_s` 很高 | 长尾 env 拖慢 chunk critical path |
 | `core_donation_count` 高，`core_donation_s` 或 restore 高 | 动态换核开销可能抵消收益 |
 | donation 时间低但收益低 | 可能是 cache/NUMA/GPU 渲染或模型推理瓶颈，而不是换核调用本身 |
-| CPU 总利用率低，GPU 利用率高 | Env CPU 不是主要瓶颈 |
-| CPU 总利用率高但只有部分 core 高 | binding 或 core 分配不均衡 |
 | Env 子进程快，timeline 中存在大段空白 | Ray/channel 等待、父进程阻塞或 GPU 队列等待 |
 | A 阶段收益明显，B 阶段收益小 | 端到端瓶颈已转移或真实配置有额外混杂变量 |
 
@@ -349,14 +323,12 @@ logs/robocasa_cpu_binding_profile/<case>/<timestamp>/
 
 - 一组 profile 配置或运行脚本，覆盖 A/B 实验矩阵。
 - 轻量 profile 埋点，优先复用现有 `Worker.timer` 和 JSONL timestamp。
-- 后处理脚本，将 Env/Rollout/Actor/system 指标对齐成 summary 和 timeline。
+- 后处理脚本，将 Env/Rollout/Actor 内部事件对齐成 summary 和 timeline。
 - 图表：
   - end-to-end phase breakdown
   - Env child step latency CDF
   - chunk critical path timeline
   - SubprocVectorEnv breakdown
-  - CPU per-core utilization heatmap
-  - GPU utilization timeline
 - `bottleneck_report.md`，明确回答：
   - CPU binding 在哪一层有效。
   - 端到端收益少的主要原因。
@@ -375,10 +347,10 @@ logs/robocasa_cpu_binding_profile/<case>/<timestamp>/
 | 风险 | 缓解 |
 |---|---|
 | profile 埋点改变时序 | 默认使用轻量 `perf_counter` 和 JSONL，torch profiler 只在短窗口启用 |
-| 日志过大 | 子进程 step 事件按 profile 开关启用，system sampler 控制采样频率 |
+| 日志过大 | 子进程 step 事件按 profile 开关启用，控制子进程事件采样频率 |
 | Ray worker 日志分散 | 输出统一 run dir，并保存 resource pool plan 和 resolved config |
 | apples-to-apples 不严格 | 每个 case 保存 resolved config，后处理检查关键字段一致 |
-| GPU/MPS 状态影响结果 | 每次运行记录 `CUDA_VISIBLE_DEVICES`、MPS 百分比、GPU util 和进程列表 |
+| GPU/MPS 配置不一致影响对比 | 每次运行记录 `CUDA_VISIBLE_DEVICES`、MPS 百分比和 resolved config |
 | RoboCasa reset 或任务随机性带来波动 | 固定 seed，至少 3 次重复，报告 p50/p95 和方差 |
 
 ## 接受标准
@@ -389,7 +361,7 @@ logs/robocasa_cpu_binding_profile/<case>/<timestamp>/
    `robocasa_env_step` latency。
 2. 如果降低，降低幅度是否传递到 `env_interact_step`。
 3. 如果没有传递，具体被哪一段主进程或调度开销抵消。
-4. 如果传递到 EnvWorker，端到端收益是否被 rollout/model、actor training、
-   weight sync 或系统资源竞争覆盖。
+4. 如果传递到 EnvWorker，端到端收益是否被 rollout/model、actor training 或
+   weight sync 覆盖。
 5. 当前 resource pool 配置中，收益较少的主因排序是什么。
 6. 后续最值得优化的 1 到 3 个点是什么，以及每个点的理论收益上限。
