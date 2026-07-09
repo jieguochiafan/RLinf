@@ -1,3 +1,4 @@
+from .aggregation import RolloutProfileSummaryOutputs, summarize_rollout_profile
 from .profiler import (
     JsonlTraceWriter,
     NoopRolloutProfiler,
@@ -11,5 +12,7 @@ __all__ = [
     "NoopRolloutProfiler",
     "RolloutProfiler",
     "RolloutProfilerConfig",
+    "RolloutProfileSummaryOutputs",
     "make_rollout_profiler",
+    "summarize_rollout_profile",
 ]
