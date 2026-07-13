@@ -8,7 +8,9 @@ PROFILE_ACTIVE_STEPS=${PROFILE_ACTIVE_STEPS:-25}
 
 mkdir -p "$RUN_DIR/resource_profile/cpu" "$RUN_DIR/resource_profile/torch"
 
+set +u
 source "$RLINF/libero_openpi/bin/activate"
+set -u
 cd "$RLINF"
 
 export EMBODIED_PATH=$RLINF/examples/embodiment
