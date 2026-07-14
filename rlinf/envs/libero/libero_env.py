@@ -38,6 +38,11 @@ from rlinf.envs.libero.utils import (
     quat2axisangle,
 )
 from rlinf.envs.libero.venv import ReconfigureSubprocEnv
+from rlinf.envs.reset_mode import (
+    get_reset_mode,
+    libero_should_full_reset,
+    reset_full_on_state_mismatch,
+)
 from rlinf.envs.utils import list_of_dict_to_dict_of_list, to_tensor
 
 logger = logging.getLogger(__name__)
@@ -1692,22 +1697,73 @@ class LiberoEnv(gym.Env):
         }
         return obs
 
+    def _libero_bddl_may_change_without_task_change(self) -> bool:
+        variant = os.environ.get(
+            "LIBERO_TYPE",
+            self.cfg.get("libero_variant", "standard")
+            if hasattr(self.cfg, "get")
+            else "standard",
+        )
+        raw_suffix = os.environ.get(
+            "LIBERO_SUFFIX",
+            os.environ.get(
+                "LIBERO_PERTURBATION",
+                self.cfg.get("perturbation_suffix", None)
+                if hasattr(self.cfg, "get")
+                else None,
+            ),
+        )
+        return (
+            variant in {"pro", "plus"}
+            and raw_suffix == "all"
+            and not getattr(self.cfg, "is_eval", False)
+        )
+
     def _reconfigure(self, reset_state_ids, env_idx):
+        import time as _time
+
+        reset_mode = get_reset_mode(self.cfg)
+        fallback = reset_full_on_state_mismatch(self.cfg)
+        bddl_may_change = self._libero_bddl_may_change_without_task_change()
+        reset_metrics = {
+            "full_count": 0,
+            "state_count": 0,
+            "fallback_count": 0,
+            "reconfigure_time": 0.0,
+            "base_reset_time": 0.0,
+            "set_init_state_time": 0.0,
+        }
         reconfig_env_idx = []
         task_ids, trial_ids = self._get_task_and_trial_ids_from_reset_state_ids(
             reset_state_ids
         )
         for j, env_id in enumerate(env_idx):
             task_changed = self.task_ids[env_id] != task_ids[j]
+            decision = libero_should_full_reset(
+                reset_mode=reset_mode,
+                task_changed=bool(task_changed),
+                is_eval=bool(getattr(self.cfg, "is_eval", False)),
+                bddl_may_change_without_task_change=bddl_may_change,
+                fallback_on_state_mismatch=fallback,
+            )
             self.task_ids[env_id] = task_ids[j]
             self.trial_ids[env_id] = trial_ids[j]
-            if task_changed or not getattr(self.cfg, "is_eval", False):
+            if decision.full_reset:
                 reconfig_env_idx.append(env_id)
+                reset_metrics["full_count"] += 1
+            else:
+                reset_metrics["state_count"] += 1
+            if decision.fallback_used:
+                reset_metrics["fallback_count"] += 1
         if reconfig_env_idx:
+            t0 = _time.perf_counter()
             env_fn_params = self.get_env_fn_params(reconfig_env_idx)
             self.env.reconfigure_env_fns(env_fn_params, reconfig_env_idx)
+            reset_metrics["reconfigure_time"] += _time.perf_counter() - t0
         self.env.seed(self.seed * len(env_idx))
+        t0 = _time.perf_counter()
         self.env.reset(id=env_idx)
+        reset_metrics["base_reset_time"] += _time.perf_counter() - t0
         variant = os.environ.get(
             "LIBERO_TYPE",
             self.cfg.get("libero_variant", "standard")
@@ -1716,7 +1772,10 @@ class LiberoEnv(gym.Env):
         )
         if variant != "plus":
             init_state = self._get_reset_states(env_idx=env_idx)
+            t0 = _time.perf_counter()
             self.env.set_init_state(init_state=init_state, id=env_idx)
+            reset_metrics["set_init_state_time"] += _time.perf_counter() - t0
+        return reset_metrics
 
     def reset(
         self,
