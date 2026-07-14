@@ -27,6 +27,7 @@ from omegaconf.dictconfig import DictConfig
 
 from rlinf.envs import SupportedEnvType
 from rlinf.envs.chunk_runner import CHUNK_STEP_MODES
+from rlinf.envs.reset_mode import validate_env_reset_mode_cfg
 from rlinf.scheduler.cluster import Cluster
 from rlinf.utils.placement import (
     HybridComponentPlacement,
@@ -977,6 +978,7 @@ def validate_embodied_cfg(cfg):
             "env.eval.max_steps_per_rollout_epoch must be divisible by actor.model.num_action_chunks"
         )
         validate_chunk_step_cfg(cfg.env.eval, "env.eval")
+        validate_env_reset_mode_cfg(cfg.env.eval, "env.eval")
 
     if not cfg.runner.get("only_eval", False):
         assert cfg.env.train.total_num_envs > 0, (
@@ -1008,6 +1010,7 @@ def validate_embodied_cfg(cfg):
             "env.train.max_steps_per_rollout_epoch must be divisible by actor.model.num_action_chunks"
         )
         validate_chunk_step_cfg(cfg.env.train, "env.train")
+        validate_env_reset_mode_cfg(cfg.env.train, "env.train")
 
     with open_dict(cfg):
         weight_sync_interval = cfg.runner.get("weight_sync_interval", 1)
