@@ -99,6 +99,11 @@ class TestOverlapEnvBootstrap(unittest.TestCase):
             "history_reward_assign", True
         )
         self.worker._prefetched_train_bootstrap = None
+        self.worker._pending_reset_metrics = []
+        self.worker._torch_profiler = None
+        self.worker._torch_profiler_dir = None
+        self.worker._torch_profiler_step_enabled = False
+        self.worker.rollout_profiler = None
 
         # Mock env_list
         mock_env = MagicMock()
@@ -181,6 +186,48 @@ class TestOverlapEnvBootstrap(unittest.TestCase):
             self.worker.prefetch_train_bootstrap(rollout_channel)
 
         self.assertIn("A prefetched train bootstrap already exists", str(cm.exception))
+
+    def test_bootstrap_step_collects_reset_metrics(self):
+        self.cfg.env.train.auto_reset = False
+        mock_env = MagicMock()
+        mock_env.reset.return_value = (
+            {"main_images": torch.zeros(2, 3, 224, 224)},
+            {
+                "reset_metrics": {
+                    "full_count": 1,
+                    "state_count": 0,
+                    "total_time": 1.25,
+                }
+            },
+        )
+        self.worker.env_list = [mock_env]
+        self.worker._pending_reset_metrics = []
+
+        self.worker.bootstrap_step()
+
+        self.assertEqual(
+            self.worker._pending_reset_metrics,
+            [{"full_count": 1, "state_count": 0, "total_time": 1.25}],
+        )
+
+    def test_flush_pending_reset_metrics_adds_reset_namespace(self):
+        self.worker._pending_reset_metrics = [
+            {"full_count": 1, "state_count": 0, "total_time": 1.25}
+        ]
+        env_metrics = {}
+
+        self.worker._flush_pending_reset_metrics(env_metrics)
+
+        self.assertEqual(self.worker._pending_reset_metrics, [])
+        self.assertTrue(
+            torch.equal(env_metrics["reset/full_count"][0], torch.tensor([1.0]))
+        )
+        self.assertTrue(
+            torch.equal(env_metrics["reset/state_count"][0], torch.tensor([0.0]))
+        )
+        self.assertTrue(
+            torch.equal(env_metrics["reset/total_time"][0], torch.tensor([1.25]))
+        )
 
 
 if __name__ == "__main__":

@@ -75,6 +75,7 @@ class EnvWorker(Worker):
         self.last_obs_list = []
         self.last_intervened_info_list = []
         self._prefetched_train_bootstrap: list[EnvOutput] | None = None
+        self._pending_reset_metrics: list[dict[str, Any]] = []
         self.rollout_epoch = self.cfg.algorithm.get("rollout_epoch", 1)
         self._component_placement = HybridComponentPlacement(cfg, Cluster())
 
@@ -1344,6 +1345,9 @@ class EnvWorker(Worker):
             for stage_id in range(self.stage_num):
                 self.env_list[stage_id].is_start = True
                 extracted_obs, infos = self.env_list[stage_id].reset()
+                reset_metrics = infos.get("reset_metrics")
+                if reset_metrics is not None:
+                    self._pending_reset_metrics.append(reset_metrics)
                 dones = get_zero_dones()
                 terminations = dones.clone()
                 truncations = dones.clone()
@@ -1380,6 +1384,14 @@ class EnvWorker(Worker):
                 env_outputs.append(env_output)
 
         return env_outputs
+
+    def _flush_pending_reset_metrics(self, env_metrics: dict[str, list]) -> None:
+        while self._pending_reset_metrics:
+            reset_metrics = self._pending_reset_metrics.pop(0)
+            for key, value in reset_metrics.items():
+                env_metrics.setdefault(f"reset/{key}", []).append(
+                    torch.tensor([float(value)], dtype=torch.float32)
+                )
 
     def _send_train_bootstrap(
         self, rollout_channel: Channel, env_outputs: list[EnvOutput]
@@ -1529,6 +1541,7 @@ class EnvWorker(Worker):
             else:
                 env_outputs = self.bootstrap_step()
             _timing_bootstrap_time += _time.time() - _bs_t0
+            self._flush_pending_reset_metrics(env_metrics)
             for stage_id in range(self.stage_num):
                 env_output: EnvOutput = env_outputs[stage_id]
                 env_batch = env_output.to_dict()
