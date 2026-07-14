@@ -29,6 +29,7 @@ from rlinf.envs.robocasa.utils import (
     get_image_space,
 )
 from rlinf.envs.robocasa.venv import RobocasaSubprocEnv
+from rlinf.envs.reset_mode import robocasa_hard_reset_from_cfg
 from rlinf.envs.utils import (
     list_of_dict_to_dict_of_list,
     to_tensor,
@@ -133,6 +134,7 @@ class RobocasaEnv(gym.Env):
     def get_env_fns(self):
         """Create environment factory functions for each parallel environment."""
         env_fns = []
+        hard_reset = robocasa_hard_reset_from_cfg(self.cfg)
 
         for env_id in range(self.num_envs):
             task_idx = self.task_ids[env_id]
@@ -150,6 +152,7 @@ class RobocasaEnv(gym.Env):
                 width=camera_widths,
                 height=camera_heights,
                 robot=robot_name,
+                hard_reset=hard_reset,
             ):
                 """Factory function to create a robosuite environment in subprocess."""
                 import robocasa  # noqa: F401 RoboCasa must register envs per subprocess
@@ -176,6 +179,7 @@ class RobocasaEnv(gym.Env):
                     camera_depths=False,
                     seed=seed,
                     translucent_robot=False,
+                    hard_reset=hard_reset,
                     render_camera="robot0_agentview_center",  # Use same camera as observation
                 )
                 return env
