@@ -1782,6 +1782,9 @@ class LiberoEnv(gym.Env):
         env_idx: Optional[Union[int, list[int], np.ndarray]] = None,
         reset_state_ids=None,
     ):
+        import time as _time
+
+        total_t0 = _time.perf_counter()
         if env_idx is None:
             env_idx = np.arange(self.num_envs)
 
@@ -1795,7 +1798,8 @@ class LiberoEnv(gym.Env):
             num_reset_states = len(env_idx)
             reset_state_ids = self._get_random_reset_state_ids(num_reset_states)
 
-        self._reconfigure(reset_state_ids, env_idx)
+        reset_metrics = self._reconfigure(reset_state_ids, env_idx)
+        settle_t0 = _time.perf_counter()
         for _ in range(15):
             zero_actions = np.zeros((len(env_idx), 7))
             if self.cfg.reset_gripper_open:
@@ -1803,6 +1807,8 @@ class LiberoEnv(gym.Env):
             raw_obs, _reward, terminations, info_lists = self.env.step(
                 zero_actions, env_idx
             )
+        reset_metrics["settle_time"] = _time.perf_counter() - settle_t0
+        reset_metrics["total_time"] = _time.perf_counter() - total_t0
         if self.current_raw_obs is None:
             self.current_raw_obs = [None] * self.num_envs
         for i, idx in enumerate(env_idx):
@@ -1815,7 +1821,7 @@ class LiberoEnv(gym.Env):
             for idx in env_idx:
                 self._collect_done[idx] = False
                 self._collect_buffers[idx] = self._new_collect_buf()
-        infos = {}
+        infos = {"reset_metrics": reset_metrics}
         return obs, infos
 
     def step(self, actions=None, auto_reset=True):

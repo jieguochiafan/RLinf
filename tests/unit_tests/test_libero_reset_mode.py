@@ -85,6 +85,7 @@ def _make_libero_env(monkeypatch, *, reset_mode, fallback=True, is_eval=False):
     env.env = _FakeVectorEnv()
     env.num_envs = 2
     env.seed = 3
+    env._is_start = False
     env.task_ids = np.array([0, 0])
     env.trial_ids = np.array([0, 1])
     env._get_task_and_trial_ids_from_reset_state_ids = lambda ids: (
@@ -133,3 +134,36 @@ def test_state_mode_fail_fast_on_task_change(monkeypatch):
 
     with pytest.raises(ValueError, match="reset_mode='state'"):
         env._reconfigure(np.array([11]), np.array([0]))
+
+
+def test_libero_reset_returns_reset_metrics(monkeypatch):
+    env = _make_libero_env(monkeypatch, reset_mode="task_aware")
+    env.current_raw_obs = [
+        {
+            "image": np.zeros((2, 2, 3), dtype=np.uint8),
+            "wrist": np.zeros((2, 2, 3), dtype=np.uint8),
+        }
+    ]
+    env.num_envs = 1
+    env.cfg.reset_gripper_open = True
+    env._collecting = False
+    env._reset_metrics = lambda env_idx: None
+    env._wrap_obs = lambda raw_obs: {"raw_obs_len": len(raw_obs)}
+
+    def _step(action, env_idx):
+        del action
+        raw_obs = [
+            {
+                "image": np.zeros((2, 2, 3), dtype=np.uint8),
+                "wrist": np.zeros((2, 2, 3), dtype=np.uint8),
+            }
+        ]
+        return raw_obs, np.zeros(len(env_idx)), np.zeros(len(env_idx), dtype=bool), [{}]
+
+    env.env.step = _step
+
+    _obs, infos = env.reset(env_idx=np.array([0]), reset_state_ids=np.array([0]))
+
+    assert infos["reset_metrics"]["state_count"] == 1
+    assert "settle_time" in infos["reset_metrics"]
+    assert "total_time" in infos["reset_metrics"]
