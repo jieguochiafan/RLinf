@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-
 RESET_MODE_FULL = "full"
 RESET_MODE_STATE = "state"
 RESET_MODE_TASK_AWARE = "task_aware"

@@ -23,13 +23,13 @@ from rlinf.envs.chunk_runner import (
     build_chunk_done_outputs,
     maybe_apply_ignore_terminations,
 )
+from rlinf.envs.reset_mode import robocasa_hard_reset_from_cfg
 from rlinf.envs.robocasa.utils import (
     OBS_KEY_CAMERA_NAME_MAPPING,
     OBS_KEY_ROBOCASA_IMAGE_MAPPING,
     get_image_space,
 )
 from rlinf.envs.robocasa.venv import RobocasaSubprocEnv
-from rlinf.envs.reset_mode import robocasa_hard_reset_from_cfg
 from rlinf.envs.utils import (
     list_of_dict_to_dict_of_list,
     to_tensor,
