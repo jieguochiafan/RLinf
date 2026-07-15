@@ -149,6 +149,32 @@ def _worker(
                     p.send((obs, info))
                 else:
                     p.send(obs)
+            elif cmd == "soft_reset":
+                robosuite_env = getattr(env, "env", None)
+                old_hard_reset = getattr(robosuite_env, "hard_reset", None)
+                if robosuite_env is not None and old_hard_reset is not None:
+                    robosuite_env.hard_reset = False
+                try:
+                    retval = env.reset(**data)
+                finally:
+                    if robosuite_env is not None and old_hard_reset is not None:
+                        robosuite_env.hard_reset = old_hard_reset
+                reset_returns_info = (
+                    isinstance(retval, (tuple, list))
+                    and len(retval) == 2
+                    and isinstance(retval[1], dict)
+                )
+                if reset_returns_info:
+                    obs, info = retval
+                else:
+                    obs = retval
+                if obs_bufs is not None:
+                    _encode_obs(obs, obs_bufs)
+                    obs = None
+                if reset_returns_info:
+                    p.send((obs, info))
+                else:
+                    p.send(obs)
             elif cmd == "close":
                 p.send(env.close())
                 p.close()
@@ -221,6 +247,11 @@ class ReconfigureSubprocEnvWorker(SubprocEnvWorker):
         self.parent_remote.send(["reconfigure", env_fn_param])
         return self.parent_remote.recv()
 
+    def soft_reset(self, **kwargs):
+        self.parent_remote.send(["soft_reset", kwargs])
+        self.result = self.parent_remote.recv()
+        return self.result
+
 
 class ReconfigureSubprocEnv(SubprocVectorEnv):
     def __init__(self, env_fns: list[Callable[[], gym.Env]], **kwargs: Any) -> None:
@@ -243,3 +274,37 @@ class ReconfigureSubprocEnv(SubprocVectorEnv):
 
         for j, i in enumerate(id):
             self.workers[i].reconfigure_env_fn(env_fns[j])
+
+    def soft_reset(
+        self,
+        id: Optional[Union[int, list[int], np.ndarray]] = None,
+        **kwargs: Any,
+    ) -> Union[np.ndarray, tuple[np.ndarray, Union[dict, list[dict]]]]:
+        self._assert_is_not_closed()
+        id = self._wrap_id(id)
+        if self.is_async:
+            self._assert_id(id)
+
+        ret_list = [self.workers[i].soft_reset(**kwargs) for i in id]
+        reset_returns_info = (
+            isinstance(ret_list[0], (tuple, list))
+            and len(ret_list[0]) == 2
+            and isinstance(ret_list[0][1], dict)
+        )
+        if reset_returns_info:
+            obs_list = [r[0] for r in ret_list]
+        else:
+            obs_list = ret_list
+        if isinstance(obs_list[0], tuple):
+            raise TypeError(
+                "Tuple observation space is not supported. ",
+                "Please change it to array or dict space",
+            )
+        try:
+            obs = np.stack(obs_list)
+        except ValueError:
+            obs = np.array(obs_list, dtype=object)
+        if reset_returns_info:
+            infos = [r[1] for r in ret_list]
+            return obs, infos
+        return obs

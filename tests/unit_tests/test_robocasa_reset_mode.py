@@ -13,8 +13,10 @@ from omegaconf import OmegaConf
     ("cfg_extra", "expected_hard_reset"),
     [
         ({"reset_mode": "full"}, True),
-        ({"reset_mode": "state"}, False),
-        ({"reset_mode": "task_aware"}, False),
+        ({"reset_mode": "state"}, True),
+        ({"reset_mode": "state", "reset_optimization_enabled": True}, False),
+        ({"reset_mode": "task_aware"}, True),
+        ({"reset_mode": "task_aware", "reset_optimization_enabled": True}, False),
         ({"hard_reset": False}, False),
         ({}, True),
     ],

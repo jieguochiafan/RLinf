@@ -9,6 +9,7 @@ from rlinf.envs.reset_mode import (
     get_reset_mode,
     libero_should_full_reset,
     reset_full_on_state_mismatch,
+    reset_optimization_enabled,
     robocasa_hard_reset_from_cfg,
     validate_env_reset_mode_cfg,
 )
@@ -47,12 +48,45 @@ def test_reset_full_on_state_mismatch_defaults_true():
     )
 
 
+def test_reset_optimization_enabled_defaults_false():
+    assert reset_optimization_enabled(OmegaConf.create({})) is False
+    assert (
+        reset_optimization_enabled(
+            OmegaConf.create({"reset_optimization_enabled": True})
+        )
+        is True
+    )
+
+
+def test_validate_env_reset_mode_rejects_non_boolean_optimization_flag():
+    cfg = OmegaConf.create({"reset_optimization_enabled": "true"})
+
+    with pytest.raises(ValueError, match="env.train.reset_optimization_enabled"):
+        validate_env_reset_mode_cfg(cfg, "env.train")
+
+
+@pytest.mark.parametrize("strategy", ["random", "task_affine_fixed"])
+def test_validate_env_reset_mode_accepts_reset_sampling_strategy(strategy):
+    cfg = OmegaConf.create({"reset_sampling_strategy": strategy})
+
+    validate_env_reset_mode_cfg(cfg, "env.train")
+
+
+def test_validate_env_reset_mode_rejects_unknown_reset_sampling_strategy():
+    cfg = OmegaConf.create({"reset_sampling_strategy": "sticky"})
+
+    with pytest.raises(ValueError, match="env.train.reset_sampling_strategy"):
+        validate_env_reset_mode_cfg(cfg, "env.train")
+
+
 @pytest.mark.parametrize(
     ("cfg_dict", "expected"),
     [
         ({"reset_mode": "full"}, True),
-        ({"reset_mode": "state"}, False),
-        ({"reset_mode": "task_aware"}, False),
+        ({"reset_mode": "state"}, True),
+        ({"reset_mode": "state", "reset_optimization_enabled": True}, False),
+        ({"reset_mode": "task_aware"}, True),
+        ({"reset_mode": "task_aware", "reset_optimization_enabled": True}, False),
         ({"hard_reset": False}, False),
         ({}, True),
     ],
@@ -61,8 +95,14 @@ def test_robocasa_hard_reset_from_cfg(cfg_dict, expected):
     assert robocasa_hard_reset_from_cfg(OmegaConf.create(cfg_dict)) is expected
 
 
-def test_robocasa_reset_mode_overrides_hard_reset_compat_key():
-    cfg = OmegaConf.create({"reset_mode": "state", "hard_reset": True})
+def test_robocasa_reset_mode_overrides_hard_reset_when_optimization_is_enabled():
+    cfg = OmegaConf.create(
+        {
+            "reset_mode": "state",
+            "reset_optimization_enabled": True,
+            "hard_reset": True,
+        }
+    )
 
     assert robocasa_hard_reset_from_cfg(cfg) is False
 

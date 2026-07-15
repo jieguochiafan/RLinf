@@ -37,4 +37,5 @@ init_params:
 action_space: 12d
 state_space: 25d
 image_space: 2views
+reset_optimization_enabled: true
 reset_mode: task_aware

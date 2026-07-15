@@ -39,9 +39,11 @@ from rlinf.envs.libero.utils import (
 )
 from rlinf.envs.libero.venv import ReconfigureSubprocEnv
 from rlinf.envs.reset_mode import (
+    RESET_SAMPLING_TASK_AFFINE_FIXED,
     get_reset_mode,
     libero_should_full_reset,
     reset_full_on_state_mismatch,
+    reset_optimization_enabled,
 )
 from rlinf.envs.utils import list_of_dict_to_dict_of_list, to_tensor
 
@@ -1034,6 +1036,7 @@ class LiberoEnv(gym.Env):
         self.task_ids_filter = cfg.get(
             "task_ids_filter", None
         )  # e.g. [0] to eval only task 0
+        self.reset_sampling_strategy = cfg.get("reset_sampling_strategy", "random")
 
         self.ignore_terminations = cfg.ignore_terminations
         self.auto_reset = cfg.auto_reset
@@ -1366,6 +1369,43 @@ class LiberoEnv(gym.Env):
         else:
             self._valid_reset_state_ids = None
 
+    def _get_task_affine_fixed_reset_state_ids(self, num_reset_states):
+        if self._valid_reset_state_ids is not None:
+            candidate_task_indices = []
+            for task_idx in range(len(self.trial_id_bins)):
+                start = self.cumsum_trial_id_bins[task_idx - 1] if task_idx > 0 else 0
+                end = self.cumsum_trial_id_bins[task_idx]
+                if np.any(
+                    (self._valid_reset_state_ids >= start)
+                    & (self._valid_reset_state_ids < end)
+                ):
+                    candidate_task_indices.append(task_idx)
+        else:
+            candidate_task_indices = list(range(len(self.trial_id_bins)))
+
+        if not candidate_task_indices:
+            raise ValueError("task_affine_fixed requires at least one valid task")
+
+        reset_state_ids = []
+        for group_idx in range(num_reset_states):
+            global_group_idx = self.seed_offset * self.num_group + group_idx
+            task_idx = candidate_task_indices[
+                global_group_idx % len(candidate_task_indices)
+            ]
+            start = self.cumsum_trial_id_bins[task_idx - 1] if task_idx > 0 else 0
+            end = self.cumsum_trial_id_bins[task_idx]
+            if self._valid_reset_state_ids is not None:
+                valid_ids = self._valid_reset_state_ids[
+                    (self._valid_reset_state_ids >= start)
+                    & (self._valid_reset_state_ids < end)
+                ]
+                reset_state_ids.append(
+                    int(valid_ids[self._generator.integers(0, len(valid_ids))])
+                )
+            else:
+                reset_state_ids.append(int(self._generator.integers(start, end)))
+        return np.array(reset_state_ids, dtype=int)
+
     def update_reset_state_ids(self):
         if self.cfg.is_eval or self.cfg.use_ordered_reset_state_ids:
             reset_state_ids = self._get_ordered_reset_state_ids(self.num_group)
@@ -1382,6 +1422,10 @@ class LiberoEnv(gym.Env):
         if self.specific_reset_id is not None:
             reset_state_ids = self.specific_reset_id * np.ones(
                 (num_reset_states,), dtype=int
+            )
+        elif self.reset_sampling_strategy == RESET_SAMPLING_TASK_AFFINE_FIXED:
+            reset_state_ids = self._get_task_affine_fixed_reset_state_ids(
+                num_reset_states
             )
         elif self._valid_reset_state_ids is not None:
             indices = self._generator.integers(
@@ -1723,6 +1767,7 @@ class LiberoEnv(gym.Env):
         import time as _time
 
         reset_mode = get_reset_mode(self.cfg)
+        optimization_enabled = reset_optimization_enabled(self.cfg)
         fallback = reset_full_on_state_mismatch(self.cfg)
         bddl_may_change = self._libero_bddl_may_change_without_task_change()
         reset_metrics = {
@@ -1734,24 +1779,47 @@ class LiberoEnv(gym.Env):
             "set_init_state_time": 0.0,
         }
         reconfig_env_idx = []
+        base_reset_env_idx = []
+        soft_reset_env_idx = []
         task_ids, trial_ids = self._get_task_and_trial_ids_from_reset_state_ids(
             reset_state_ids
         )
+        variant = os.environ.get(
+            "LIBERO_TYPE",
+            self.cfg.get("libero_variant", "standard")
+            if hasattr(self.cfg, "get")
+            else "standard",
+        )
+        can_state_reset_from_init_state = variant != "plus"
         for j, env_id in enumerate(env_idx):
             task_changed = self.task_ids[env_id] != task_ids[j]
-            decision = libero_should_full_reset(
-                reset_mode=reset_mode,
-                task_changed=bool(task_changed),
-                is_eval=bool(getattr(self.cfg, "is_eval", False)),
-                bddl_may_change_without_task_change=bddl_may_change,
-                fallback_on_state_mismatch=fallback,
-            )
+            if optimization_enabled:
+                decision = libero_should_full_reset(
+                    reset_mode=reset_mode,
+                    task_changed=bool(task_changed),
+                    is_eval=bool(getattr(self.cfg, "is_eval", False)),
+                    bddl_may_change_without_task_change=bddl_may_change,
+                    fallback_on_state_mismatch=fallback,
+                )
+            else:
+                decision = libero_should_full_reset(
+                    reset_mode="full",
+                    task_changed=True,
+                    is_eval=False,
+                    bddl_may_change_without_task_change=False,
+                    fallback_on_state_mismatch=fallback,
+                )
             self.task_ids[env_id] = task_ids[j]
             self.trial_ids[env_id] = trial_ids[j]
             if decision.full_reset:
                 reconfig_env_idx.append(env_id)
+                base_reset_env_idx.append(env_id)
                 reset_metrics["full_count"] += 1
             else:
+                if can_state_reset_from_init_state:
+                    soft_reset_env_idx.append(env_id)
+                else:
+                    base_reset_env_idx.append(env_id)
                 reset_metrics["state_count"] += 1
             if decision.fallback_used:
                 reset_metrics["fallback_count"] += 1
@@ -1761,20 +1829,24 @@ class LiberoEnv(gym.Env):
             self.env.reconfigure_env_fns(env_fn_params, reconfig_env_idx)
             reset_metrics["reconfigure_time"] += _time.perf_counter() - t0
         self.env.seed(self.seed * len(env_idx))
-        t0 = _time.perf_counter()
-        self.env.reset(id=env_idx)
-        reset_metrics["base_reset_time"] += _time.perf_counter() - t0
-        variant = os.environ.get(
-            "LIBERO_TYPE",
-            self.cfg.get("libero_variant", "standard")
-            if hasattr(self.cfg, "get")
-            else "standard",
-        )
-        if variant != "plus":
+        if base_reset_env_idx:
+            t0 = _time.perf_counter()
+            self.env.reset(id=np.asarray(base_reset_env_idx))
+            reset_metrics["base_reset_time"] += _time.perf_counter() - t0
+        if soft_reset_env_idx:
+            t0 = _time.perf_counter()
+            if hasattr(self.env, "soft_reset"):
+                self.env.soft_reset(id=np.asarray(soft_reset_env_idx))
+            else:
+                self.env.reset(id=np.asarray(soft_reset_env_idx))
+            reset_metrics["base_reset_time"] += _time.perf_counter() - t0
+        raw_obs = None
+        if can_state_reset_from_init_state:
             init_state = self._get_reset_states(env_idx=env_idx)
             t0 = _time.perf_counter()
-            self.env.set_init_state(init_state=init_state, id=env_idx)
+            raw_obs = self.env.set_init_state(init_state=init_state, id=env_idx)
             reset_metrics["set_init_state_time"] += _time.perf_counter() - t0
+        reset_metrics["raw_obs"] = raw_obs
         return reset_metrics
 
     def reset(
@@ -1799,6 +1871,7 @@ class LiberoEnv(gym.Env):
             reset_state_ids = self._get_random_reset_state_ids(num_reset_states)
 
         reset_metrics = self._reconfigure(reset_state_ids, env_idx)
+        raw_obs = reset_metrics.pop("raw_obs", None)
         settle_t0 = _time.perf_counter()
         for _ in range(15):
             zero_actions = np.zeros((len(env_idx), 7))

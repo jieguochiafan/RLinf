@@ -15,6 +15,9 @@ reward_coef: 1.0
 # RLinf LiberoEnv specific settings
 reset_gripper_open: True
 is_eval: False
+reset_optimization_enabled: true
+reset_mode: task_aware
+reset_sampling_strategy: task_affine_fixed
 
 seed: 0
 group_size: 1
