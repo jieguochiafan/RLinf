@@ -114,6 +114,17 @@ Estimated saving: about 92.4%.
 
 ## Rollout-Level Impact
 
+During training, rollout rank 0 shows the reset time received with each epoch's
+bootstrap batch in the rollout progress bar:
+
+```text
+Generating Rollout Epochs: 12%|...| 1/8 [01:34<..., 94.38s/it, reset=47.08s]
+```
+
+The postfix is reported whether reset optimization is enabled or disabled. When
+multiple environment workers feed rollout rank 0, it reports the maximum reset
+time among those mapped workers.
+
 LIBERO spatial simulation, 8 envs, 64 rollout epochs:
 
 | Sampling Strategy | Full Reset Ratio | State Reset Ratio |
@@ -150,4 +161,3 @@ env:
     reset_optimization_enabled: true
     reset_mode: task_aware
 ```
-

@@ -41,6 +41,7 @@ from rlinf.utils.nested_dict_process import cat_list_of_dict_tensor
 from rlinf.utils.placement import (
     HybridComponentPlacement,
 )
+from rlinf.utils.profile_timeline import TimelineRecorder, timeline_span
 from rlinf.utils.utils import clear_memory
 
 
@@ -50,6 +51,9 @@ class RewardWorker(Worker):
     def __init__(self, cfg: DictConfig):
         Worker.__init__(self)
         self.cfg = cfg
+        self.timeline = TimelineRecorder.from_config(
+            cfg, component="reward", rank=self._rank
+        )
         self.placement = HybridComponentPlacement(cfg, Cluster())
 
     def init_worker(self):
@@ -197,6 +201,9 @@ class EmbodiedRewardWorker(Worker):
     def __init__(self, cfg: DictConfig):
         Worker.__init__(self)
         self.cfg = cfg
+        self.timeline = TimelineRecorder.from_config(
+            cfg, component="reward", rank=self._rank
+        )
 
         self._standalone_realworld = self.cfg.reward.get("standalone_realworld", False)
         self.placement = (
@@ -266,7 +273,8 @@ class EmbodiedRewardWorker(Worker):
             reward_input, last_run_count = await self.recv_merged_reward_input(
                 input_channel, mode="train"
             )
-            rewards = self.model.compute_reward(reward_input)
+            with self.timeline.span("reward.inference"):
+                rewards = self.model.compute_reward(reward_input)
 
             if rewards is not None and rewards.dim() == 1:
                 rewards = rewards.unsqueeze(-1)
@@ -279,6 +287,7 @@ class EmbodiedRewardWorker(Worker):
         if self.enable_offload:
             self.model.to("cpu")
 
+    @timeline_span("reward.wait_input", include_args=("mode",))
     async def recv_merged_reward_input(
         self, input_channel: Channel, mode: Literal["train", "eval"] = "train"
     ) -> tuple[dict[str, Any], int]:
@@ -384,6 +393,7 @@ class EmbodiedRewardWorker(Worker):
             dst_rank=self._rank,
         )
 
+    @timeline_span("reward.send_output")
     def send_reward_output(
         self,
         output_channel: Channel,
@@ -432,7 +442,8 @@ class EmbodiedRewardWorker(Worker):
             observations, _ = await self.recv_merged_reward_input(
                 input_channel, mode="train"
             )
-            rewards = self.model.compute_reward(observations)
+            with self.timeline.span("reward.inference"):
+                rewards = self.model.compute_reward(observations)
 
             if rewards is not None and rewards.dim() == 1:
                 rewards = rewards.unsqueeze(-1)

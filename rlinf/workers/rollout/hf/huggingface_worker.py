@@ -35,7 +35,11 @@ from rlinf.models.embodiment.base_policy import BasePolicy
 from rlinf.scheduler import Channel, Cluster, Worker
 from rlinf.utils.comm_mapping import CommMapper
 from rlinf.utils.placement import HybridComponentPlacement
-from rlinf.utils.profile_timeline import write_time_anchor
+from rlinf.utils.profile_timeline import (
+    TimelineRecorder,
+    timeline_span,
+    write_time_anchor,
+)
 
 
 class MultiStepRolloutWorker(Worker):
@@ -43,6 +47,9 @@ class MultiStepRolloutWorker(Worker):
         Worker.__init__(self)
 
         self.cfg = cfg
+        self.timeline = TimelineRecorder.from_config(
+            cfg, component="rollout", rank=self._rank
+        )
         self.should_stop = False
         train_env_cfg = cfg.env.get("train", None)
         self.log_generation_timestamps = bool(
@@ -250,9 +257,7 @@ class MultiStepRolloutWorker(Worker):
             self._generation_timestamp_file = open(
                 path, "a", encoding="utf-8", buffering=1
             )
-        self._generation_timestamp_file.write(
-            json.dumps(event, sort_keys=True) + "\n"
-        )
+        self._generation_timestamp_file.write(json.dumps(event, sort_keys=True) + "\n")
 
     def _build_generation_timestamp_event(
         self,
@@ -377,9 +382,7 @@ class MultiStepRolloutWorker(Worker):
         if self.log_generation_timestamps:
             perf_start = time.perf_counter()
             self._write_generation_timestamp_event(
-                self._build_generation_timestamp_event(
-                    "start", mode, profile_context
-                )
+                self._build_generation_timestamp_event("start", mode, profile_context)
             )
 
         kwargs = (
@@ -420,37 +423,44 @@ class MultiStepRolloutWorker(Worker):
         with torch.no_grad():
             expert_label_flag = False
             # Decide which model to act via use_expert
-            with self._profile_generation_context(profile_context):
-                if use_expert:
-                    actions, result = self.expert_model.predict_action_batch(
-                        env_obs=env_obs,
-                        **kwargs,
-                    )
-                    expert_label_flag = True
-                else:
-                    actions, result = self.hf_model.predict_action_batch(
-                        env_obs=env_obs,
-                        **kwargs,
-                    )
+            timeline_context = {
+                "mode": mode,
+                "policy_version": self.version,
+                **(profile_context or {}),
+            }
+            with self.timeline.span("rollout.inference", **timeline_context):
+                profile_scope = self._profile_generation_context(profile_context)
+                with profile_scope:
+                    if use_expert:
+                        actions, result = self.expert_model.predict_action_batch(
+                            env_obs=env_obs,
+                            **kwargs,
+                        )
+                        expert_label_flag = True
+                    else:
+                        actions, result = self.hf_model.predict_action_batch(
+                            env_obs=env_obs,
+                            **kwargs,
+                        )
 
-                # Decide re-label or not
-                if (
-                    not only_save_expert  # only re-label in classic dagger mode
-                    and not use_expert  # only re-label if not using expert
-                    and self.expert_model is not None  # only re-label if expert exists
-                    and mode == "train"  # only re-label in train mode
-                ):
-                    _, expert_result = self.expert_model.predict_action_batch(
-                        env_obs=env_obs,
-                        **kwargs,
-                    )
-                    expert_forward_inputs = expert_result["forward_inputs"]
-                    expert_target = expert_forward_inputs.get(
-                        "model_action", expert_forward_inputs.get("action")
-                    )
-                    if expert_target is not None:
-                        result["forward_inputs"]["model_action"] = expert_target
-                    expert_label_flag = True
+                    # Decide re-label or not
+                    if (
+                        not only_save_expert  # only re-label in classic dagger mode
+                        and not use_expert  # only re-label if not using expert
+                        and self.expert_model is not None  # expert must be available
+                        and mode == "train"  # only re-label in train mode
+                    ):
+                        _, expert_result = self.expert_model.predict_action_batch(
+                            env_obs=env_obs,
+                            **kwargs,
+                        )
+                        expert_forward_inputs = expert_result["forward_inputs"]
+                        expert_target = expert_forward_inputs.get(
+                            "model_action", expert_forward_inputs.get("action")
+                        )
+                        if expert_target is not None:
+                            result["forward_inputs"]["model_action"] = expert_target
+                        expert_label_flag = True
 
                 if self._torch_profiler is not None and torch.cuda.is_available():
                     torch.cuda.synchronize()
@@ -498,6 +508,7 @@ class MultiStepRolloutWorker(Worker):
                 final_values = torch.zeros_like(actions[:, :1], dtype=torch.float32)
         return final_values[:, :1].cpu().contiguous()
 
+    @timeline_span("rollout.recv_apply_weights")
     async def sync_model_from_actor(self):
         """Sync model parameters from the actor worker."""
 
@@ -549,12 +560,15 @@ class MultiStepRolloutWorker(Worker):
         input_channel: Channel,
         output_channel: Channel,
         epoch_idx: int | None = None,
-    ):
+    ) -> float | None:
         self.update_dagger_beta()
         _last_rollout_result = None  # cache for dummy reuse when all envs done
+        reset_time_s = None
         for chunk_step_idx in range(self.n_train_chunk_steps):
             for stage_id in range(self.num_pipeline_stages):
                 env_output = await self.recv_env_output(input_channel)
+                if chunk_step_idx == 0 and stage_id == 0:
+                    reset_time_s = env_output.get("reset_time_s")
 
                 # v10: skip predict if all envs done
                 all_done_flag = env_output.get("env_all_done", None)
@@ -656,6 +670,26 @@ class MultiStepRolloutWorker(Worker):
                     ),
                 )
             self.send_rollout_result(output_channel, rollout_result, mode="train")
+        return reset_time_s
+
+    def _log_rollout_progress(
+        self,
+        epoch_idx: int,
+        total_epochs: int,
+        epoch_time_s: float,
+        reset_time_s: float | None,
+    ) -> None:
+        """Log permanent per-epoch timing alongside the transient progress bar."""
+        if self._rank != 0:
+            return
+        reset_text = (
+            f"{reset_time_s:.3f}s" if reset_time_s is not None else "unavailable"
+        )
+        self.log_info(
+            "[rollout-progress] "
+            f"rollout_epoch={epoch_idx + 1}/{total_epochs} "
+            f"total={epoch_time_s:.3f}s reset={reset_text}"
+        )
 
     async def generate(
         self,
@@ -672,12 +706,27 @@ class MultiStepRolloutWorker(Worker):
                 "enabled", False
             )
             actual_rollout_epoch = 1 if v17_enabled else self.rollout_epoch
-            for epoch_idx in tqdm(
+            progress_bar = tqdm(
                 range(actual_rollout_epoch),
                 desc="Generating Rollout Epochs",
                 disable=(self._rank != 0),
-            ):
-                await self.generate_one_epoch(input_channel, output_channel, epoch_idx)
+            )
+            for epoch_idx in progress_bar:
+                epoch_start = time.perf_counter()
+                reset_time_s = await self.generate_one_epoch(
+                    input_channel, output_channel, epoch_idx
+                )
+                epoch_time_s = time.perf_counter() - epoch_start
+                if reset_time_s is not None:
+                    progress_bar.set_postfix_str(
+                        f"reset={reset_time_s:.2f}s", refresh=False
+                    )
+                self._log_rollout_progress(
+                    epoch_idx,
+                    actual_rollout_epoch,
+                    epoch_time_s,
+                    reset_time_s,
+                )
 
             if self.enable_offload:
                 self.offload_model()
@@ -715,6 +764,7 @@ class MultiStepRolloutWorker(Worker):
                 eval_batch_size=self.eval_batch_size,
             )
 
+    @timeline_span("rollout.wait_obs", include_args=("mode",))
     async def recv_env_output(
         self, input_channel: Channel, mode: Literal["train", "eval"] = "train"
     ) -> dict[str, Any]:
@@ -815,6 +865,14 @@ class MultiStepRolloutWorker(Worker):
 
         result = {"obs": merged_obs, "final_obs": merged_final_obs}
 
+        reset_times = [
+            float(obs_batch["reset_time_s"])
+            for obs_batch in obs_batches
+            if obs_batch.get("reset_time_s") is not None
+        ]
+        if reset_times:
+            result["reset_time_s"] = max(reset_times)
+
         # v10: preserve env_all_done flag (concat across ranks, check all)
         if obs_batches and "env_all_done" in obs_batches[0]:
             result["env_all_done"] = torch.cat(
@@ -823,6 +881,7 @@ class MultiStepRolloutWorker(Worker):
 
         return result
 
+    @timeline_span("rollout.send_action", include_args=("mode",))
     def send_chunk_actions(
         self,
         output_channel: Channel,
@@ -896,6 +955,7 @@ class MultiStepRolloutWorker(Worker):
             for idx in range(len(sizes))
         ]
 
+    @timeline_span("rollout.send_action", include_args=("mode",))
     def send_rollout_result(
         self,
         output_channel: Channel,

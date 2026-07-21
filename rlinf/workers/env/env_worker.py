@@ -48,7 +48,11 @@ from rlinf.utils.nested_dict_process import (
     update_nested_cfg,
 )
 from rlinf.utils.placement import HybridComponentPlacement
-from rlinf.utils.profile_timeline import write_time_anchor
+from rlinf.utils.profile_timeline import (
+    TimelineRecorder,
+    timeline_span,
+    write_time_anchor,
+)
 from rlinf.workers.env.history_manager import HistoryManager
 
 
@@ -65,6 +69,9 @@ class EnvWorker(Worker):
         Worker.__init__(self)
 
         self.cfg = cfg
+        self.timeline = TimelineRecorder.from_config(
+            cfg, component="env", rank=self._rank
+        )
         self.train_video_cnt = 0
         self.eval_video_cnt = 0
         self.should_stop = False
@@ -724,6 +731,10 @@ class EnvWorker(Worker):
                 self.env_list[i].offload()
 
     @Worker.timer("env_interact_step")
+    @timeline_span(
+        "env.step",
+        include_args=("stage_id", "epoch", "chunk_step_idx"),
+    )
     def env_interact_step(
         self,
         chunk_actions: torch.Tensor,
@@ -1055,6 +1066,7 @@ class EnvWorker(Worker):
         return chunk_action
 
     @Worker.timer("recv_rollout_results")
+    @timeline_span("env.wait_action", include_args=("mode",))
     def recv_rollout_results(
         self, input_channel: Channel, mode="train"
     ) -> RolloutResult:
@@ -1156,6 +1168,7 @@ class EnvWorker(Worker):
                 if not self.cfg.env.eval.auto_reset:
                     self.eval_env_list[i].update_reset_state_ids()
 
+    @timeline_span("env.send_obs", include_args=("mode",))
     def send_env_batch(
         self,
         rollout_channel: Channel,
@@ -1182,6 +1195,7 @@ class EnvWorker(Worker):
                 key=CommMapper.build_channel_key(self._rank, rank, extra=f"{mode}_obs"),
             )
 
+    @timeline_span("env.send_reward_input", include_args=("mode",))
     def send_reward_input(
         self,
         send_channel: Channel,
@@ -1201,6 +1215,7 @@ class EnvWorker(Worker):
             )
 
     @Worker.timer("recv_reward_results")
+    @timeline_span("env.wait_reward")
     def recv_reward_results(self, recv_channel: Channel) -> torch.Tensor:
         reward_results: list[torch.Tensor] = []
         src_ranks_and_sizes = self.src_rank_map["reward_train"]
@@ -1221,6 +1236,10 @@ class EnvWorker(Worker):
         return torch.cat(reward_results, dim=0)
 
     @Worker.timer("get_reward_model_output")
+    @timeline_span(
+        "env.reward",
+        include_args=("stage_id", "last_run"),
+    )
     def get_reward_model_output(
         self,
         env_output: EnvOutput,
@@ -1327,6 +1346,7 @@ class EnvWorker(Worker):
             for reward_assign_step in range(2, reward_assign_length + 1):
                 rollout_rewards[-reward_assign_step][env_id] += reward[env_id]
 
+    @timeline_span("env.reset_bootstrap")
     def bootstrap_step(self) -> list[EnvOutput]:
         def get_zero_dones() -> torch.Tensor:
             return (
@@ -1393,6 +1413,21 @@ class EnvWorker(Worker):
                     torch.tensor([float(value)], dtype=torch.float32)
                 )
 
+    def _log_rollout_epoch_timing(
+        self,
+        epoch: int,
+        total_epochs: int,
+        epoch_time: float,
+        reset_time: float,
+    ) -> None:
+        """Log one rollout epoch's total and reset time from the first env worker."""
+        if self._rank != 0:
+            return
+        self.log_info(
+            f"[rollout-epoch-timing] rollout_epoch={epoch + 1}/{total_epochs} "
+            f"total={epoch_time:.3f}s reset={reset_time:.3f}s"
+        )
+
     def _send_train_bootstrap(
         self, rollout_channel: Channel, env_outputs: list[EnvOutput]
     ) -> None:
@@ -1445,6 +1480,7 @@ class EnvWorker(Worker):
             for env_output in env_output_list
         ]
 
+    @timeline_span("env.send_trajectory")
     async def send_rollout_trajectories(
         self, rollout_result: EmbodiedRolloutResult, channel: Channel
     ):
@@ -1533,14 +1569,19 @@ class EnvWorker(Worker):
             _bl_step_time = 0.0
             _bl_step_count = 0
             _bl_per_epoch_step_time = []
+            _bl_per_epoch_reset_time = []
         for epoch in range(actual_rollout_epoch):
+            _epoch_t0 = _time.time()
             _bs_t0 = _time.time()
             if epoch == 0 and self._prefetched_train_bootstrap is not None:
                 env_outputs = self._prefetched_train_bootstrap
                 self._prefetched_train_bootstrap = None
             else:
                 env_outputs = self.bootstrap_step()
-            _timing_bootstrap_time += _time.time() - _bs_t0
+            _epoch_reset_time = _time.time() - _bs_t0
+            _timing_bootstrap_time += _epoch_reset_time
+            if not v17_enabled:
+                _bl_per_epoch_reset_time.append(_epoch_reset_time)
             self._flush_pending_reset_metrics(env_metrics)
             for stage_id in range(self.stage_num):
                 env_output: EnvOutput = env_outputs[stage_id]
@@ -1548,6 +1589,7 @@ class EnvWorker(Worker):
                 init_send_dict = {
                     "obs": env_batch["obs"],
                     "final_obs": env_batch["final_obs"],
+                    "reset_time_s": _epoch_reset_time,
                 }
                 if v10_enabled or v17_enabled:
                     init_send_dict["env_all_done"] = torch.zeros(
@@ -2293,6 +2335,12 @@ class EnvWorker(Worker):
 
             self.store_last_obs_and_intervened_info(env_outputs)
             self.finish_rollout()
+            self._log_rollout_epoch_timing(
+                epoch,
+                actual_rollout_epoch,
+                _time.time() - _epoch_t0,
+                _epoch_reset_time,
+            )
 
         # ── Timing summary ──
         if v17_enabled:
@@ -2362,7 +2410,8 @@ class EnvWorker(Worker):
                 f"[bl-timing] env_step: {_bl_step_count} calls, total={_bl_step_time:.1f}s, avg={avg_step:.3f}s/call"
             )
             print(
-                f"[bl-timing] per_epoch_step_time: {[round(t, 1) for t in _bl_per_epoch_step_time]}"
+                f"[bl-timing] per_epoch_step_time: {[round(t, 1) for t in _bl_per_epoch_step_time]}, "
+                f"per_epoch_reset_time: {[round(t, 1) for t in _bl_per_epoch_reset_time]}"
             )
         # Common timers
         _env_step_total = (

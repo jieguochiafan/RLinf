@@ -229,6 +229,33 @@ class TestOverlapEnvBootstrap(unittest.TestCase):
             torch.equal(env_metrics["reset/total_time"][0], torch.tensor([1.25]))
         )
 
+    def test_rollout_epoch_timing_logs_on_rank_zero(self):
+        self.worker.log_info = MagicMock()
+
+        self.worker._log_rollout_epoch_timing(
+            epoch=1,
+            total_epochs=8,
+            epoch_time=98.7654,
+            reset_time=12.3456,
+        )
+
+        self.worker.log_info.assert_called_once_with(
+            "[rollout-epoch-timing] rollout_epoch=2/8 total=98.765s reset=12.346s"
+        )
+
+    def test_rollout_epoch_timing_skips_nonzero_rank(self):
+        self.worker._rank = 1
+        self.worker.log_info = MagicMock()
+
+        self.worker._log_rollout_epoch_timing(
+            epoch=0,
+            total_epochs=8,
+            epoch_time=90.0,
+            reset_time=12.0,
+        )
+
+        self.worker.log_info.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

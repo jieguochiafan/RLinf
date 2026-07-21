@@ -94,3 +94,21 @@ SwanLab
 .. tip::
 
    三个 logger 可以 **并行运行**；你可以自由组合使用。
+
+具身训练运行时间线
+------------------
+
+具身训练可以选择记录 Env、Rollout、Reward 和 Actor 的运行区间，用于绘制
+甘特图。该功能默认关闭：
+
+.. code-block:: yaml
+
+   runner:
+     profile_timeline:
+       enabled: true
+       output_dir: null  # 默认写入 <runner.logger.log_path>/profile_timeline
+
+每个 Worker 进程在独立目录中写入一个 ``events.jsonl`` 文件。事件包含墙钟和
+单调时钟的开始/结束时间、组件、rank、进程及可用的 rollout 元数据。时间线
+记录流水线计算和等待区间，不记录 advantage/return 计算与 proximal logprob
+重算。

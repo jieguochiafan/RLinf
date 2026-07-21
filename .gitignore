@@ -22,3 +22,5 @@ PKG-INFO
 *.egg-info/
 .worktrees/
 .claude/settings.json
+nsight_profile/
+perf_test_robocasa/

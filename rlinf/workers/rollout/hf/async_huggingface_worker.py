@@ -95,18 +95,27 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
         assert self.finished_episodes is not None, (
             "finished_episodes should be initialized."
         )
-        while True:
+
+        def has_capacity() -> bool:
             capacity = (
                 (self.staleness_threshold + self.version + 1)
                 * self.total_num_train_envs
                 * self.rollout_epoch
             )
-            if (
+            return (
                 self.finished_episodes + self.total_num_train_envs * self.rollout_epoch
                 <= capacity
-            ):
-                break
-            await asyncio.sleep(0.01)
+            )
+
+        if has_capacity():
+            return
+        with self.timeline.span(
+            "rollout.staleness_wait",
+            policy_version=self.version,
+            finished_episodes=self.finished_episodes,
+        ):
+            while not has_capacity():
+                await asyncio.sleep(0.01)
 
     def stop(self):
         if self._generate_task is not None and not self._generate_task.done():

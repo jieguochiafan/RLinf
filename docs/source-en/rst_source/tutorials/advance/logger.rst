@@ -96,3 +96,21 @@ metrics. You can check the metrics through your dashboard.
 
    All three loggers run **in parallel**; feel free to mix and match.
 
+Embodied runtime timeline
+-------------------------
+
+Embodied runs can optionally record Env, Rollout, Reward, and Actor runtime
+intervals for a Gantt-style timeline. It is disabled by default:
+
+.. code-block:: yaml
+
+   runner:
+     profile_timeline:
+       enabled: true
+       output_dir: null  # defaults to <runner.logger.log_path>/profile_timeline
+
+Each worker writes an ``events.jsonl`` file in its own process directory. Events
+contain wall-clock and monotonic start/end timestamps, component, rank, process,
+and available rollout metadata. The timeline records pipeline work and waiting
+intervals; advantage/return calculation and proximal-logprob recomputation are
+not recorded.

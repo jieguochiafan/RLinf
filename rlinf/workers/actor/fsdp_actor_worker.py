@@ -77,6 +77,7 @@ from rlinf.utils.placement import (
     HybridComponentPlacement,
     ModelParallelComponentPlacement,
 )
+from rlinf.utils.profile_timeline import TimelineRecorder, timeline_span
 from rlinf.utils.pytree import register_pytree_dataclasses
 from rlinf.utils.utils import (
     clear_memory,
@@ -977,6 +978,9 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         Worker.__init__(self)
         super().__init__(cfg.actor, self._world_size, self._rank)
         self.cfg = cfg
+        self.timeline = TimelineRecorder.from_config(
+            cfg, component="actor", rank=self._rank
+        )
 
         # Fix global RNG for reproducibility (per-rank seed)
         import random
@@ -1039,6 +1043,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
     def get_rollout_state_dict(self) -> dict:
         return self.get_model_state_dict(cpu_offload=False, full_state_dict=False)
 
+    @timeline_span("actor.sync_weights")
     async def sync_model_to_rollout(self) -> None:
         if self.enable_offload:
             if not self.is_optimizer_offloaded:
@@ -1047,7 +1052,8 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             if self.is_weight_offloaded:
                 self.load_param_and_grad(self.device, False)
 
-        state_dict = self.get_rollout_state_dict()
+        with self.timeline.span("actor.export_weights", policy_version=self.version):
+            state_dict = self.get_rollout_state_dict()
 
         async def send_func(data):
             if not self._is_weight_sender:
@@ -1095,7 +1101,8 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 param_names_need_sync=self.param_names_need_sync,
             )
 
-        await self.weight_syncer.sync(state_dict, send_func, version=self.version)
+        with self.timeline.span("actor.send_weights", policy_version=self.version):
+            await self.weight_syncer.sync(state_dict, send_func, version=self.version)
 
         if self.enable_offload:
             assert not self.is_weight_offloaded, (
@@ -1117,13 +1124,26 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         split_num = compute_split_num(send_num, recv_num)
 
         recv_list = []
-        for _ in range(split_num):
-            trajectory: Trajectory = await input_channel.get(async_op=True).async_wait()
-            recv_list.append(trajectory)
+        with self.timeline.span(
+            "actor.wait_trajectory",
+            policy_version=self.version,
+            expected_trajectories=split_num,
+        ):
+            for _ in range(split_num):
+                trajectory: Trajectory = (
+                    await input_channel.get(async_op=True).async_wait()
+                )
+                recv_list.append(trajectory)
 
-        self.rollout_batch = convert_trajectories_to_batch(recv_list)
-
-        self.rollout_batch = self._process_received_rollout_batch(self.rollout_batch)
+        with self.timeline.span(
+            "actor.prepare_batch",
+            policy_version=self.version,
+            trajectory_count=len(recv_list),
+        ):
+            self.rollout_batch = convert_trajectories_to_batch(recv_list)
+            self.rollout_batch = self._process_received_rollout_batch(
+                self.rollout_batch
+            )
 
     def _process_received_rollout_batch(
         self, rollout_batch: dict[str, torch.Tensor]
@@ -1429,6 +1449,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             )
 
     @Worker.timer("run_training")
+    @timeline_span("actor.train")
     def run_training(self) -> None:
         """
         Run the training process using the received rollout batch.
