@@ -7,38 +7,6 @@
       "gpu": {
         "mig_device_uuid": null,
         "mode": "mps",
-        "parent_gpu": 0,
-        "sm_percent": 40,
-        "visible_devices": [
-          "0"
-        ]
-      },
-      "node_group_label": "cluster",
-      "rank": 0
-    },
-    {
-      "cluster_node_rank": 0,
-      "component": "actor",
-      "cpu": null,
-      "gpu": {
-        "mig_device_uuid": null,
-        "mode": "mps",
-        "parent_gpu": 1,
-        "sm_percent": 40,
-        "visible_devices": [
-          "1"
-        ]
-      },
-      "node_group_label": "cluster",
-      "rank": 1
-    },
-    {
-      "cluster_node_rank": 0,
-      "component": "actor",
-      "cpu": null,
-      "gpu": {
-        "mig_device_uuid": null,
-        "mode": "mps",
         "parent_gpu": 2,
         "sm_percent": 40,
         "visible_devices": [
@@ -46,7 +14,7 @@
         ]
       },
       "node_group_label": "cluster",
-      "rank": 2
+      "rank": 0
     },
     {
       "cluster_node_rank": 0,
@@ -62,7 +30,7 @@
         ]
       },
       "node_group_label": "cluster",
-      "rank": 3
+      "rank": 1
     },
     {
       "cluster_node_rank": 0,
@@ -78,7 +46,7 @@
         ]
       },
       "node_group_label": "cluster",
-      "rank": 4
+      "rank": 2
     },
     {
       "cluster_node_rank": 0,
@@ -94,7 +62,7 @@
         ]
       },
       "node_group_label": "cluster",
-      "rank": 5
+      "rank": 3
     },
     {
       "cluster_node_rank": 0,
@@ -110,7 +78,7 @@
         ]
       },
       "node_group_label": "cluster",
-      "rank": 6
+      "rank": 4
     },
     {
       "cluster_node_rank": 0,
@@ -126,39 +94,7 @@
         ]
       },
       "node_group_label": "cluster",
-      "rank": 7
-    },
-    {
-      "cluster_node_rank": 0,
-      "component": "env",
-      "cpu": null,
-      "gpu": {
-        "mig_device_uuid": null,
-        "mode": "mps",
-        "parent_gpu": 0,
-        "sm_percent": 0,
-        "visible_devices": [
-          "0"
-        ]
-      },
-      "node_group_label": "cluster",
-      "rank": 0
-    },
-    {
-      "cluster_node_rank": 0,
-      "component": "env",
-      "cpu": null,
-      "gpu": {
-        "mig_device_uuid": null,
-        "mode": "mps",
-        "parent_gpu": 1,
-        "sm_percent": 0,
-        "visible_devices": [
-          "1"
-        ]
-      },
-      "node_group_label": "cluster",
-      "rank": 1
+      "rank": 5
     },
     {
       "cluster_node_rank": 0,
@@ -174,7 +110,7 @@
         ]
       },
       "node_group_label": "cluster",
-      "rank": 2
+      "rank": 0
     },
     {
       "cluster_node_rank": 0,
@@ -190,7 +126,7 @@
         ]
       },
       "node_group_label": "cluster",
-      "rank": 3
+      "rank": 1
     },
     {
       "cluster_node_rank": 0,
@@ -206,7 +142,7 @@
         ]
       },
       "node_group_label": "cluster",
-      "rank": 4
+      "rank": 2
     },
     {
       "cluster_node_rank": 0,
@@ -222,7 +158,7 @@
         ]
       },
       "node_group_label": "cluster",
-      "rank": 5
+      "rank": 3
     },
     {
       "cluster_node_rank": 0,
@@ -238,7 +174,7 @@
         ]
       },
       "node_group_label": "cluster",
-      "rank": 6
+      "rank": 4
     },
     {
       "cluster_node_rank": 0,
@@ -254,7 +190,7 @@
         ]
       },
       "node_group_label": "cluster",
-      "rank": 7
+      "rank": 5
     },
     {
       "cluster_node_rank": 0,
@@ -263,10 +199,10 @@
       "gpu": {
         "mig_device_uuid": null,
         "mode": "mps",
-        "parent_gpu": 0,
-        "sm_percent": 80,
+        "parent_gpu": 2,
+        "sm_percent": 100,
         "visible_devices": [
-          "0"
+          "2"
         ]
       },
       "node_group_label": "cluster",
@@ -279,10 +215,10 @@
       "gpu": {
         "mig_device_uuid": null,
         "mode": "mps",
-        "parent_gpu": 1,
-        "sm_percent": 80,
+        "parent_gpu": 3,
+        "sm_percent": 100,
         "visible_devices": [
-          "1"
+          "3"
         ]
       },
       "node_group_label": "cluster",
@@ -295,10 +231,10 @@
       "gpu": {
         "mig_device_uuid": null,
         "mode": "mps",
-        "parent_gpu": 2,
-        "sm_percent": 80,
+        "parent_gpu": 4,
+        "sm_percent": 100,
         "visible_devices": [
-          "2"
+          "4"
         ]
       },
       "node_group_label": "cluster",
@@ -311,10 +247,10 @@
       "gpu": {
         "mig_device_uuid": null,
         "mode": "mps",
-        "parent_gpu": 3,
-        "sm_percent": 80,
+        "parent_gpu": 5,
+        "sm_percent": 100,
         "visible_devices": [
-          "3"
+          "5"
         ]
       },
       "node_group_label": "cluster",
@@ -327,10 +263,10 @@
       "gpu": {
         "mig_device_uuid": null,
         "mode": "mps",
-        "parent_gpu": 4,
-        "sm_percent": 80,
+        "parent_gpu": 6,
+        "sm_percent": 100,
         "visible_devices": [
-          "4"
+          "6"
         ]
       },
       "node_group_label": "cluster",
@@ -343,59 +279,25 @@
       "gpu": {
         "mig_device_uuid": null,
         "mode": "mps",
-        "parent_gpu": 5,
-        "sm_percent": 80,
-        "visible_devices": [
-          "5"
-        ]
-      },
-      "node_group_label": "cluster",
-      "rank": 5
-    },
-    {
-      "cluster_node_rank": 0,
-      "component": "rollout",
-      "cpu": null,
-      "gpu": {
-        "mig_device_uuid": null,
-        "mode": "mps",
-        "parent_gpu": 6,
-        "sm_percent": 80,
-        "visible_devices": [
-          "6"
-        ]
-      },
-      "node_group_label": "cluster",
-      "rank": 6
-    },
-    {
-      "cluster_node_rank": 0,
-      "component": "rollout",
-      "cpu": null,
-      "gpu": {
-        "mig_device_uuid": null,
-        "mode": "mps",
         "parent_gpu": 7,
-        "sm_percent": 80,
+        "sm_percent": 100,
         "visible_devices": [
           "7"
         ]
       },
       "node_group_label": "cluster",
-      "rank": 7
+      "rank": 5
     }
   ],
   "enabled": true,
   "summary": {
     "mps_gpu_totals": {
-      "node0:gpu0": 120,
-      "node0:gpu1": 120,
-      "node0:gpu2": 120,
-      "node0:gpu3": 120,
-      "node0:gpu4": 120,
-      "node0:gpu5": 120,
-      "node0:gpu6": 120,
-      "node0:gpu7": 120
+      "node0:gpu2": 140,
+      "node0:gpu3": 140,
+      "node0:gpu4": 140,
+      "node0:gpu5": 140,
+      "node0:gpu6": 140,
+      "node0:gpu7": 140
     },
     "shared_cpu_cores": {},
     "shared_mig_uuids": {}
