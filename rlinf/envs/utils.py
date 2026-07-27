@@ -19,10 +19,18 @@ import numpy as np
 import torch
 from PIL import Image, ImageDraw, ImageFont
 
-try:
-    import tensorflow as tf
-except ImportError:  # pragma: no cover
-    tf = None
+tf = None
+
+
+def _get_tensorflow():
+    global tf
+    if tf is None:
+        try:
+            import tensorflow as tensorflow_module
+        except ImportError:  # pragma: no cover
+            tensorflow_module = None
+        tf = tensorflow_module
+    return tf
 
 
 def to_tensor(
@@ -279,25 +287,28 @@ def crop_and_resize(image, crop_scale, batch_size):
     to original size. We use the same logic seen in the `dlimp` RLDS datasets wrapper to avoid
     distribution shift at test time.
     """
-    if tf is None:
+    tensorflow_module = _get_tensorflow()
+    if tensorflow_module is None:
         raise ImportError("tensorflow is required for crop_and_resize")
 
     assert image.shape.ndims == 3 or image.shape.ndims == 4
     expanded_dims = False
     if image.shape.ndims == 3:
-        image = tf.expand_dims(image, axis=0)
+        image = tensorflow_module.expand_dims(image, axis=0)
         expanded_dims = True
 
-    new_heights = tf.reshape(
-        tf.clip_by_value(tf.sqrt(crop_scale), 0, 1), shape=(batch_size,)
+    new_heights = tensorflow_module.reshape(
+        tensorflow_module.clip_by_value(tensorflow_module.sqrt(crop_scale), 0, 1),
+        shape=(batch_size,),
     )
-    new_widths = tf.reshape(
-        tf.clip_by_value(tf.sqrt(crop_scale), 0, 1), shape=(batch_size,)
+    new_widths = tensorflow_module.reshape(
+        tensorflow_module.clip_by_value(tensorflow_module.sqrt(crop_scale), 0, 1),
+        shape=(batch_size,),
     )
 
     height_offsets = (1 - new_heights) / 2
     width_offsets = (1 - new_widths) / 2
-    bounding_boxes = tf.stack(
+    bounding_boxes = tensorflow_module.stack(
         [
             height_offsets,
             width_offsets,
@@ -307,8 +318,8 @@ def crop_and_resize(image, crop_scale, batch_size):
         axis=1,
     )
 
-    image = tf.image.crop_and_resize(
-        image, bounding_boxes, tf.range(batch_size), (224, 224)
+    image = tensorflow_module.image.crop_and_resize(
+        image, bounding_boxes, tensorflow_module.range(batch_size), (224, 224)
     )
 
     if expanded_dims:
@@ -318,19 +329,22 @@ def crop_and_resize(image, crop_scale, batch_size):
 
 
 def center_crop_image(image):
-    if tf is None:
+    tensorflow_module = _get_tensorflow()
+    if tensorflow_module is None:
         raise ImportError("tensorflow is required for crop_and_resize")
 
     batch_size = 1
     crop_scale = 0.9
 
-    image = tf.convert_to_tensor(np.array(image))
+    image = tensorflow_module.convert_to_tensor(np.array(image))
     orig_dtype = image.dtype
 
-    image = tf.image.convert_image_dtype(image, tf.float32)
+    image = tensorflow_module.image.convert_image_dtype(image, tensorflow_module.float32)
     image = crop_and_resize(image, crop_scale, batch_size)
-    image = tf.clip_by_value(image, 0, 1)
-    image = tf.image.convert_image_dtype(image, orig_dtype, saturate=True)
+    image = tensorflow_module.clip_by_value(image, 0, 1)
+    image = tensorflow_module.image.convert_image_dtype(
+        image, orig_dtype, saturate=True
+    )
 
     image = Image.fromarray(image.numpy())
     image = image.convert("RGB")

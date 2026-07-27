@@ -18,10 +18,11 @@ Based on metaworld/venv.py implementation, adapted for Robocasa/Robosuite enviro
 """
 
 import json
+import multiprocessing as mp
 import os
 import time
-from multiprocessing import Pipe, connection
-from multiprocessing.context import Process
+import traceback
+from multiprocessing import connection
 from typing import Any, Callable, Optional, Union
 
 import gymnasium as gym
@@ -118,6 +119,7 @@ def _worker(
     env_fn_wrapper: CloudpickleWrapper,
     obs_bufs: Optional[Union[dict, tuple, ShArray]] = None,
     local_env_index: int = -1,
+    init_lock: Any = None,
 ) -> None:
     """Worker function for robocasa subprocess environment.
 
@@ -180,7 +182,18 @@ def _worker(
     parent.close()
     if local_env_index >= 0:
         _apply_subproc_env_cpu_affinity(local_env_index)
-    env = env_fn_wrapper.data()
+    try:
+        if init_lock is None:
+            env = env_fn_wrapper.data()
+        else:
+            with init_lock:
+                env = env_fn_wrapper.data()
+    except Exception:
+        try:
+            p.send(("__robocasa_worker_error__", traceback.format_exc()))
+        finally:
+            p.close()
+        return
     try:
         while True:
             try:
@@ -293,6 +306,11 @@ def _worker(
             else:
                 p.close()
                 raise NotImplementedError(f"Unknown command: {cmd}")
+    except Exception:
+        try:
+            p.send(("__robocasa_worker_error__", traceback.format_exc()))
+        finally:
+            p.close()
     except KeyboardInterrupt:
         p.close()
 
@@ -309,8 +327,10 @@ class RobocasaSubprocEnvWorker(SubprocEnvWorker):
         env_fn: Callable[[], gym.Env],
         share_memory: bool = False,
         local_env_index: int = -1,
+        init_lock: Any = None,
     ):
-        self.parent_remote, self.child_remote = Pipe()
+        ctx = mp.get_context("spawn")
+        self.parent_remote, self.child_remote = ctx.Pipe()
         self.share_memory = share_memory
         self.buffer: Optional[Union[dict, tuple, ShArray]] = None
         self._cpu_affinity = get_env_core_group_from_env(os.environ, local_env_index)
@@ -326,12 +346,23 @@ class RobocasaSubprocEnvWorker(SubprocEnvWorker):
             CloudpickleWrapper(env_fn),
             self.buffer,
             local_env_index,
+            init_lock,
         )
-        # Use our custom _worker function
-        self.process = Process(target=_worker, args=args, daemon=True)
+        # Use spawn to avoid fork-related native crashes in MuJoCo/OpenGL stacks.
+        self.process = ctx.Process(target=_worker, args=args, daemon=True)
         self.process.start()
         self.child_remote.close()
         EnvWorker.__init__(self, env_fn)
+
+    def _recv_result(self):
+        result = self.parent_remote.recv()
+        if (
+            isinstance(result, tuple)
+            and len(result) == 2
+            and result[0] == "__robocasa_worker_error__"
+        ):
+            raise RuntimeError(f"Robocasa worker failed:\n{result[1]}")
+        return result
 
     def get_mujoco_diagnostics(
         self,
@@ -347,7 +378,39 @@ class RobocasaSubprocEnvWorker(SubprocEnvWorker):
                 },
             ]
         )
-        return self.parent_remote.recv()
+        return self._recv_result()
+
+    def reset(self, **kwargs: Any) -> Union[np.ndarray, tuple[np.ndarray, dict]]:
+        if "seed" in kwargs:
+            super().seed(kwargs["seed"])
+        self.parent_remote.send(["reset", kwargs])
+        result = self._recv_result()
+        if isinstance(result, tuple):
+            obs, info = result
+            if self.share_memory:
+                obs = self._decode_obs()
+            return obs, info
+        obs = result
+        if self.share_memory:
+            obs = self._decode_obs()
+        return obs
+
+    def recv(self) -> Any:
+        result = self._recv_result()
+        if isinstance(result, tuple):
+            if len(result) == 2:
+                obs, info = result
+                if self.share_memory:
+                    obs = self._decode_obs()
+                return obs, info
+            obs = result[0]
+            if self.share_memory:
+                obs = self._decode_obs()
+            return (obs, *result[1:])  # type: ignore
+        obs = result
+        if self.share_memory:
+            obs = self._decode_obs()
+        return obs
 
 
 class RobocasaSubprocEnv(SubprocVectorEnv):
@@ -357,8 +420,14 @@ class RobocasaSubprocEnv(SubprocVectorEnv):
     Uses subprocess isolation to avoid OpenGL context sharing issues in MuJoCo.
     """
 
-    def __init__(self, env_fns: list[Callable[[], gym.Env]], **kwargs: Any) -> None:
+    def __init__(
+        self,
+        env_fns: list[Callable[[], gym.Env]],
+        serial_init: bool = False,
+        **kwargs: Any,
+    ) -> None:
         env_index = {"value": 0}
+        self._serial_init_lock = mp.get_context("spawn").Lock() if serial_init else None
 
         def worker_fn(fn: Callable[[], gym.Env]) -> RobocasaSubprocEnvWorker:
             # Use our custom worker with shared memory disabled
@@ -366,7 +435,10 @@ class RobocasaSubprocEnv(SubprocVectorEnv):
             local_env_index = env_index["value"]
             env_index["value"] += 1
             return RobocasaSubprocEnvWorker(
-                fn, share_memory=False, local_env_index=local_env_index
+                fn,
+                share_memory=False,
+                local_env_index=local_env_index,
+                init_lock=self._serial_init_lock,
             )
 
         BaseVectorEnv.__init__(self, env_fns, worker_fn, **kwargs)
@@ -418,3 +490,93 @@ class RobocasaSubprocEnv(SubprocVectorEnv):
                     "wall_end_ns": timing.get("wall_end_ns"),
                 }
                 handle.write(json.dumps(_to_jsonable(record), sort_keys=True) + "\n")
+
+class RobocasaDummyEnvWorker(EnvWorker):
+    """In-process RoboCasa worker used for single-env diagnostics runs."""
+
+    def __init__(self, env_fn: Callable[[], gym.Env]) -> None:
+        self.env = env_fn()
+        super().__init__(env_fn)
+
+    def get_env_attr(self, key: str) -> Any:
+        return getattr(self.env, key)
+
+    def set_env_attr(self, key: str, value: Any) -> None:
+        setattr(self.env.unwrapped, key, value)
+
+    def send(self, action: Optional[np.ndarray], **kwargs: Any) -> None:
+        if action is None:
+            retval = self.env.reset(**kwargs)
+            reset_returns_info = (
+                isinstance(retval, (tuple, list))
+                and len(retval) == 2
+                and isinstance(retval[1], dict)
+            )
+            if reset_returns_info:
+                obs, info = retval
+            else:
+                obs = retval
+                info = {}
+            if hasattr(self.env, "get_ep_meta"):
+                info["ep_meta"] = self.env.get_ep_meta()
+            self.result = (obs, info)
+        else:
+            env_return = self.env.step(action)
+            if hasattr(self.env, "_check_success"):
+                env_return = list(env_return)
+                info = env_return[-1]
+                info["success"] = self.env._check_success()
+                env_return[-1] = info
+                env_return = tuple(env_return)
+            if hasattr(self.env, "get_ep_meta"):
+                env_return = list(env_return)
+                info = env_return[-1]
+                info["ep_meta"] = self.env.get_ep_meta()
+                env_return[-1] = info
+                env_return = tuple(env_return)
+            self.result = env_return
+
+    def reset(self, **kwargs: Any) -> Union[np.ndarray, tuple[np.ndarray, dict]]:
+        self.send(None, **kwargs)
+        return self.recv()
+
+    def recv(self) -> Any:
+        return self.result
+
+    def render(self, **kwargs: Any) -> Any:
+        return self.env.render(**kwargs) if hasattr(self.env, "render") else None
+
+    def close_env(self) -> None:
+        self.env.close()
+
+    def get_mujoco_diagnostics(
+        self,
+        max_contacts: Optional[int] = None,
+        include_model_names: bool = True,
+    ) -> dict[str, Any]:
+        return build_mujoco_diagnostics_snapshot(
+            model=self.env.sim.model,
+            data=self.env.sim.data,
+            max_contacts=max_contacts,
+            include_model_names=include_model_names,
+        )
+
+
+class RobocasaDummyEnv(BaseVectorEnv):
+    """In-process vector env for one RoboCasa environment."""
+
+    def __init__(self, env_fns: list[Callable[[], gym.Env]], **kwargs: Any) -> None:
+        BaseVectorEnv.__init__(self, env_fns, RobocasaDummyEnvWorker, **kwargs)
+
+    def get_mujoco_diagnostics(
+        self,
+        max_contacts: Optional[int] = None,
+        include_model_names: bool = True,
+    ) -> list[dict[str, Any]]:
+        if not hasattr(self, "is_closed"):
+            self.is_closed = False
+        self._assert_is_not_closed()
+        return [
+            worker.get_mujoco_diagnostics(max_contacts, include_model_names)
+            for worker in self.workers
+        ]

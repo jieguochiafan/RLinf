@@ -28,7 +28,7 @@ from rlinf.envs.robocasa.utils import (
     OBS_KEY_ROBOCASA_IMAGE_MAPPING,
     get_image_space,
 )
-from rlinf.envs.robocasa.venv import RobocasaSubprocEnv
+from rlinf.envs.robocasa.venv import RobocasaDummyEnv, RobocasaSubprocEnv
 from rlinf.envs.utils import (
     list_of_dict_to_dict_of_list,
     to_tensor,
@@ -127,8 +127,14 @@ class RobocasaEnv(gym.Env):
         # Create environment factory functions for subprocess isolation
         env_fns = self.get_env_fns()
 
-        # Use subprocess vector environment to avoid OpenGL context sharing
-        self.env = RobocasaSubprocEnv(env_fns)
+        if self.cfg.get("use_subproc", True):
+            # Use subprocess vector environment to avoid OpenGL context sharing.
+            self.env = RobocasaSubprocEnv(
+                env_fns,
+                serial_init=bool(self.cfg.get("serial_subproc_init", False)),
+            )
+        else:
+            self.env = RobocasaDummyEnv(env_fns)
 
     def get_env_fns(self):
         """Create environment factory functions for each parallel environment."""

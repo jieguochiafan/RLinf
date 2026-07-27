@@ -13,16 +13,23 @@ from toolkits.run_libero_latency_schedule_benchmark import (
     TaskRecord,
     apply_cpu_affinity,
     build_historical_optimal_plan,
+    build_minmax_binpack_plan,
+    build_odd_even_binpack_plan,
     build_phase_shifted_trapezoid_plan,
     build_random_baseline_plan,
+    build_same_core_latency_order_plan,
     build_task_id_baseline_plan,
     build_trapezoid_pipeline_plan,
+    build_warmup_minmax_binpack_plan,
+    build_warmup_odd_even_binpack_plan,
     build_worker_plans,
     compute_comparison_metrics,
     compute_schedule_summary,
     estimate_latency_scores,
     load_task_records,
     main,
+    run_chunk_barrier_with_process_workers,
+    run_chunk_independent_with_process_workers,
     run_schedule_with_process_workers,
     run_schedule_with_step_function,
     sample_task_records,
@@ -329,6 +336,10 @@ def sleeping_process_env_factory(item: ScheduleItem):
     return SleepingProcessEnv(sleep_s=0.2)
 
 
+def sleeping_by_task_latency_process_env_factory(item: ScheduleItem):
+    return SleepingProcessEnv(sleep_s=item.task.mean_latency_ms / 1000.0)
+
+
 def slow_init_process_env_factory(item: ScheduleItem):
     del item
     return SlowInitProcessEnv(sleep_s=0.2)
@@ -445,6 +456,324 @@ def test_historical_optimal_groups_slow_tasks_to_minimize_fake_makespan():
     assert summary["makespan_s"] == pytest.approx(0.101)
     assert summary["steps_per_second"] == pytest.approx(4 / 0.101)
     assert {item.schedule_name for item in plan} == {"historical_optimal"}
+
+
+def test_same_core_latency_order_keeps_task_id_core_assignment():
+    records = _records_for_schedule()
+    baseline_plan = build_task_id_baseline_plan(records, cpu_ids=[20, 21])
+    plan = build_same_core_latency_order_plan(records, cpu_ids=[20, 21])
+
+    baseline_assignment = {
+        item.task.task_id: (item.core_index, item.cpu_id)
+        for item in baseline_plan
+    }
+    controlled_assignment = {
+        item.task.task_id: (item.core_index, item.cpu_id)
+        for item in plan
+    }
+
+    assert controlled_assignment == baseline_assignment
+    assert [item.task.task_id for item in plan] == [3, 4, 1, 2]
+    assert {item.schedule_name for item in plan} == {"same_core_latency_order"}
+
+
+def test_odd_even_binpack_marks_odd_even_but_balances_combined_step_work():
+    records = [
+        TaskRecord(
+            task_id=task_id,
+            task_name=f"task_{task_id}",
+            mean_latency_ms=float(score),
+            njnt=1,
+            ngeom=1,
+            estimated_latency_score=float(score),
+        )
+        for task_id, score in [
+            (10, 10),
+            (9, 9),
+            (8, 8),
+            (7, 7),
+            (6, 6),
+            (5, 5),
+            (4, 4),
+            (3, 3),
+        ]
+    ]
+
+    plan = build_odd_even_binpack_plan(records, cpu_ids=[20, 21])
+
+    assert {item.schedule_name for item in plan} == {"odd_even_binpack"}
+    odd_items = [item for item in plan if item.side == "odd"]
+    even_items = [item for item in plan if item.side == "even"]
+    assert {item.task.task_id for item in odd_items} == {10, 8, 6, 4}
+    assert {item.task.task_id for item in even_items} == {9, 7, 5, 3}
+    items_by_core = {
+        core_index: [
+            item.task.task_id
+            for item in sorted(plan, key=lambda value: value.order_index)
+            if item.core_index == core_index
+        ]
+        for core_index in [0, 1]
+    }
+    assert items_by_core == {
+        0: [10, 7, 6, 3],
+        1: [9, 8, 5, 4],
+    }
+    assert {
+        core_index: sum(
+            item.task.estimated_latency_score
+            for item in plan
+            if item.core_index == core_index
+        )
+        for core_index in [0, 1]
+    } == {0: 26.0, 1: 26.0}
+
+
+def test_odd_even_binpack_does_not_pack_odd_and_even_independently():
+    records = [
+        TaskRecord(
+            task_id=task_id,
+            task_name=f"task_{task_id}",
+            mean_latency_ms=float(score),
+            njnt=1,
+            ngeom=1,
+            estimated_latency_score=float(score),
+        )
+        for task_id, score in [
+            (10, 10),
+            (9, 9),
+            (8, 8),
+            (7, 7),
+            (6, 6),
+            (5, 5),
+            (4, 4),
+            (3, 3),
+        ]
+    ]
+
+    plan = build_odd_even_binpack_plan(records, cpu_ids=[20, 21])
+
+    odd_items = [item for item in plan if item.side == "odd"]
+    even_items = [item for item in plan if item.side == "even"]
+    assert [
+        [item.task.task_id for item in sorted(odd_items, key=lambda value: value.order_index)
+         if item.core_index == core_index]
+        for core_index in [0, 1]
+    ] != [[10, 4], [8, 6]]
+    assert [
+        [item.task.task_id for item in sorted(even_items, key=lambda value: value.order_index)
+         if item.core_index == core_index]
+        for core_index in [0, 1]
+    ] != [[9, 3], [7, 5]]
+
+
+def test_odd_even_binpack_minimizes_max_core_latency_with_many_negative_scores():
+    records = [
+        TaskRecord(
+            task_id=task_id,
+            task_name=f"task_{task_id}",
+            mean_latency_ms=latency_ms,
+            njnt=1,
+            ngeom=1,
+            estimated_latency_score=score,
+        )
+        for task_id, score, latency_ms in [
+            *[(task_id, 1.0, 10.0) for task_id in range(8)],
+            *[(task_id, -1.0, 10.0) for task_id in range(8, 32)],
+        ]
+    ]
+
+    plan = build_odd_even_binpack_plan(records, cpu_ids=list(range(8)))
+
+    loads = {
+        core_index: sum(
+            item.task.mean_latency_ms
+            for item in plan
+            if item.core_index == core_index
+        )
+        for core_index in range(8)
+    }
+    assert max(loads.values()) == 40.0
+    assert min(loads.values()) == 40.0
+
+
+def test_odd_even_binpack_large_case_prefers_lower_max_core_latency():
+    weights = [
+        10.0,
+        10.0,
+        10.0,
+        10.0,
+        10.0,
+        10.0,
+        10.0,
+        10.0,
+        8.0,
+        8.0,
+        8.0,
+        8.0,
+        8.0,
+        8.0,
+        8.0,
+        8.0,
+        6.0,
+        6.0,
+        6.0,
+        6.0,
+    ]
+    records = [
+        TaskRecord(
+            task_id=task_id,
+            task_name=f"task_{task_id}",
+            mean_latency_ms=weight,
+            njnt=1,
+            ngeom=1,
+            estimated_latency_score=weight,
+        )
+        for task_id, weight in enumerate(weights)
+    ]
+
+    plan = build_odd_even_binpack_plan(records, cpu_ids=list(range(4)))
+
+    loads = {
+        core_index: sum(
+            item.task.mean_latency_ms
+            for item in plan
+            if item.core_index == core_index
+        )
+        for core_index in range(4)
+    }
+    assert max(loads.values()) == 42.0
+
+
+def test_minmax_binpack_balances_all_tasks_without_odd_even_split():
+    records = [
+        TaskRecord(
+            task_id=task_id,
+            task_name=f"task_{task_id}",
+            mean_latency_ms=weight,
+            njnt=1,
+            ngeom=1,
+            estimated_latency_score=weight,
+        )
+        for task_id, weight in [
+            (1, 9.0),
+            (2, 8.0),
+            (3, 7.0),
+            (4, 6.0),
+            (5, 5.0),
+            (6, 4.0),
+        ]
+    ]
+
+    plan = build_minmax_binpack_plan(records, cpu_ids=[20, 21, 22])
+
+    assert {item.schedule_name for item in plan} == {"minmax_binpack"}
+    assert {item.side for item in plan} == {"minmax"}
+    loads = {
+        core_index: sum(
+            item.task.mean_latency_ms
+            for item in plan
+            if item.core_index == core_index
+        )
+        for core_index in [0, 1, 2]
+    }
+    assert max(loads.values()) == 13.0
+    assert min(loads.values()) == 13.0
+
+
+def test_warmup_minmax_binpack_uses_warmup_latency_for_weights():
+    records = [
+        TaskRecord(
+            task_id=task_id,
+            task_name=f"task_{task_id}",
+            mean_latency_ms=historical,
+            njnt=1,
+            ngeom=1,
+            estimated_latency_score=historical,
+        )
+        for task_id, historical in [
+            (1, 100.0),
+            (2, 10.0),
+            (3, 10.0),
+            (4, 10.0),
+        ]
+    ]
+    warmup_latency_ms = {1: 1.0, 2: 100.0, 3: 50.0, 4: 49.0}
+
+    plan = build_warmup_minmax_binpack_plan(
+        records,
+        cpu_ids=[0, 1],
+        warmup_latency_ms=warmup_latency_ms,
+    )
+
+    assert {item.schedule_name for item in plan} == {"warmup_minmax_binpack"}
+    loads = {
+        core_index: sum(
+            warmup_latency_ms[item.task.task_id]
+            for item in plan
+            if item.core_index == core_index
+        )
+        for core_index in [0, 1]
+    }
+    assert max(loads.values()) == 100.0
+    assert min(loads.values()) == 100.0
+
+
+def test_warmup_odd_even_binpack_uses_warmup_latency_for_sorting_and_packing():
+    records = [
+        TaskRecord(
+            task_id=1,
+            task_name="high_score_fast_warmup",
+            mean_latency_ms=100.0,
+            njnt=1,
+            ngeom=1,
+            estimated_latency_score=10.0,
+        ),
+        TaskRecord(
+            task_id=2,
+            task_name="low_score_slow_warmup",
+            mean_latency_ms=10.0,
+            njnt=1,
+            ngeom=1,
+            estimated_latency_score=1.0,
+        ),
+        TaskRecord(
+            task_id=3,
+            task_name="middle",
+            mean_latency_ms=10.0,
+            njnt=1,
+            ngeom=1,
+            estimated_latency_score=5.0,
+        ),
+        TaskRecord(
+            task_id=4,
+            task_name="small",
+            mean_latency_ms=10.0,
+            njnt=1,
+            ngeom=1,
+            estimated_latency_score=4.0,
+        ),
+    ]
+    warmup_latency_ms = {1: 1.0, 2: 100.0, 3: 50.0, 4: 49.0}
+
+    plan = build_warmup_odd_even_binpack_plan(
+        records,
+        cpu_ids=[0, 1],
+        warmup_latency_ms=warmup_latency_ms,
+    )
+
+    assert {item.schedule_name for item in plan} == {"warmup_odd_even_binpack"}
+    side_by_task = {item.task.task_id: item.side for item in plan}
+    assert side_by_task == {2: "odd", 3: "even", 4: "odd", 1: "even"}
+    loads = {
+        core_index: sum(
+            warmup_latency_ms[item.task.task_id]
+            for item in plan
+            if item.core_index == core_index
+        )
+        for core_index in [0, 1]
+    }
+    assert max(loads.values()) == 100.0
+    assert min(loads.values()) == 100.0
 
 
 def test_phase_shifted_trapezoid_staggers_long_and_short_rounds_by_core():
@@ -568,6 +897,83 @@ def test_run_schedule_with_step_function_rejects_invalid_latency_values():
         )
 
 
+def test_odd_even_binpack_step_function_merges_odd_even_with_step_barrier():
+    records = [
+        TaskRecord(
+            task_id=task_id,
+            task_name=f"task_{task_id}",
+            mean_latency_ms=float(score),
+            njnt=1,
+            ngeom=1,
+            estimated_latency_score=float(score),
+        )
+        for task_id, score in [
+            (10, 10),
+            (9, 9),
+            (8, 8),
+            (7, 7),
+        ]
+    ]
+    plan = build_odd_even_binpack_plan(records, cpu_ids=[0, 1])
+    events = run_schedule_with_step_function(
+        plan,
+        steps_per_env=2,
+        step_fn=lambda item, step_index: item.task.mean_latency_ms / 1000.0,
+    )
+
+    step0_rounds = [
+        event.round_index
+        for event in events
+        if event.task_step_index == 0
+    ]
+    step1_rounds = [
+        event.round_index
+        for event in events
+        if event.task_step_index == 1
+    ]
+    first_round_task_ids = {event.task_id for event in events if event.round_index == 0}
+    assert first_round_task_ids == {10, 9}
+    assert min(step1_rounds) > max(step0_rounds)
+
+
+def test_minmax_binpack_step_function_runs_all_tasks_with_step_barrier():
+    records = [
+        TaskRecord(
+            task_id=task_id,
+            task_name=f"task_{task_id}",
+            mean_latency_ms=float(weight),
+            njnt=1,
+            ngeom=1,
+            estimated_latency_score=float(weight),
+        )
+        for task_id, weight in [
+            (1, 9),
+            (2, 8),
+            (3, 7),
+            (4, 6),
+        ]
+    ]
+    plan = build_minmax_binpack_plan(records, cpu_ids=[0, 1])
+    events = run_schedule_with_step_function(
+        plan,
+        steps_per_env=2,
+        step_fn=lambda item, step_index: item.task.mean_latency_ms / 1000.0,
+    )
+
+    step0_rounds = [
+        event.round_index
+        for event in events
+        if event.task_step_index == 0
+    ]
+    step1_rounds = [
+        event.round_index
+        for event in events
+        if event.task_step_index == 1
+    ]
+    assert min(step1_rounds) > max(step0_rounds)
+    assert {event.task_id for event in events} == {1, 2, 3, 4}
+
+
 def test_build_worker_plans_groups_items_by_core():
     records = _records_for_schedule()
     plan = build_task_id_baseline_plan(records, cpu_ids=[10, 11])
@@ -595,6 +1001,267 @@ def test_run_schedule_with_process_workers_completes_equal_steps_per_task():
     assert len(result.events) == 4
     assert {event.task_id for event in result.events} == {1, 2, 3, 4}
     assert all(event.round_wall_time_s >= event.latency_s for event in result.events)
+
+
+def test_task_id_baseline_process_workers_barrier_between_rounds():
+    records = [
+        TaskRecord(
+            task_id=1,
+            task_name="short_a",
+            mean_latency_ms=20.0,
+            njnt=1,
+            ngeom=1,
+            estimated_latency_score=4.0,
+        ),
+        TaskRecord(
+            task_id=2,
+            task_name="long_a",
+            mean_latency_ms=200.0,
+            njnt=1,
+            ngeom=1,
+            estimated_latency_score=3.0,
+        ),
+        TaskRecord(
+            task_id=3,
+            task_name="short_b",
+            mean_latency_ms=20.0,
+            njnt=1,
+            ngeom=1,
+            estimated_latency_score=2.0,
+        ),
+        TaskRecord(
+            task_id=4,
+            task_name="long_b",
+            mean_latency_ms=200.0,
+            njnt=1,
+            ngeom=1,
+            estimated_latency_score=1.0,
+        ),
+    ]
+    plan = build_task_id_baseline_plan(records, cpu_ids=[0, 1])
+
+    result = run_schedule_with_process_workers(
+        plan,
+        steps_per_env=1,
+        env_factory=sleeping_by_task_latency_process_env_factory,
+        dummy_action=[0.0] * 7,
+        subprocess_timeout_s=10.0,
+    )
+
+    assert result.errors == []
+    events_by_task = {event.task_id: event for event in result.events}
+    assert events_by_task[3].start_time_s is not None
+    assert events_by_task[2].end_time_s is not None
+    assert events_by_task[3].start_time_s >= events_by_task[2].end_time_s
+
+def test_trapezoid_pipeline_process_workers_do_not_barrier_between_long_and_short_groups():
+    records = [
+        TaskRecord(
+            task_id=1,
+            task_name="slow_long",
+            mean_latency_ms=200.0,
+            njnt=1,
+            ngeom=1,
+            estimated_latency_score=4.0,
+        ),
+        TaskRecord(
+            task_id=2,
+            task_name="fast_long",
+            mean_latency_ms=20.0,
+            njnt=1,
+            ngeom=1,
+            estimated_latency_score=3.0,
+        ),
+        TaskRecord(
+            task_id=3,
+            task_name="paired_short_for_slow_long",
+            mean_latency_ms=20.0,
+            njnt=1,
+            ngeom=1,
+            estimated_latency_score=2.0,
+        ),
+        TaskRecord(
+            task_id=4,
+            task_name="paired_short_for_fast_long",
+            mean_latency_ms=20.0,
+            njnt=1,
+            ngeom=1,
+            estimated_latency_score=1.0,
+        ),
+    ]
+    plan = build_trapezoid_pipeline_plan(records, cpu_ids=[0, 1])
+    plan_by_task = {item.task.task_id: item for item in plan}
+
+    result = run_schedule_with_process_workers(
+        plan,
+        steps_per_env=1,
+        env_factory=sleeping_by_task_latency_process_env_factory,
+        dummy_action=[0.0] * 7,
+        subprocess_timeout_s=10.0,
+    )
+
+    assert result.errors == []
+    events_by_task = {event.task_id: event for event in result.events}
+    assert plan_by_task[2].side == "long"
+    assert plan_by_task[3].side == "short"
+    assert plan_by_task[2].core_index == plan_by_task[3].core_index
+    assert events_by_task[3].start_time_s is not None
+    assert events_by_task[1].end_time_s is not None
+    assert events_by_task[3].start_time_s < events_by_task[1].end_time_s
+
+
+def test_trapezoid_pipeline_process_workers_barrier_between_long_short_layers():
+    records = [
+        TaskRecord(
+            task_id=task_id,
+            task_name=f"task_{task_id}",
+            mean_latency_ms=latency_ms,
+            njnt=1,
+            ngeom=1,
+            estimated_latency_score=score,
+        )
+        for task_id, score, latency_ms in [
+            (1, 8.0, 20.0),
+            (2, 7.0, 200.0),
+            (3, 6.0, 20.0),
+            (4, 5.0, 20.0),
+            (5, 4.0, 20.0),
+            (6, 3.0, 20.0),
+            (7, 2.0, 20.0),
+            (8, 1.0, 20.0),
+        ]
+    ]
+    plan = build_trapezoid_pipeline_plan(records, cpu_ids=[0, 1])
+
+    result = run_schedule_with_process_workers(
+        plan,
+        steps_per_env=1,
+        env_factory=sleeping_by_task_latency_process_env_factory,
+        dummy_action=[0.0] * 7,
+        subprocess_timeout_s=10.0,
+    )
+
+    assert result.errors == []
+    events_by_task = {event.task_id: event for event in result.events}
+    assert events_by_task[8].start_time_s is not None
+    assert events_by_task[2].end_time_s is not None
+    assert events_by_task[8].start_time_s < events_by_task[2].end_time_s
+    assert events_by_task[3].start_time_s is not None
+    assert events_by_task[7].end_time_s is not None
+    assert events_by_task[3].start_time_s >= events_by_task[7].end_time_s
+
+
+def test_trapezoid_pipeline_process_workers_barrier_between_group_steps():
+    records = [
+        TaskRecord(
+            task_id=1,
+            task_name="slow_long",
+            mean_latency_ms=200.0,
+            njnt=1,
+            ngeom=1,
+            estimated_latency_score=4.0,
+        ),
+        TaskRecord(
+            task_id=2,
+            task_name="fast_long",
+            mean_latency_ms=20.0,
+            njnt=1,
+            ngeom=1,
+            estimated_latency_score=3.0,
+        ),
+        TaskRecord(
+            task_id=3,
+            task_name="paired_short_for_slow_long",
+            mean_latency_ms=20.0,
+            njnt=1,
+            ngeom=1,
+            estimated_latency_score=2.0,
+        ),
+        TaskRecord(
+            task_id=4,
+            task_name="paired_short_for_fast_long",
+            mean_latency_ms=20.0,
+            njnt=1,
+            ngeom=1,
+            estimated_latency_score=1.0,
+        ),
+    ]
+    plan = build_trapezoid_pipeline_plan(records, cpu_ids=[0, 1])
+
+    result = run_schedule_with_process_workers(
+        plan,
+        steps_per_env=2,
+        env_factory=sleeping_by_task_latency_process_env_factory,
+        dummy_action=[0.0] * 7,
+        subprocess_timeout_s=10.0,
+    )
+
+    assert result.errors == []
+    events_by_task_step = {
+        (event.task_id, event.task_step_index): event
+        for event in result.events
+    }
+    assert (
+        events_by_task_step[(3, 0)].start_time_s
+        < events_by_task_step[(1, 0)].end_time_s
+    )
+    step0_end = max(
+        event.end_time_s
+        for event in result.events
+        if event.task_step_index == 0
+    )
+    step1_start = min(
+        event.start_time_s
+        for event in result.events
+        if event.task_step_index == 1
+    )
+    assert step1_start >= step0_end
+
+
+def test_odd_even_binpack_process_workers_merge_odd_even_with_step_barrier():
+    records = [
+        TaskRecord(
+            task_id=task_id,
+            task_name=f"task_{task_id}",
+            mean_latency_ms=latency_ms,
+            njnt=1,
+            ngeom=1,
+            estimated_latency_score=score,
+        )
+        for task_id, score, latency_ms in [
+            (10, 10.0, 200.0),
+            (9, 9.0, 20.0),
+            (8, 8.0, 20.0),
+            (7, 7.0, 20.0),
+        ]
+    ]
+    plan = build_odd_even_binpack_plan(records, cpu_ids=[0, 1])
+
+    result = run_schedule_with_process_workers(
+        plan,
+        steps_per_env=2,
+        env_factory=sleeping_by_task_latency_process_env_factory,
+        dummy_action=[0.0] * 7,
+        subprocess_timeout_s=10.0,
+    )
+
+    assert result.errors == []
+    events_by_task_step = {
+        (event.task_id, event.task_step_index): event
+        for event in result.events
+    }
+    step0_end = max(
+        event.end_time_s
+        for event in result.events
+        if event.task_step_index == 0
+    )
+    step1_start = min(
+        event.start_time_s
+        for event in result.events
+        if event.task_step_index == 1
+    )
+    assert events_by_task_step[(9, 0)].start_time_s < events_by_task_step[(10, 0)].end_time_s
+    assert step1_start >= step0_end
 
 
 def test_run_schedule_with_process_workers_reports_step_error_context():
@@ -766,6 +1433,102 @@ def test_apply_cpu_affinity_returns_false_when_affinity_unavailable(monkeypatch)
     assert apply_cpu_affinity(0) is False
 
 
+def test_run_schedule_with_process_workers_can_disable_cpu_affinity():
+    records = [
+        TaskRecord(task_id=1, task_name="task_a", mean_latency_ms=20.0, njnt=1, ngeom=1),
+        TaskRecord(task_id=2, task_name="task_b", mean_latency_ms=20.0, njnt=1, ngeom=1),
+    ]
+    plan = build_task_id_baseline_plan(records, cpu_ids=[0, 1])
+
+    result = run_schedule_with_process_workers(
+        plan,
+        steps_per_env=1,
+        env_factory=sleeping_process_env_factory,
+        dummy_action=[0.0] * 7,
+        subprocess_timeout_s=10.0,
+        bind_cpu_affinity=False,
+    )
+
+    assert result.errors == []
+    assert len(result.events) == 2
+    assert {event.cpu_affinity_applied for event in result.events} == {False}
+
+
+def test_chunk_barrier_process_workers_wait_between_chunk_steps():
+    records = [
+        TaskRecord(
+            task_id=1,
+            task_name="slow_env",
+            mean_latency_ms=200.0,
+            njnt=1,
+            ngeom=1,
+        ),
+        TaskRecord(
+            task_id=2,
+            task_name="fast_env",
+            mean_latency_ms=20.0,
+            njnt=1,
+            ngeom=1,
+        ),
+    ]
+    plan = build_task_id_baseline_plan(records, cpu_ids=[0, 1])
+
+    result = run_chunk_barrier_with_process_workers(
+        plan,
+        num_action_chunks=1,
+        chunk_size=2,
+        env_factory=sleeping_by_task_latency_process_env_factory,
+        dummy_action=[0.0] * 7,
+        generation_latency_s=0.0,
+        subprocess_timeout_s=10.0,
+    )
+
+    assert result.errors == []
+    events = {
+        (event.task_id, event.task_step_index): event
+        for event in result.events
+    }
+    assert events[(2, 1)].start_time_s >= events[(1, 0)].end_time_s
+
+
+def test_chunk_independent_process_workers_do_not_wait_between_local_chunk_steps():
+    records = [
+        TaskRecord(
+            task_id=1,
+            task_name="slow_env",
+            mean_latency_ms=200.0,
+            njnt=1,
+            ngeom=1,
+        ),
+        TaskRecord(
+            task_id=2,
+            task_name="fast_env",
+            mean_latency_ms=20.0,
+            njnt=1,
+            ngeom=1,
+        ),
+    ]
+    plan = build_task_id_baseline_plan(records, cpu_ids=[0, 1])
+
+    result = run_chunk_independent_with_process_workers(
+        plan,
+        num_action_chunks=1,
+        chunk_size=2,
+        env_factory=sleeping_by_task_latency_process_env_factory,
+        dummy_action=[0.0] * 7,
+        generation_latency_s=0.0,
+        subprocess_timeout_s=10.0,
+    )
+
+    assert result.errors == []
+    events = {
+        (event.task_id, event.task_step_index): event
+        for event in result.events
+    }
+    assert events[(2, 1)].start_time_s < events[(1, 0)].end_time_s
+    assert {event.task_step_index for event in result.events} == {0, 1}
+
+
 def test_compute_schedule_summary_reports_throughput_and_idle():
     events = [
         StepEvent(
@@ -877,6 +1640,62 @@ def test_compute_schedule_summary_includes_missing_core_idle():
     assert summary["mean_core_idle_ratio"] == pytest.approx(0.375)
 
 
+def test_compute_schedule_summary_uses_timed_core_seconds_for_async_events():
+    events = [
+        StepEvent(
+            schedule_name="s",
+            round_index=0,
+            core_index=0,
+            cpu_id=0,
+            task_id=1,
+            task_name="short_a",
+            task_step_index=0,
+            latency_s=0.04,
+            round_wall_time_s=0.04,
+            idle_time_s=0.0,
+            cpu_affinity_applied=True,
+            start_time_s=0.0,
+            end_time_s=0.04,
+        ),
+        StepEvent(
+            schedule_name="s",
+            round_index=1,
+            core_index=1,
+            cpu_id=1,
+            task_id=2,
+            task_name="long",
+            task_step_index=0,
+            latency_s=0.2,
+            round_wall_time_s=0.2,
+            idle_time_s=0.0,
+            cpu_affinity_applied=True,
+            start_time_s=0.0,
+            end_time_s=0.2,
+        ),
+        StepEvent(
+            schedule_name="s",
+            round_index=2,
+            core_index=0,
+            cpu_id=0,
+            task_id=3,
+            task_name="short_b",
+            task_step_index=0,
+            latency_s=0.04,
+            round_wall_time_s=0.04,
+            idle_time_s=0.0,
+            cpu_affinity_applied=True,
+            start_time_s=0.04,
+            end_time_s=0.08,
+        ),
+    ]
+
+    summary = compute_schedule_summary("s", events)
+
+    assert summary["makespan_s"] == pytest.approx(0.2)
+    assert summary["steps_per_second"] == pytest.approx(15.0)
+    assert summary["mean_core_idle_ratio"] == pytest.approx(0.3)
+
+
 def test_compute_comparison_metrics_compares_and_aggregates_random():
     summaries = [
         {
@@ -965,6 +1784,8 @@ def test_write_comparison_report_includes_comparison_random_and_mapping_evidence
         "worst steps/sec | mean idle ratio |"
     ) in report
     assert "## Trapezoid Mapping Evidence" in report
+    assert "Within each group step" in report
+    assert "The next step of that group" in report
     assert "| core_index | cpu_id | long task ids | short task ids |" in report
     assert "| 0 | 20 | 4 | 1 |" in report
     assert "| 1 | 21 | 3 | 2 |" in report
@@ -1040,6 +1861,7 @@ def test_main_fake_mode_writes_outputs(tmp_path: Path):
             "--output-dir",
             str(output_dir),
             "--fake-latency-from-csv",
+            "--include-odd-even-binpack",
         ]
     )
 
@@ -1047,7 +1869,9 @@ def test_main_fake_mode_writes_outputs(tmp_path: Path):
     assert (output_dir / "run_config.json").exists()
     assert (output_dir / "selected_tasks.csv").exists()
     assert (output_dir / "schedule_plan_task_id_baseline.csv").exists()
+    assert (output_dir / "schedule_plan_odd_even_binpack.csv").exists()
     assert (output_dir / "step_events_task_id_baseline.jsonl").exists()
+    assert (output_dir / "step_events_odd_even_binpack.jsonl").exists()
     assert (output_dir / "schedule_summary.csv").exists()
     assert (output_dir / "schedule_summary.json").exists()
     assert (output_dir / "comparison_report.md").exists()
@@ -1055,7 +1879,96 @@ def test_main_fake_mode_writes_outputs(tmp_path: Path):
     assert {item["schedule_name"] for item in summaries} >= {
         "task_id_baseline",
         "historical_optimal",
+        "odd_even_binpack",
         "trapezoid_pipeline",
+    }
+
+
+def test_main_can_skip_trapezoid_plans(tmp_path: Path):
+    csv_path = tmp_path / "tasks.csv"
+    _write_task_csv(csv_path)
+    output_dir = tmp_path / "out"
+
+    exit_code = main(
+        [
+            *_base_main_args(csv_path, output_dir),
+            "--fake-latency-from-csv",
+            "--include-odd-even-binpack",
+            "--random-baseline-repeats",
+            "0",
+            "--skip-trapezoid-plans",
+        ]
+    )
+
+    assert exit_code == 0
+    summaries = json.loads((output_dir / "schedule_summary.json").read_text())
+    assert {item["schedule_name"] for item in summaries} == {
+        "task_id_baseline",
+        "historical_optimal",
+        "odd_even_binpack",
+    }
+    assert not (output_dir / "schedule_plan_trapezoid_pipeline.csv").exists()
+    assert not (output_dir / "schedule_plan_phase_shifted_trapezoid.csv").exists()
+
+
+def test_main_fake_mode_can_include_warmup_odd_even_binpack(tmp_path: Path):
+    csv_path = tmp_path / "tasks.csv"
+    _write_task_csv(csv_path)
+    output_dir = tmp_path / "out"
+
+    exit_code = main(
+        [
+            *_base_main_args(csv_path, output_dir),
+            "--fake-latency-from-csv",
+            "--include-warmup-odd-even-binpack",
+            "--warmup-profile-steps",
+            "2",
+            "--random-baseline-repeats",
+            "0",
+            "--skip-trapezoid-plans",
+        ]
+    )
+
+    assert exit_code == 0
+    assert (output_dir / "warmup_latency.csv").exists()
+    assert (output_dir / "schedule_plan_warmup_odd_even_binpack.csv").exists()
+    assert (output_dir / "step_events_warmup_odd_even_binpack.jsonl").exists()
+    summaries = json.loads((output_dir / "schedule_summary.json").read_text())
+    assert {item["schedule_name"] for item in summaries} == {
+        "task_id_baseline",
+        "historical_optimal",
+        "warmup_odd_even_binpack",
+    }
+
+
+def test_main_fake_mode_can_include_warmup_minmax_binpack(tmp_path: Path):
+    csv_path = tmp_path / "tasks.csv"
+    _write_task_csv(csv_path)
+    output_dir = tmp_path / "out"
+
+    exit_code = main(
+        [
+            *_base_main_args(csv_path, output_dir),
+            "--fake-latency-from-csv",
+            "--include-warmup-minmax-binpack",
+            "--warmup-profile-steps",
+            "2",
+            "--random-baseline-repeats",
+            "0",
+            "--skip-trapezoid-plans",
+        ]
+    )
+
+    assert exit_code == 0
+    assert (output_dir / "warmup_latency.csv").exists()
+    assert (output_dir / "schedule_plan_warmup_minmax_binpack.csv").exists()
+    assert (output_dir / "step_events_warmup_minmax_binpack.jsonl").exists()
+    assert not (output_dir / "schedule_plan_warmup_odd_even_binpack.csv").exists()
+    summaries = json.loads((output_dir / "schedule_summary.json").read_text())
+    assert {item["schedule_name"] for item in summaries} == {
+        "task_id_baseline",
+        "historical_optimal",
+        "warmup_minmax_binpack",
     }
 
 

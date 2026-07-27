@@ -51,6 +51,23 @@ RUNTIME_METADATA_KEYS = [
     "nu",
     "ncam",
 ]
+MUJOCO_TIMER_NAMES = {
+    0: "step",
+    1: "forward",
+    2: "inverse",
+    3: "position",
+    4: "velocity",
+    5: "actuation",
+    6: "constraint",
+    7: "advance",
+    8: "pos_kinematics",
+    9: "pos_inertia",
+    10: "pos_collision",
+    11: "pos_make",
+    12: "pos_project",
+    13: "col_broad",
+    14: "col_narrow",
+}
 DEFAULT_SUBPROCESS_TIMEOUT_S = 1800.0
 SUBPROCESS_CLEANUP_TIMEOUT_S = 5.0
 
@@ -73,6 +90,7 @@ class ProfileConfig:
     dummy_action: list[float]
     stop_on_done: bool
     subprocess_timeout_s: float | None
+    mujoco_profiler: bool = False
 
 
 @dataclass(frozen=True)
@@ -503,6 +521,106 @@ def collect_runtime_metadata(env: Any, config: ProfileConfig) -> dict[str, Any]:
     return metadata
 
 
+def collect_mujoco_profiler_metadata(env: Any) -> dict[str, Any]:
+    data = getattr(getattr(env, "sim", None), "data", None)
+    if data is None:
+        return {}
+    metadata: dict[str, Any] = {}
+    timer = getattr(data, "timer", None)
+    if timer is not None:
+        for timer_id, timer_name in MUJOCO_TIMER_NAMES.items():
+            if timer_id >= len(timer):
+                continue
+            stat = timer[timer_id]
+            metadata[f"mujoco_timer_{timer_name}_duration_s"] = float(
+                getattr(stat, "duration", 0.0)
+            )
+            metadata[f"mujoco_timer_{timer_name}_count"] = int(
+                getattr(stat, "number", 0)
+            )
+    solver_niter = getattr(data, "solver_niter", None)
+    if solver_niter is not None:
+        solver_array = np.asarray(solver_niter, dtype=np.int64)
+        metadata["mujoco_solver_niter_sum"] = int(np.sum(solver_array))
+        metadata["mujoco_solver_niter_max"] = (
+            int(np.max(solver_array)) if solver_array.size else 0
+        )
+    for key in ("ncon", "nefc"):
+        value = getattr(data, key, None)
+        if value is not None:
+            metadata[f"mujoco_{key}"] = int(value)
+    return metadata
+
+
+def _summarize_mujoco_profiler_events(
+    profiler_events: list[dict[str, Any]],
+) -> dict[str, Any]:
+    if not profiler_events:
+        return {}
+    summary: dict[str, Any] = {}
+    keys = sorted({key for event in profiler_events for key in event})
+    for key in keys:
+        values = [
+            float(event[key])
+            for event in profiler_events
+            if isinstance(event.get(key), int | float)
+        ]
+        if not values:
+            continue
+        if key.endswith("_count") or key in {
+            "mujoco_solver_niter_sum",
+            "mujoco_solver_niter_max",
+            "mujoco_ncon",
+            "mujoco_nefc",
+        }:
+            summary[f"{key}_max"] = max(values)
+        else:
+            summary[f"{key}_mean"] = float(np.mean(np.asarray(values)))
+            summary[f"{key}_max"] = max(values)
+    return summary
+
+
+def _diff_mujoco_profiler_metadata(
+    current: dict[str, Any],
+    previous: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if previous is None:
+        return dict(current)
+    diff: dict[str, Any] = {}
+    for key, value in current.items():
+        previous_value = previous.get(key)
+        if (
+            key.startswith("mujoco_timer_")
+            and isinstance(value, int | float)
+            and isinstance(previous_value, int | float)
+        ):
+            delta = value - previous_value
+            if isinstance(value, int) and isinstance(previous_value, int):
+                diff[key] = int(delta)
+            else:
+                diff[key] = max(float(delta), 0.0)
+        else:
+            diff[key] = value
+    return diff
+
+
+def _enable_mujoco_profiler_timers() -> tuple[Any, Any] | None:
+    try:
+        import mujoco
+    except ImportError:
+        return None
+    previous_callback = mujoco.get_mjcb_time()
+    mujoco.set_mjcb_time(time.perf_counter)
+    return mujoco, previous_callback
+
+
+def _restore_mujoco_profiler_timers(timer_state: tuple[Any, Any] | None) -> None:
+    if timer_state is None:
+        return
+    mujoco, previous_callback = timer_state
+    mujoco.set_mjcb_time(previous_callback)
+
+
 def _apply_cpu_affinity(cpu_id: int | None) -> bool:
     if cpu_id is None:
         return False
@@ -606,6 +724,7 @@ def profile_task_trial(
     clock: Any = time.perf_counter,
 ) -> ProfileResult:
     env = None
+    mujoco_timer_state = None
     cpu_affinity_applied = _apply_cpu_affinity(config.cpu_id)
     stage = "apply_cpu_affinity"
     try:
@@ -655,6 +774,9 @@ def profile_task_trial(
         if init_state is not None and hasattr(env, "set_init_state"):
             stage = "set_init_state"
             env.set_init_state(init_state)
+        if config.mujoco_profiler:
+            stage = "enable_mujoco_profiler_timers"
+            mujoco_timer_state = _enable_mujoco_profiler_timers()
         base = _event_base(
             config=config,
             spec=spec,
@@ -664,6 +786,10 @@ def profile_task_trial(
         )
         events: list[dict[str, Any]] = []
         latencies: list[float] = []
+        mujoco_profiler_events: list[dict[str, Any]] = []
+        previous_mujoco_profiler_metadata = (
+            collect_mujoco_profiler_metadata(env) if config.mujoco_profiler else None
+        )
         done_seen_step: int | None = None
         success_seen = False
         for step_index in range(config.measure_steps):
@@ -679,6 +805,16 @@ def profile_task_trial(
                 done_seen_step = step_index
             success_seen = success_seen or success
             latencies.append(latency_s)
+            mujoco_profiler_metadata = {}
+            if config.mujoco_profiler:
+                cumulative_metadata = collect_mujoco_profiler_metadata(env)
+                mujoco_profiler_metadata = _diff_mujoco_profiler_metadata(
+                    cumulative_metadata,
+                    previous_mujoco_profiler_metadata,
+                )
+                previous_mujoco_profiler_metadata = cumulative_metadata
+            if mujoco_profiler_metadata:
+                mujoco_profiler_events.append(mujoco_profiler_metadata)
             event = {
                 "event": "libero_step_latency",
                 **base,
@@ -688,6 +824,7 @@ def profile_task_trial(
                 "done": done,
                 "success": success,
                 "done_seen_step": done_seen_step,
+                **mujoco_profiler_metadata,
             }
             events.append(event)
             if done and config.stop_on_done:
@@ -695,6 +832,7 @@ def profile_task_trial(
         summary = {
             **base,
             **compute_latency_summary(latencies),
+            **_summarize_mujoco_profiler_events(mujoco_profiler_events),
             "done_seen_step": done_seen_step,
             "success_seen": success_seen,
             "error": None,
@@ -718,6 +856,7 @@ def profile_task_trial(
             ),
         )
     finally:
+        _restore_mujoco_profiler_timers(mujoco_timer_state)
         if env is not None and hasattr(env, "close"):
             try:
                 stage = "close"
@@ -896,6 +1035,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--dummy-action", default=None)
     parser.add_argument("--stop-on-done", action="store_true")
+    parser.add_argument("--mujoco-profiler", action="store_true")
     return parser
 
 
@@ -940,6 +1080,7 @@ def config_from_args(args: argparse.Namespace) -> ProfileConfig:
         dummy_action=parse_dummy_action(args.dummy_action),
         stop_on_done=args.stop_on_done,
         subprocess_timeout_s=subprocess_timeout_s,
+        mujoco_profiler=args.mujoco_profiler,
     )
 
 

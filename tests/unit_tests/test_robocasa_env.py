@@ -3,6 +3,7 @@ from __future__ import annotations
 import builtins
 import importlib
 import json
+import multiprocessing as mp
 import sys
 from types import ModuleType
 
@@ -22,6 +23,7 @@ def test_get_env_fns_imports_robocasa_before_robosuite_make(
     fake_pil_image_draw = ModuleType("PIL.ImageDraw")
     fake_pil_image_font = ModuleType("PIL.ImageFont")
     fake_venv = ModuleType("rlinf.envs.robocasa.venv")
+    fake_venv.RobocasaDummyEnv = object
     fake_venv.RobocasaSubprocEnv = object
     monkeypatch.delitem(
         sys.modules,
@@ -340,3 +342,141 @@ def test_robocasa_vector_env_writes_step_timing_events(tmp_path) -> None:
             "wall_start_ns": 10,
         }
     ]
+
+
+def test_robocasa_subproc_env_uses_spawn_context(monkeypatch) -> None:
+    module = importlib.import_module("rlinf.envs.robocasa.venv")
+    recorded = {}
+
+    class _FakeConn:
+        def close(self):
+            recorded["child_closed"] = True
+
+    class _FakeContext:
+        def Pipe(self):
+            return ("parent", _FakeConn())
+
+        def Process(self, target, args, daemon):
+            recorded["target"] = target
+            recorded["args"] = args
+            recorded["daemon"] = daemon
+
+            class _Process:
+                def start(self):
+                    recorded["started"] = True
+
+            return _Process()
+
+    monkeypatch.setattr(mp, "get_context", lambda method: _FakeContext())
+
+    class _DummyEnv:
+        observation_space = None
+
+        def close(self):
+            return None
+
+    env = module.RobocasaSubprocEnvWorker(lambda: _DummyEnv(), share_memory=False)
+
+    assert recorded["started"] is True
+    assert recorded["daemon"] is True
+    assert recorded["args"][0] == "parent"
+    assert isinstance(recorded["args"][1], _FakeConn)
+    assert env.parent_remote == "parent"
+
+
+def test_robocasa_subproc_worker_receives_init_lock(monkeypatch) -> None:
+    module = importlib.import_module("rlinf.envs.robocasa.venv")
+    recorded = {}
+    init_lock = object()
+
+    class _FakeConn:
+        def close(self):
+            pass
+
+    class _FakeContext:
+        def Pipe(self):
+            return ("parent", _FakeConn())
+
+        def Process(self, target, args, daemon):
+            recorded["args"] = args
+
+            class _Process:
+                def start(self):
+                    pass
+
+            return _Process()
+
+    monkeypatch.setattr(mp, "get_context", lambda method: _FakeContext())
+
+    env = module.RobocasaSubprocEnvWorker(
+        lambda: object(), share_memory=False, init_lock=init_lock
+    )
+
+    assert env.parent_remote == "parent"
+    assert recorded["args"][-1] is init_lock
+
+
+def test_robocasa_subproc_env_uses_shared_init_lock(monkeypatch) -> None:
+    module = importlib.import_module("rlinf.envs.robocasa.venv")
+    init_locks = []
+
+    class _FakeContext:
+        def Lock(self):
+            return "shared-lock"
+
+    class _FakeWorker:
+        def __init__(self, env_fn, share_memory, local_env_index, init_lock=None):
+            del env_fn, share_memory, local_env_index
+            init_locks.append(init_lock)
+
+    def fake_base_init(self, env_fns, worker_fn, **kwargs):
+        del self, kwargs
+        for env_fn in env_fns:
+            worker_fn(env_fn)
+
+    monkeypatch.setattr(mp, "get_context", lambda method: _FakeContext())
+    monkeypatch.setattr(module, "RobocasaSubprocEnvWorker", _FakeWorker)
+    monkeypatch.setattr(module.BaseVectorEnv, "__init__", fake_base_init)
+
+    env = module.RobocasaSubprocEnv([lambda: None, lambda: None], serial_init=True)
+
+    assert init_locks == ["shared-lock", "shared-lock"]
+    assert env._serial_init_lock == "shared-lock"
+
+
+def test_robocasa_env_uses_dummy_vector_env_when_subproc_disabled(
+    monkeypatch,
+) -> None:
+    module = importlib.import_module("rlinf.envs.robocasa.robocasa_env")
+    RobocasaEnv = module.RobocasaEnv
+    env = RobocasaEnv.__new__(RobocasaEnv)
+    env.cfg = OmegaConf.create({"use_subproc": False})
+    env.num_envs = 1
+    env.num_tasks = 1
+    env.get_env_fns = lambda: ["env_fn"]
+    monkeypatch.setitem(sys.modules, "robocasa", ModuleType("robocasa"))
+    monkeypatch.setattr(module, "RobocasaDummyEnv", lambda env_fns: ("dummy", env_fns))
+
+    env._init_env()
+
+    assert env.env == ("dummy", ["env_fn"])
+
+
+def test_robocasa_env_passes_serial_subproc_init(monkeypatch) -> None:
+    module = importlib.import_module("rlinf.envs.robocasa.robocasa_env")
+    RobocasaEnv = module.RobocasaEnv
+    env = RobocasaEnv.__new__(RobocasaEnv)
+    env.cfg = OmegaConf.create({"use_subproc": True, "serial_subproc_init": True})
+    env.num_envs = 1
+    env.num_tasks = 1
+    env.get_env_fns = lambda: ["env_fn"]
+    monkeypatch.setitem(sys.modules, "robocasa", ModuleType("robocasa"))
+
+    def fake_subproc_env(env_fns, serial_init=False):
+        return ("subproc", env_fns, serial_init)
+
+    monkeypatch.setattr(module, "RobocasaSubprocEnv", fake_subproc_env)
+
+    env._init_env()
+
+    assert env.env == ("subproc", ["env_fn"], True)

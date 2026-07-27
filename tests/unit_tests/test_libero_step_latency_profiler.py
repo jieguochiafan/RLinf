@@ -10,9 +10,11 @@ from toolkits.profile_libero_step_latency import (
     ProfileConfig,
     ProfileResult,
     TaskTrialSpec,
+    _diff_mujoco_profiler_metadata,
     _profile_subprocess_entry,
     append_jsonl,
     build_arg_parser,
+    collect_mujoco_profiler_metadata,
     compute_latency_summary,
     config_from_args,
     parse_bddl_metadata,
@@ -212,8 +214,26 @@ class FakeModel:
     camera_names = ["agentview", "robot0_eye_in_hand"]
 
 
+class FakeTimerStat:
+    def __init__(self, duration: float, number: int):
+        self.duration = duration
+        self.number = number
+
+
+class FakeData:
+    def __init__(self):
+        self.timer = [
+            FakeTimerStat(duration=0.001 * (index + 1), number=index + 2)
+            for index in range(15)
+        ]
+        self.solver_niter = [3, 1, 0]
+        self.ncon = 4
+        self.nefc = 7
+
+
 class FakeSim:
     model = FakeModel()
+    data = FakeData()
 
 
 class FakeEnv:
@@ -235,6 +255,9 @@ class FakeEnv:
 
     def step(self, action):
         self.steps += 1
+        for index, timer_stat in enumerate(self.sim.data.timer):
+            timer_stat.duration += 0.0005 * (index + 1)
+            timer_stat.number += 1
         done = self.steps >= 3
         return {"obs": self.steps}, float(done), done, {"success": done}
 
@@ -312,6 +335,7 @@ def test_config_from_args_parses_cli_values(tmp_path: Path):
             "6",
             "--cpu-id",
             "0",
+            "--mujoco-profiler",
             "--subprocess-timeout-s",
             "123.5",
             "--camera-height",
@@ -334,6 +358,7 @@ def test_config_from_args_parses_cli_values(tmp_path: Path):
     assert config.measure_steps == 6
     assert config.cpu_id == 0
     assert config.cpu_ids is None
+    assert config.mujoco_profiler is True
     assert config.subprocess_timeout_s == 123.5
     assert config.camera_height == 128
     assert config.camera_width == 96
@@ -442,6 +467,39 @@ def test_main_reports_startup_errors_without_traceback(
     assert "Traceback" not in captured.out
 
 
+def test_collect_mujoco_profiler_metadata_extracts_timer_and_solver_stats():
+    metadata = collect_mujoco_profiler_metadata(FakeEnv())
+
+    assert metadata["mujoco_timer_step_duration_s"] == 0.001
+    assert metadata["mujoco_timer_step_count"] == 2
+    assert metadata["mujoco_timer_pos_collision_duration_s"] == 0.011
+    assert metadata["mujoco_timer_col_broad_duration_s"] == 0.014
+    assert metadata["mujoco_timer_col_narrow_count"] == 16
+    assert metadata["mujoco_solver_niter_sum"] == 4
+    assert metadata["mujoco_solver_niter_max"] == 3
+    assert metadata["mujoco_ncon"] == 4
+    assert metadata["mujoco_nefc"] == 7
+
+
+def test_diff_mujoco_profiler_metadata_converts_cumulative_timers_to_step_delta():
+    previous = {
+        "mujoco_timer_step_duration_s": 0.004,
+        "mujoco_timer_step_count": 2,
+        "mujoco_ncon": 1,
+    }
+    current = {
+        "mujoco_timer_step_duration_s": 0.011,
+        "mujoco_timer_step_count": 5,
+        "mujoco_ncon": 4,
+    }
+
+    assert _diff_mujoco_profiler_metadata(current, previous) == {
+        "mujoco_timer_step_duration_s": 0.006999999999999999,
+        "mujoco_timer_step_count": 3,
+        "mujoco_ncon": 4,
+    }
+
+
 def test_profile_task_trial_with_mock_env(tmp_path: Path):
     bddl_path = tmp_path / "KITCHEN_SCENE3_task.bddl"
     bddl_path.write_text(SAMPLE_BDDL)
@@ -470,6 +528,32 @@ def test_profile_task_trial_with_mock_env(tmp_path: Path):
     assert result.summary["max_latency_s"] == 0.25
     assert result.summary["success_seen"] is True
     assert result.summary["done_seen_step"] == 2
+
+
+def test_profile_task_trial_records_mujoco_profiler_fields(tmp_path: Path):
+    bddl_path = tmp_path / "KITCHEN_SCENE3_task.bddl"
+    bddl_path.write_text(SAMPLE_BDDL)
+    config = replace(_profile_config(tmp_path, measure_steps=1), mujoco_profiler=True)
+    spec = _task_trial_spec(bddl_path)
+
+    result = profile_task_trial(
+        config=config,
+        spec=spec,
+        env_factory=FakeEnv,
+        init_state=np.zeros(3),
+        clock=IncrementingClock(step=0.25),
+    )
+
+    assert result.error is None
+    assert math.isclose(result.events[0]["mujoco_timer_step_duration_s"], 0.0005)
+    assert math.isclose(result.events[0]["mujoco_timer_col_narrow_duration_s"], 0.0075)
+    assert result.events[0]["mujoco_timer_step_count"] == 1
+    assert result.events[0]["mujoco_solver_niter_sum"] == 4
+    assert math.isclose(result.summary["mujoco_timer_step_duration_s_mean"], 0.0005)
+    assert math.isclose(
+        result.summary["mujoco_timer_pos_collision_duration_s_mean"], 0.0055
+    )
+    assert result.summary["mujoco_ncon_max"] == 4
 
 
 def test_profile_task_trial_stop_on_done_stops_measurement(tmp_path: Path):

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import sys
+from types import ModuleType
 
 import numpy as np
 import pytest
@@ -269,3 +271,26 @@ def test_run_diagnostics_eval_prepares_action_chunk(monkeypatch, tmp_path) -> No
     assert prepare_calls[0]["action_dim"] == 2
     assert prepare_calls[0]["policy"] == "12d"
     np.testing.assert_allclose(env.actions[0], np.array([[9.0, 8.0, 7.0]]))
+
+
+def test_main_does_not_call_cluster_validating_validate_cfg(monkeypatch) -> None:
+    fake_config = ModuleType("rlinf.config")
+
+    def _validate_cfg(cfg):
+        raise AssertionError("validate_cfg should not run for standalone eval")
+
+    fake_config.validate_cfg = _validate_cfg
+    monkeypatch.setitem(sys.modules, "rlinf.config", fake_config)
+
+    calls = []
+    monkeypatch.setattr(
+        diagnostics_eval,
+        "run_diagnostics_eval",
+        lambda cfg: calls.append(cfg),
+    )
+    cfg = OmegaConf.create({"runner": {"only_eval": False}})
+
+    diagnostics_eval.main.__wrapped__(cfg)
+
+    assert cfg.runner.only_eval is True
+    assert calls == [cfg]

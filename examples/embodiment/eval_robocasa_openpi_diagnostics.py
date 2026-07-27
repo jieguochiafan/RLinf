@@ -15,8 +15,13 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
+from contextlib import contextmanager
 from typing import Any
+
+os.environ.setdefault("USE_TF", "0")
+os.environ.setdefault("USE_FLAX", "0")
 
 import hydra
 import numpy as np
@@ -127,17 +132,35 @@ def load_openpi_model(cfg: DictConfig) -> torch.nn.Module:
     return model
 
 
+@contextmanager
+def _robocasa_egl_env():
+    """Normalize EGL device env vars while constructing RoboCasa envs."""
+    keys = ("CUDA_VISIBLE_DEVICES", "MUJOCO_EGL_DEVICE_ID")
+    original = {key: os.environ.get(key) for key in keys}
+    try:
+        os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+        os.environ["MUJOCO_EGL_DEVICE_ID"] = "0"
+        yield
+    finally:
+        for key, value in original.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
 def create_robocasa_eval_env(cfg: DictConfig):
     """Create a single-process local RoboCasa eval environment."""
     from rlinf.envs.robocasa.robocasa_env import RobocasaEnv
 
-    return RobocasaEnv(
-        cfg=cfg.env.eval,
-        num_envs=1,
-        seed_offset=0,
-        total_num_processes=1,
-        worker_info=None,
-    )
+    with _robocasa_egl_env():
+        return RobocasaEnv(
+            cfg=cfg.env.eval,
+            num_envs=1,
+            seed_offset=0,
+            total_num_processes=1,
+            worker_info=None,
+        )
 
 
 def _tensor_bool(value: Any) -> bool:
@@ -223,6 +246,7 @@ def _select_env_success(infos: dict[str, Any], terminated: Any, env_id: int = 0)
 def run_diagnostics_eval(cfg: DictConfig) -> None:
     """Run local RoboCasa OpenPI diagnostics evaluation and write JSONL records."""
     validate_diagnostics_cfg(cfg)
+    OmegaConf.update(cfg, "env.eval.use_subproc", False, merge=False, force_add=True)
     output_path = Path(str(cfg.diagnostics.output_path))
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -335,10 +359,7 @@ def run_diagnostics_eval(cfg: DictConfig) -> None:
     config_name="robocasa_closedrawer_ppo_openpi",
 )
 def main(cfg: DictConfig) -> None:
-    from rlinf.config import validate_cfg
-
     cfg.runner.only_eval = True
-    cfg = validate_cfg(cfg)
     run_diagnostics_eval(cfg)
 
 
