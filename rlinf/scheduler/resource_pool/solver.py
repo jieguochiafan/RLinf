@@ -115,6 +115,19 @@ class ResourcePoolSolver:
         pair_cfg = env_cfg.get("latency_balanced_pair", {})
         return int(pair_cfg.get("envs_per_core", 1))
 
+    def _component_cpu_affinity_scope(self) -> str:
+        if bool(getattr(self.cfg.runner, "only_eval", False)):
+            env_cfg = self.cfg.env.eval
+        else:
+            env_cfg = self.cfg.env.train
+        scope = str(env_cfg.get("cpu_affinity_scope", "process"))
+        if scope not in ("process", "step_only"):
+            raise ValueError(
+                "env CPU affinity scope must be one of 'process' or "
+                f"'step_only', got {scope!r}"
+            )
+        return scope
+
     def _component_uses_latency_balanced_pair(self) -> bool:
         if bool(getattr(self.cfg.runner, "only_eval", False)):
             env_cfg = self.cfg.env.eval
@@ -181,6 +194,11 @@ class ResourcePoolSolver:
             if component == "env" and request.granularity == "per_env"
             else False
         )
+        affinity_scope = (
+            self._component_cpu_affinity_scope()
+            if component == "env" and request.granularity == "per_env"
+            else "process"
+        )
         for node_rank in sorted(placements_by_node):
             node_placements = sorted(
                 placements_by_node[node_rank], key=lambda placement: placement.rank
@@ -229,6 +247,7 @@ class ResourcePoolSolver:
                 bindings[int(placement.rank)] = CpuBinding(
                     process_cpu_cores=process_cpu_cores,
                     env_cpu_core_groups=env_cpu_core_groups,
+                    affinity_scope=affinity_scope,
                 )
         return bindings
 

@@ -11,7 +11,7 @@ from rlinf.scheduler.resource_pool.gpu_binding import (
 )
 
 
-@pytest.mark.parametrize("value", [0, 20, 40, 60, 80, 100])
+@pytest.mark.parametrize("value", [0, 20, 40, 50, 60, 80, 100])
 def test_validate_sm_percent_accepts_supported_values(value: int) -> None:
     assert validate_sm_percent(value) == value
 

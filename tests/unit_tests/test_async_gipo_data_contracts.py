@@ -37,8 +37,24 @@ def test_trajectory_envelope_segment_type_validation():
         segment_type="fixed_horizon",
         auto_reset=False,
         trajectory=object(),
+        started_at=0.25,
         completed_at=1.0,
         last_policy_version=4,
     )
 
     assert envelope.segment_type == "fixed_horizon"
+
+
+def test_trajectory_envelope_reports_rollout_duration():
+    envelope = AsyncTrajectoryEnvelope(
+        env_rank=0,
+        stage_id=1,
+        segment_type="episode",
+        auto_reset=True,
+        trajectory=object(),
+        started_at=10.0,
+        completed_at=12.5,
+        last_policy_version=4,
+    )
+
+    assert envelope.duration_s == 2.5

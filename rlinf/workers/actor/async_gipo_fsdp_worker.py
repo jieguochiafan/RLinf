@@ -13,9 +13,13 @@
 # limitations under the License.
 
 import asyncio
+import json
 import os
 import queue
 import threading
+from typing import Any
+
+import torch
 
 from rlinf.data.embodied_async import AsyncTrajectoryEnvelope
 from rlinf.data.replay_buffer import TrajectoryReplayBuffer
@@ -53,6 +57,55 @@ class AsyncGIPOEmbodiedFSDPActor(AsyncPPOEmbodiedFSDPActor):
         super().init_worker()
         self.setup_gipo_replay_buffer()
         self._recv_queue = queue.Queue()
+        self._rollout_trajectory_timestamps = []
+        self._last_rollout_trajectory_timestamps = []
+        self._trajectory_timestamp_file = None
+
+    def _write_rollout_trajectory_timestamp(self, payload: dict[str, Any]) -> None:
+        if self._trajectory_timestamp_file is None:
+            log_path = self.cfg.runner.logger.get("log_path", "../results")
+            output_dir = os.path.join(log_path, "rollout_trajectory_timestamps")
+            os.makedirs(output_dir, exist_ok=True)
+            path = os.path.join(output_dir, f"actor_rank_{self._rank}.jsonl")
+            self._trajectory_timestamp_file = open(
+                path,
+                "a",
+                encoding="utf-8",
+                buffering=1,
+            )
+        self._trajectory_timestamp_file.write(json.dumps(payload, sort_keys=True) + "\n")
+
+    def _record_rollout_trajectory_timestamp(
+        self,
+        envelope: AsyncTrajectoryEnvelope,
+    ) -> None:
+        if not hasattr(self, "_rollout_trajectory_timestamps"):
+            self._rollout_trajectory_timestamps = []
+        if not hasattr(self, "_last_rollout_trajectory_timestamps"):
+            self._last_rollout_trajectory_timestamps = []
+
+        payload = envelope.timing_payload()
+        self._rollout_trajectory_timestamps.append(payload)
+        self._last_rollout_trajectory_timestamps.append(payload)
+        if hasattr(self, "cfg") and hasattr(self.cfg, "runner"):
+            self._write_rollout_trajectory_timestamp(payload)
+
+    def _consume_rollout_trajectory_timing_metrics(self) -> dict[str, float]:
+        timestamps = getattr(self, "_last_rollout_trajectory_timestamps", [])
+        self._last_rollout_trajectory_timestamps = []
+        if not timestamps:
+            return {}
+
+        durations = [float(payload["duration_s"]) for payload in timestamps]
+        started_at = [float(payload["started_at"]) for payload in timestamps]
+        completed_at = [float(payload["completed_at"]) for payload in timestamps]
+        return {
+            "rollout/trajectory_count": float(len(timestamps)),
+            "rollout/trajectory_duration_mean": sum(durations) / len(durations),
+            "rollout/trajectory_duration_min": min(durations),
+            "rollout/trajectory_duration_max": max(durations),
+            "rollout/trajectory_collect_window": max(completed_at) - min(started_at),
+        }
 
     def _drain_received_trajectories(self, max_trajectories: int | None = None) -> int:
         recv_list = []
@@ -64,12 +117,94 @@ class AsyncGIPOEmbodiedFSDPActor(AsyncPPOEmbodiedFSDPActor):
             except queue.Empty:
                 break
             if isinstance(envelope, AsyncTrajectoryEnvelope):
+                self._record_rollout_trajectory_timestamp(envelope)
                 recv_list.append(envelope.trajectory)
             else:
                 recv_list.append(envelope)
         if recv_list:
             self.replay_buffer.add_trajectories(recv_list)
         return len(recv_list)
+
+    def _get_common_gipo_step_time(self, local_step_time: int) -> int:
+        if not (
+            torch.distributed.is_available() and torch.distributed.is_initialized()
+        ):
+            return local_step_time
+
+        step_time = torch.tensor(local_step_time, dtype=torch.long, device=self.device)
+        torch.distributed.all_reduce(step_time, op=torch.distributed.ReduceOp.MAX)
+        return int(step_time.item())
+
+    def _pad_gipo_tensor_time_dim(
+        self,
+        tensor: torch.Tensor,
+        target_time: int,
+        *,
+        pad_value: float | bool = 0,
+    ) -> torch.Tensor:
+        if tensor.shape[0] == target_time:
+            return tensor
+        pad_shape = (target_time - tensor.shape[0], *tensor.shape[1:])
+        padding = torch.full(
+            pad_shape,
+            fill_value=pad_value,
+            dtype=tensor.dtype,
+            device=tensor.device,
+        )
+        return torch.cat([tensor, padding], dim=0)
+
+    def _pad_gipo_replay_batch_to_step_time(
+        self,
+        batch: dict,
+        target_step_time: int,
+    ) -> None:
+        boundary_fields = ("dones", "terminations", "truncations", "prev_values")
+        step_fields = (
+            "actions",
+            "intervene_flags",
+            "rewards",
+            "prev_logprobs",
+            "versions",
+            "loss_mask",
+        )
+
+        def _pad_nested_step_tensors(values: dict) -> None:
+            for key, value in list(values.items()):
+                if isinstance(value, torch.Tensor):
+                    values[key] = self._pad_gipo_tensor_time_dim(
+                        value,
+                        target_step_time,
+                        pad_value=False if value.dtype == torch.bool else 0,
+                    )
+                elif isinstance(value, dict):
+                    _pad_nested_step_tensors(value)
+
+        for field_name in step_fields:
+            value = batch.get(field_name)
+            if isinstance(value, torch.Tensor):
+                batch[field_name] = self._pad_gipo_tensor_time_dim(
+                    value,
+                    target_step_time,
+                    pad_value=(
+                        False
+                        if field_name in ("intervene_flags", "loss_mask")
+                        else 0
+                    ),
+                )
+
+        for field_name in boundary_fields:
+            value = batch.get(field_name)
+            if isinstance(value, torch.Tensor):
+                batch[field_name] = self._pad_gipo_tensor_time_dim(
+                    value,
+                    target_step_time + 1,
+                )
+
+        for dict_name in ("forward_inputs", "curr_obs", "next_obs"):
+            values = batch.get(dict_name)
+            if not values:
+                continue
+            _pad_nested_step_tensors(values)
 
     async def _wait_for_replay_buffer_ready(self, min_buffer_size: int) -> None:
         while not self.should_stop:
@@ -89,12 +224,22 @@ class AsyncGIPOEmbodiedFSDPActor(AsyncPPOEmbodiedFSDPActor):
             "target_batch_segments", 1
         )
         batch = self.replay_buffer.sample_trajectory_batch(target_segments)
+        local_step_time = int(batch["prev_logprobs"].shape[0])
+        target_step_time = self._get_common_gipo_step_time(local_step_time)
+        self._pad_gipo_replay_batch_to_step_time(batch, target_step_time)
         self.rollout_batch = batch
         return self.load_batch(batch)
 
     async def run_training(self):
         await self._prepare_gipo_replay_batch()
-        return await asyncio.to_thread(AsyncPPOEmbodiedFSDPActor.run_training, self)
+        training_metrics = await asyncio.to_thread(
+            AsyncPPOEmbodiedFSDPActor.run_training,
+            self,
+        )
+        timing_metrics = self._consume_rollout_trajectory_timing_metrics()
+        if timing_metrics:
+            training_metrics.update(timing_metrics)
+        return training_metrics
 
     async def recv_trajectories_async(self, input_channel):
         if getattr(self, "_recv_queue", None) is None:
@@ -117,3 +262,7 @@ class AsyncGIPOEmbodiedFSDPActor(AsyncPPOEmbodiedFSDPActor):
         recv_thread = getattr(self, "_recv_thread", None)
         if recv_thread is not None and recv_thread.is_alive():
             await asyncio.to_thread(recv_thread.join, 5)
+        timestamp_file = getattr(self, "_trajectory_timestamp_file", None)
+        if timestamp_file is not None:
+            timestamp_file.close()
+            self._trajectory_timestamp_file = None

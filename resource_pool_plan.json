@@ -1,0 +1,122 @@
+{
+  "bindings": [
+    {
+      "cluster_node_rank": 0,
+      "component": "env",
+      "cpu": {
+        "affinity_scope": "process",
+        "env_cpu_core_groups": [],
+        "process_cpu_cores": [
+          28,
+          29,
+          30,
+          31,
+          32,
+          33,
+          34
+        ]
+      },
+      "gpu": {
+        "mig_device_uuid": null,
+        "mode": "mps",
+        "parent_gpu": 4,
+        "sm_percent": 0,
+        "visible_devices": [
+          "4"
+        ]
+      },
+      "node_group_label": "cluster",
+      "rank": 0
+    },
+    {
+      "cluster_node_rank": 0,
+      "component": "env",
+      "cpu": {
+        "affinity_scope": "process",
+        "env_cpu_core_groups": [],
+        "process_cpu_cores": [
+          35,
+          36,
+          37,
+          38,
+          39,
+          40,
+          41
+        ]
+      },
+      "gpu": {
+        "mig_device_uuid": null,
+        "mode": "mps",
+        "parent_gpu": 5,
+        "sm_percent": 0,
+        "visible_devices": [
+          "5"
+        ]
+      },
+      "node_group_label": "cluster",
+      "rank": 1
+    },
+    {
+      "cluster_node_rank": 0,
+      "component": "env",
+      "cpu": {
+        "affinity_scope": "process",
+        "env_cpu_core_groups": [],
+        "process_cpu_cores": [
+          42,
+          43,
+          44,
+          45,
+          46,
+          47,
+          48
+        ]
+      },
+      "gpu": {
+        "mig_device_uuid": null,
+        "mode": "mps",
+        "parent_gpu": 6,
+        "sm_percent": 0,
+        "visible_devices": [
+          "6"
+        ]
+      },
+      "node_group_label": "cluster",
+      "rank": 2
+    },
+    {
+      "cluster_node_rank": 0,
+      "component": "env",
+      "cpu": {
+        "affinity_scope": "process",
+        "env_cpu_core_groups": [],
+        "process_cpu_cores": [
+          49,
+          50,
+          51,
+          52,
+          53,
+          54,
+          55
+        ]
+      },
+      "gpu": {
+        "mig_device_uuid": null,
+        "mode": "mps",
+        "parent_gpu": 7,
+        "sm_percent": 0,
+        "visible_devices": [
+          "7"
+        ]
+      },
+      "node_group_label": "cluster",
+      "rank": 3
+    }
+  ],
+  "enabled": true,
+  "summary": {
+    "mps_gpu_totals": {},
+    "shared_cpu_cores": {},
+    "shared_mig_uuids": {}
+  }
+}

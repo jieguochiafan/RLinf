@@ -98,6 +98,9 @@ class TestOverlapEnvBootstrap(unittest.TestCase):
         self.worker.history_reward_assign = self.cfg.get("reward", {}).get(
             "history_reward_assign", True
         )
+        self.worker._interact_step_count = 0
+        self.worker._probe_warmup_steps = 0
+        self.worker._probe_resume_pending = False
         self.worker._prefetched_train_bootstrap = None
         self.worker._pending_reset_metrics = []
         self.worker._torch_profiler = None

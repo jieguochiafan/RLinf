@@ -5,6 +5,7 @@ from .profiler import (
     RolloutProfiler,
     RolloutProfilerConfig,
     make_rollout_profiler,
+    write_profile_context_event,
 )
 
 __all__ = [
@@ -15,4 +16,5 @@ __all__ = [
     "RolloutProfileSummaryOutputs",
     "make_rollout_profiler",
     "summarize_rollout_profile",
+    "write_profile_context_event",
 ]

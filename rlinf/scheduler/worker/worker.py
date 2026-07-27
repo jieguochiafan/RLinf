@@ -1249,6 +1249,10 @@ class Worker(metaclass=WorkerMeta):
             self._resource_binding is not None
             and self._resource_binding.cpu is not None
             and self._resource_binding.cpu.process_cpu_cores
+            and not (
+                self._resource_binding.component == "env"
+                and self._resource_binding.cpu.affinity_scope == "step_only"
+            )
         ):
             apply_process_cpu_affinity(self._resource_binding.cpu.process_cpu_cores)
 

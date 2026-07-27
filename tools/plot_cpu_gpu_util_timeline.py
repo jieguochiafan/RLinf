@@ -1,0 +1,1897 @@
+"""Plot CPU and GPU utilization timelines in one stacked figure."""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import math
+import os
+from collections import defaultdict, deque
+from concurrent.futures import ProcessPoolExecutor
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from pathlib import Path
+
+import matplotlib.dates as mdates
+import matplotlib.pyplot as plt
+import numpy as np
+from matplotlib import font_manager
+from plot_cpu_core_util_timeline import (
+    PhaseWindow,
+    read_cpu_core_series,
+    smooth_series,
+)
+from plot_cpu_core_util_timeline import (
+    resolve_phases as resolve_legacy_phases,
+)
+from plot_gpu_util_rollout_train_timeline import (
+    read_gpu_samples,
+    resolve_gpu_csv,
+    smooth_utilization,
+)
+
+AVAILABLE_FONTS = {font.name for font in font_manager.fontManager.ttflist}
+FONT_FAMILY = "Arial" if "Arial" in AVAILABLE_FONTS else "DejaVu Sans"
+
+
+@dataclass(frozen=True)
+class ProcessWindow:
+    """A process-owned interval that should be attributed to a detail phase."""
+
+    phase: str
+    pid: int
+    start: datetime
+    end: datetime
+
+
+@dataclass(frozen=True)
+class CpuTimelineSeries:
+    """CPU utilization series normalized for the stacked CPU/GPU plot."""
+
+    times: np.ndarray
+    total: np.ndarray
+    p90: np.ndarray
+    max_value: np.ndarray
+    components: dict[str, tuple[np.ndarray, np.ndarray]]
+    summary_path: Path
+    component_path: Path | None
+    ylabel: str
+    line_label: str
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("run_dir", type=Path, help="Profile run directory.")
+    parser.add_argument(
+        "--output-prefix",
+        type=Path,
+        default=None,
+        help="Output prefix. Defaults to <run_dir>/cpu_gpu_util_timeline.",
+    )
+    parser.add_argument(
+        "--cpu-csv",
+        type=Path,
+        default=None,
+        help=(
+            "CPU CSV. Defaults to <run_dir>/resource_profile/cpu/thread_core_samples.csv, "
+            "or the legacy <run_dir>/cpu/worker_cpu_core_util.csv."
+        ),
+    )
+    parser.add_argument(
+        "--gpu-csv",
+        type=Path,
+        default=None,
+        help=(
+            "GPU CSV. Defaults to <run_dir>/resource_profile/nvidia_smi/gpu_util_500ms.csv, "
+            "or the legacy <run_dir>/gpu/gpu_util_10hz.csv."
+        ),
+    )
+    parser.add_argument(
+        "--gpu-role",
+        action="append",
+        default=[],
+        metavar="GPU=ROLE",
+        help="Optional GPU role label, e.g. --gpu-role 4=Generation --gpu-role 5=Train.",
+    )
+    parser.add_argument(
+        "--num-cpus",
+        type=int,
+        default=None,
+        help="CPU count for percent normalization. If omitted, infer from sampled CPU ids.",
+    )
+    parser.add_argument(
+        "--cpu-unit",
+        choices=("cores", "percent"),
+        default="cores",
+        help="Plot CPU as core-equivalent load or percent of --num-cpus.",
+    )
+    parser.add_argument(
+        "--parallel-workers",
+        type=int,
+        default=min(16, os.cpu_count() or 1),
+        help="Worker processes used when aggregating thread_core_samples.csv.",
+    )
+    parser.add_argument(
+        "--no-component-lines",
+        action="store_true",
+        help="Do not draw per-component CPU lines for thread_core_samples.csv.",
+    )
+    parser.add_argument(
+        "--cpu-smooth-window-s",
+        type=float,
+        default=30.0,
+        help="Centered moving-average window in seconds for CPU series.",
+    )
+    parser.add_argument(
+        "--gpu-smooth-window-s",
+        type=float,
+        default=30.0,
+        help="GPU smoothing window in seconds.",
+    )
+    parser.add_argument(
+        "--gpu-smooth-mode",
+        choices=("mean", "quantile", "max"),
+        default="quantile",
+        help="GPU smoothing mode.",
+    )
+    parser.add_argument(
+        "--gpu-smooth-quantile",
+        type=float,
+        default=0.9,
+        help="Quantile used for GPU quantile smoothing.",
+    )
+    parser.add_argument(
+        "--x-pad-s",
+        type=float,
+        default=90.0,
+        help="Extra x-axis padding in seconds on both sides.",
+    )
+    parser.add_argument(
+        "--fig-width",
+        type=float,
+        default=4.0,
+        help="Figure width in inches.",
+    )
+    parser.add_argument(
+        "--fig-height",
+        type=float,
+        default=2.8,
+        help="Figure height in inches.",
+    )
+    parser.add_argument(
+        "--bin-s",
+        type=float,
+        default=1.0,
+        help="CPU aggregation bin size in seconds.",
+    )
+    parser.add_argument(
+        "--cache-prefix",
+        type=Path,
+        default=None,
+        help="CPU cache prefix. Defaults to <run_dir>/cpu/cpu_core_util_agg_<bin>s.",
+    )
+    parser.add_argument(
+        "--phase-csv",
+        type=Path,
+        default=None,
+        help="Phase CSV generated by the GPU timeline script.",
+    )
+    parser.add_argument(
+        "--rebuild-cache",
+        action="store_true",
+        help="Rebuild cached CPU aggregation CSVs.",
+    )
+    parser.add_argument(
+        "--no-cpu-inset",
+        action="store_true",
+        help="Do not draw or export the CPU inset figure.",
+    )
+    return parser.parse_args()
+
+
+def format_wall_datetime(timestamp_s: float) -> str:
+    return datetime.fromtimestamp(float(timestamp_s)).strftime("%Y-%m-%d %H:%M:%S.%f")[
+        :-3
+    ]
+
+
+def resolve_cpu_csv(run_dir: Path, cpu_csv: Path | None) -> Path:
+    if cpu_csv is not None:
+        return cpu_csv
+    candidates = [
+        run_dir / "resource_profile" / "cpu" / "thread_core_samples.csv",
+        run_dir / "cpu" / "thread_core_samples.csv",
+        run_dir / "cpu" / "worker_cpu_core_util.csv",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0]
+
+
+def is_thread_cpu_csv(path: Path) -> bool:
+    if not path.exists():
+        return False
+    with path.open(newline="") as handle:
+        header = handle.readline().strip().split(",")
+    return {"interval_start", "interval_end", "component", "cpu_time_s"}.issubset(
+        set(header)
+    )
+
+
+def thread_cpu_cache_paths(cache_prefix: Path) -> tuple[Path, Path]:
+    return (
+        cache_prefix.with_name(cache_prefix.name + "_summary.csv"),
+        cache_prefix.with_name(cache_prefix.name + "_components.csv"),
+    )
+
+
+def default_thread_cpu_cache_prefix(raw_path: Path, bin_s: float) -> Path:
+    if raw_path.parent.name == "cpu" and raw_path.parent.parent.name == "resource_profile":
+        return raw_path.parent.parent / "plot_cache" / f"thread_cpu_util_agg_{bin_s:g}s"
+    return raw_path.parent / f"thread_cpu_util_agg_{bin_s:g}s"
+
+
+def add_thread_cpu_time_to_bins(
+    total_by_bin: dict[int, float],
+    component_by_bin: dict[tuple[int, str], float],
+    *,
+    start_s: float,
+    end_s: float,
+    component: str,
+    cpu_time_s: float,
+    bin_s: float,
+) -> None:
+    duration_s = end_s - start_s
+    if duration_s <= 0 or cpu_time_s <= 0 or not math.isfinite(cpu_time_s):
+        return
+
+    current_s = start_s
+    while current_s < end_s:
+        bin_id = int(math.floor(current_s / bin_s))
+        bin_end_s = min(end_s, (bin_id + 1) * bin_s)
+        if bin_end_s <= current_s:
+            break
+        share = cpu_time_s * ((bin_end_s - current_s) / duration_s)
+        total_by_bin[bin_id] = total_by_bin.get(bin_id, 0.0) + share
+        component_key = (bin_id, component or "unknown")
+        component_by_bin[component_key] = component_by_bin.get(component_key, 0.0) + share
+        current_s = bin_end_s
+
+
+def aggregate_thread_cpu_chunk(
+    args: tuple[Path, int, int, float],
+) -> tuple[dict[int, float], dict[tuple[int, str], float], set[int]]:
+    raw_path, start_offset, end_offset, bin_s = args
+    total_by_bin: dict[int, float] = {}
+    component_by_bin: dict[tuple[int, str], float] = {}
+    cpu_ids: set[int] = set()
+
+    with raw_path.open("rb") as handle:
+        if start_offset == 0:
+            handle.readline()
+        else:
+            handle.seek(max(0, start_offset - 1))
+            previous = handle.read(1)
+            if previous != b"\n":
+                handle.readline()
+
+        while handle.tell() < end_offset:
+            line = handle.readline()
+            if not line:
+                break
+            parts = line.rstrip(b"\r\n").split(b",")
+            if len(parts) < 8:
+                continue
+            try:
+                interval_start_s = float(parts[0])
+                interval_end_s = float(parts[1])
+                component = parts[4].decode("utf-8", errors="ignore").strip()
+                cpu = int(parts[6])
+                cpu_time_s = float(parts[7])
+            except ValueError:
+                continue
+            cpu_ids.add(cpu)
+            add_thread_cpu_time_to_bins(
+                total_by_bin,
+                component_by_bin,
+                start_s=interval_start_s,
+                end_s=interval_end_s,
+                component=component,
+                cpu_time_s=cpu_time_s,
+                bin_s=bin_s,
+            )
+
+    return total_by_bin, component_by_bin, cpu_ids
+
+
+def build_thread_cpu_ranges(
+    raw_path: Path,
+    workers: int,
+    bin_s: float,
+) -> list[tuple[Path, int, int, float]]:
+    file_size = raw_path.stat().st_size
+    worker_count = max(1, min(workers, file_size if file_size > 0 else 1))
+    chunk_size = int(math.ceil(file_size / worker_count))
+    ranges = []
+    for worker_idx in range(worker_count):
+        start_offset = worker_idx * chunk_size
+        end_offset = min(file_size, (worker_idx + 1) * chunk_size)
+        if start_offset >= end_offset:
+            continue
+        ranges.append((raw_path, start_offset, end_offset, bin_s))
+    return ranges
+
+
+def build_thread_cpu_cache(
+    raw_path: Path,
+    cache_prefix: Path,
+    *,
+    bin_s: float,
+    num_cpus: int | None,
+    parallel_workers: int,
+) -> tuple[Path, Path, int]:
+    if bin_s <= 0:
+        raise ValueError("--bin-s must be positive")
+
+    total_by_bin: dict[int, float] = {}
+    component_by_bin: dict[tuple[int, str], float] = {}
+    cpu_ids: set[int] = set()
+    ranges = build_thread_cpu_ranges(raw_path, parallel_workers, bin_s)
+
+    if len(ranges) <= 1:
+        results = [aggregate_thread_cpu_chunk(ranges[0])]
+    else:
+        with ProcessPoolExecutor(max_workers=len(ranges)) as executor:
+            results = list(executor.map(aggregate_thread_cpu_chunk, ranges))
+
+    for partial_total, partial_components, partial_cpu_ids in results:
+        cpu_ids.update(partial_cpu_ids)
+        for bin_id, value in partial_total.items():
+            total_by_bin[bin_id] = total_by_bin.get(bin_id, 0.0) + value
+        for key, value in partial_components.items():
+            component_by_bin[key] = component_by_bin.get(key, 0.0) + value
+
+    if not total_by_bin:
+        raise ValueError(f"No CPU samples could be aggregated from {raw_path}")
+
+    resolved_num_cpus = num_cpus
+    if resolved_num_cpus is None:
+        resolved_num_cpus = max(cpu_ids) + 1 if cpu_ids else (os.cpu_count() or 1)
+    if resolved_num_cpus <= 0:
+        raise ValueError("--num-cpus must be positive")
+
+    summary_path, component_path = thread_cpu_cache_paths(cache_prefix)
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    first_bin = min(total_by_bin)
+    last_bin = max(total_by_bin)
+
+    with summary_path.open("w", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=[
+                "timestamp",
+                "datetime",
+                "bin_start",
+                "bin_end",
+                "total_core_equiv",
+                "total_pct",
+                "num_cpus",
+            ],
+        )
+        writer.writeheader()
+        for bin_id in range(first_bin, last_bin + 1):
+            timestamp_s = (bin_id + 0.5) * bin_s
+            core_equiv = total_by_bin.get(bin_id, 0.0) / bin_s
+            writer.writerow(
+                {
+                    "timestamp": f"{timestamp_s:.6f}",
+                    "datetime": format_wall_datetime(timestamp_s),
+                    "bin_start": f"{bin_id * bin_s:.6f}",
+                    "bin_end": f"{(bin_id + 1) * bin_s:.6f}",
+                    "total_core_equiv": f"{core_equiv:.6f}",
+                    "total_pct": f"{100.0 * core_equiv / resolved_num_cpus:.6f}",
+                    "num_cpus": resolved_num_cpus,
+                }
+            )
+
+    components = sorted({component for _bin_id, component in component_by_bin})
+    with component_path.open("w", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=[
+                "timestamp",
+                "datetime",
+                "component",
+                "core_equiv",
+                "pct_of_cpus",
+            ],
+        )
+        writer.writeheader()
+        for bin_id in range(first_bin, last_bin + 1):
+            timestamp_s = (bin_id + 0.5) * bin_s
+            for component in components:
+                core_equiv = component_by_bin.get((bin_id, component), 0.0) / bin_s
+                writer.writerow(
+                    {
+                        "timestamp": f"{timestamp_s:.6f}",
+                        "datetime": format_wall_datetime(timestamp_s),
+                        "component": component,
+                        "core_equiv": f"{core_equiv:.6f}",
+                        "pct_of_cpus": f"{100.0 * core_equiv / resolved_num_cpus:.6f}",
+                    }
+                )
+
+    return summary_path, component_path, resolved_num_cpus
+
+
+def read_thread_cpu_cache(
+    summary_path: Path,
+    component_path: Path,
+    *,
+    cpu_unit: str,
+    component_lines: bool,
+) -> CpuTimelineSeries:
+    times: list[float] = []
+    totals: list[float] = []
+    num_cpus: int | None = None
+    total_field = "total_core_equiv" if cpu_unit == "cores" else "total_pct"
+    component_field = "core_equiv" if cpu_unit == "cores" else "pct_of_cpus"
+
+    with summary_path.open(newline="") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            times.append(float(row["timestamp"]))
+            totals.append(float(row[total_field]))
+            if num_cpus is None and row.get("num_cpus"):
+                num_cpus = int(float(row["num_cpus"]))
+
+    components: dict[str, list[tuple[float, float]]] = defaultdict(list)
+    if component_lines and component_path.exists():
+        with component_path.open(newline="") as handle:
+            reader = csv.DictReader(handle)
+            for row in reader:
+                try:
+                    components[row["component"]].append(
+                        (float(row["timestamp"]), float(row[component_field]))
+                    )
+                except (KeyError, ValueError):
+                    continue
+
+    component_series = {
+        component: (
+            np.array([timestamp for timestamp, _value in rows], dtype=float),
+            np.array([value for _timestamp, value in rows], dtype=float),
+        )
+        for component, rows in components.items()
+        if rows
+    }
+
+    values = np.array(totals, dtype=float)
+    ylabel = "CPU Load (cores)"
+    if cpu_unit == "percent":
+        cpu_count_text = str(num_cpus) if num_cpus is not None else "all"
+        ylabel = f"CPU Util. (% of {cpu_count_text})"
+    return CpuTimelineSeries(
+        times=np.array(times, dtype=float),
+        total=values,
+        p90=values,
+        max_value=values,
+        components=component_series,
+        summary_path=summary_path,
+        component_path=component_path,
+        ylabel=ylabel,
+        line_label="Total" if component_series else "Mean",
+    )
+
+
+def read_cpu_timeline_series(
+    run_dir: Path,
+    *,
+    cpu_csv: Path | None,
+    cache_prefix: Path | None,
+    bin_s: float,
+    rebuild_cache: bool,
+    num_cpus: int | None,
+    cpu_unit: str,
+    parallel_workers: int,
+    component_lines: bool,
+) -> CpuTimelineSeries:
+    raw_path = resolve_cpu_csv(run_dir, cpu_csv)
+    if is_thread_cpu_csv(raw_path):
+        thread_cache_prefix = (
+            cache_prefix
+            if cache_prefix is not None
+            else default_thread_cpu_cache_prefix(raw_path, bin_s)
+        )
+        summary_path, component_path = thread_cpu_cache_paths(thread_cache_prefix)
+        if rebuild_cache or not summary_path.exists() or not component_path.exists():
+            summary_path, component_path, _resolved_num_cpus = build_thread_cpu_cache(
+                raw_path,
+                thread_cache_prefix,
+                bin_s=bin_s,
+                num_cpus=num_cpus,
+                parallel_workers=max(1, parallel_workers),
+            )
+        return read_thread_cpu_cache(
+            summary_path,
+            component_path,
+            cpu_unit=cpu_unit,
+            component_lines=component_lines,
+        )
+
+    legacy_cache_prefix = (
+        cache_prefix
+        if cache_prefix is not None
+        else run_dir / "cpu" / f"cpu_core_util_agg_{bin_s:g}s"
+    )
+    times, mean_util, p90_util, max_util, summary_path, _per_core_path = (
+        read_cpu_core_series(raw_path, legacy_cache_prefix, bin_s, rebuild_cache)
+    )
+    return CpuTimelineSeries(
+        times=times,
+        total=mean_util,
+        p90=p90_util,
+        max_value=max_util,
+        components={},
+        summary_path=summary_path,
+        component_path=None,
+        ylabel="CPU Util. (%)",
+        line_label="Mean",
+    )
+
+
+def parse_gpu_roles(raw_roles: list[str]) -> dict[int, str]:
+    roles: dict[int, str] = {}
+    for raw_role in raw_roles:
+        if "=" not in raw_role:
+            raise ValueError(f"Invalid --gpu-role value: {raw_role!r}")
+        raw_gpu, role = raw_role.split("=", 1)
+        roles[int(raw_gpu.strip())] = role.strip()
+    return roles
+
+
+def draw_phase_markers(
+    ax: plt.Axes,
+    phases: list[PhaseWindow],
+    *,
+    label: bool,
+) -> None:
+    for phase in phases:
+        color = "black"
+        ax.axvline(phase.start, color=color, linestyle="--", linewidth=1.0, alpha=0.9)
+        ax.axvline(phase.end, color=color, linestyle="--", linewidth=1.0, alpha=0.9)
+        if label:
+            ax.text(
+                phase.start + (phase.end - phase.start) / 2,
+                104,
+                phase.name,
+                ha="center",
+                va="bottom",
+                fontsize=12,
+                color=color,
+            )
+
+
+def ns_to_datetime(wall_ns: int) -> datetime:
+    return datetime.fromtimestamp(wall_ns / 1_000_000_000)
+
+
+def ns_to_seconds(wall_ns: int) -> float:
+    return wall_ns / 1_000_000_000
+
+
+def read_timestamp_windows(path: Path, name: str) -> list[PhaseWindow]:
+    starts_by_key: dict[tuple[str, str, str], list[datetime]] = {}
+    windows = []
+    if not path.exists():
+        return windows
+
+    for jsonl_path in sorted(path.glob("*.jsonl")):
+        with jsonl_path.open() as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                record = json.loads(line)
+                if "wall_ns" not in record:
+                    continue
+                event = record.get("event")
+                if event not in {"start", "end"}:
+                    continue
+                key = (
+                    str(record.get("rank", jsonl_path.stem)),
+                    str(record.get("epoch", "")),
+                    str(record.get("chunk_step", "")),
+                )
+                timestamp = ns_to_datetime(int(record["wall_ns"]))
+                if event == "start":
+                    starts_by_key.setdefault(key, []).append(timestamp)
+                    continue
+                starts = starts_by_key.get(key)
+                if not starts:
+                    continue
+                start = starts.pop(0)
+                if timestamp <= start:
+                    continue
+                windows.append(
+                    PhaseWindow(
+                        name=name,
+                        start=start,
+                        end=timestamp,
+                        source=str(jsonl_path),
+                    )
+                )
+    return windows
+
+
+def read_rollout_detail_windows(run_dir: Path) -> list[PhaseWindow]:
+    windows = []
+    windows.extend(
+        read_timestamp_windows(
+            run_dir / "logs" / "rollout_generation_timestamps",
+            "Generation",
+        )
+    )
+    windows.extend(
+        read_timestamp_windows(
+            run_dir / "logs" / "env_sim_timestamps",
+            "Simulator",
+        )
+    )
+    return merge_detail_windows(windows)
+
+
+def resolve_plot_phases(
+    run_dir: Path,
+    phase_csv: Path | None,
+    times: np.ndarray,
+    p90_util: np.ndarray,
+) -> list[PhaseWindow]:
+    try:
+        return resolve_legacy_phases(run_dir, phase_csv, times, p90_util)
+    except (FileNotFoundError, ValueError):
+        return []
+
+
+def pair_process_windows(
+    path: Path,
+    phase: str,
+    start_event: str,
+    end_event: str,
+    pid_field: str,
+    key_fields: tuple[str, ...],
+) -> list[ProcessWindow]:
+    """Pair process timestamp start/end records into attributed windows."""
+    starts: dict[tuple[object, ...], deque[tuple[int, float]]] = defaultdict(deque)
+    windows = []
+    if not path.exists():
+        return windows
+
+    for jsonl_path in sorted(path.glob("*.jsonl")):
+        with jsonl_path.open() as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                record = json.loads(line)
+                event = record.get("event")
+                if event not in {start_event, end_event}:
+                    continue
+                if "wall_ns" not in record or pid_field not in record:
+                    continue
+                key = tuple(record.get(field, "") for field in key_fields)
+                pid = int(record[pid_field])
+                timestamp_s = ns_to_seconds(int(record["wall_ns"]))
+                if event == start_event:
+                    starts[key].append((pid, timestamp_s))
+                    continue
+                start_queue = starts.get(key)
+                if not start_queue:
+                    continue
+                start_pid, start_s = start_queue.popleft()
+                if timestamp_s <= start_s:
+                    continue
+                windows.append(
+                    ProcessWindow(
+                        phase=phase,
+                        pid=start_pid,
+                        start=datetime.fromtimestamp(start_s),
+                        end=datetime.fromtimestamp(timestamp_s),
+                    )
+                )
+    return windows
+
+
+def read_process_detail_windows(run_dir: Path) -> list[ProcessWindow]:
+    """Read Gen/Sim process windows, attributing simulator children to Sim."""
+    windows = []
+    windows.extend(
+        pair_process_windows(
+            run_dir / "logs" / "rollout_generation_timestamps",
+            "Generation",
+            "start",
+            "end",
+            "pid",
+            ("rank", "epoch", "chunk_step", "stage", "phase"),
+        )
+    )
+    sim_dir = run_dir / "logs" / "env_sim_timestamps"
+    windows.extend(
+        pair_process_windows(
+            sim_dir,
+            "Simulator",
+            "start",
+            "end",
+            "pid",
+            ("rank", "epoch", "chunk_step", "stage"),
+        )
+    )
+    windows.extend(
+        pair_process_windows(
+            sim_dir,
+            "Simulator",
+            "subenv_start",
+            "subenv_end",
+            "child_pid",
+            (
+                "rank",
+                "epoch",
+                "chunk_step",
+                "stage",
+                "vector_step",
+                "global_env",
+                "local_env",
+                "operation",
+            ),
+        )
+    )
+    return windows
+
+
+def merge_detail_windows(
+    windows: list[PhaseWindow],
+    max_gap_s: float = 0.10,
+) -> list[PhaseWindow]:
+    """Merge same-phase detail windows from multiple ranks into phase spans."""
+    merged = []
+    for name in sorted({window.name for window in windows}):
+        phase_windows = sorted(
+            [window for window in windows if window.name == name],
+            key=lambda window: (window.start, window.end),
+        )
+        if not phase_windows:
+            continue
+        current_start = phase_windows[0].start
+        current_end = phase_windows[0].end
+        sources = [phase_windows[0].source]
+        for window in phase_windows[1:]:
+            gap_s = (window.start - current_end).total_seconds()
+            if gap_s <= max_gap_s:
+                current_end = max(current_end, window.end)
+                sources.append(window.source)
+                continue
+            merged.append(
+                PhaseWindow(
+                    name=name,
+                    start=current_start,
+                    end=current_end,
+                    source=";".join(sorted(set(sources))),
+                )
+            )
+            current_start = window.start
+            current_end = window.end
+            sources = [window.source]
+        merged.append(
+            PhaseWindow(
+                name=name,
+                start=current_start,
+                end=current_end,
+                source=";".join(sorted(set(sources))),
+            )
+        )
+    return sorted(merged, key=lambda window: (window.start, window.end, window.name))
+
+
+def summarize_detail_cpu_util(
+    times: np.ndarray,
+    util: np.ndarray,
+    detail_windows: list[PhaseWindow],
+    window: tuple[datetime, datetime],
+) -> dict[str, float]:
+    """Compute weighted CPU utilization means for rollout detail phases."""
+    if len(times) < 2:
+        return {}
+
+    window_start_s = window[0].timestamp()
+    window_end_s = window[1].timestamp()
+    sample_edges = np.concatenate(
+        [
+            times[:1],
+            (times[:-1] + times[1:]) / 2,
+            times[-1:],
+        ]
+    )
+    weighted_totals: dict[str, float] = {}
+    weights: dict[str, float] = {}
+
+    for detail_window in detail_windows:
+        detail_start_s = max(detail_window.start.timestamp(), window_start_s)
+        detail_end_s = min(detail_window.end.timestamp(), window_end_s)
+        if detail_end_s <= detail_start_s:
+            continue
+        for idx, value in enumerate(util):
+            if not np.isfinite(value):
+                continue
+            overlap_start = max(float(sample_edges[idx]), detail_start_s)
+            overlap_end = min(float(sample_edges[idx + 1]), detail_end_s)
+            overlap_s = overlap_end - overlap_start
+            if overlap_s <= 0:
+                continue
+            weighted_totals[detail_window.name] = (
+                weighted_totals.get(detail_window.name, 0.0)
+                + float(value) * overlap_s
+            )
+            weights[detail_window.name] = weights.get(detail_window.name, 0.0) + overlap_s
+
+    return {
+        name: weighted_total / weights[name]
+        for name, weighted_total in weighted_totals.items()
+        if weights.get(name, 0.0) > 0
+    }
+
+
+def summarize_detail_cpu_load(
+    times: np.ndarray,
+    util: np.ndarray,
+    detail_windows: list[PhaseWindow],
+    window: tuple[datetime, datetime],
+) -> dict[str, float]:
+    """Compute CPU utilization area for rollout detail phases."""
+    if len(times) < 2:
+        return {}
+
+    window_start_s = window[0].timestamp()
+    window_end_s = window[1].timestamp()
+    sample_edges = np.concatenate(
+        [
+            times[:1],
+            (times[:-1] + times[1:]) / 2,
+            times[-1:],
+        ]
+    )
+    loads: dict[str, float] = {}
+    for detail_window in detail_windows:
+        detail_start_s = max(detail_window.start.timestamp(), window_start_s)
+        detail_end_s = min(detail_window.end.timestamp(), window_end_s)
+        if detail_end_s <= detail_start_s:
+            continue
+        for idx, value in enumerate(util):
+            if not np.isfinite(value):
+                continue
+            overlap_start = max(float(sample_edges[idx]), detail_start_s)
+            overlap_end = min(float(sample_edges[idx + 1]), detail_end_s)
+            overlap_s = overlap_end - overlap_start
+            if overlap_s <= 0:
+                continue
+            loads[detail_window.name] = (
+                loads.get(detail_window.name, 0.0) + float(value) * overlap_s
+            )
+    return loads
+
+
+def merge_second_intervals(
+    intervals: list[tuple[float, float]],
+    max_gap_s: float = 0.0,
+) -> list[tuple[float, float]]:
+    if not intervals:
+        return []
+    sorted_intervals = sorted(intervals)
+    merged = [list(sorted_intervals[0])]
+    for start_s, end_s in sorted_intervals[1:]:
+        if start_s <= merged[-1][1] + max_gap_s:
+            merged[-1][1] = max(merged[-1][1], end_s)
+            continue
+        merged.append([start_s, end_s])
+    return [(start_s, end_s) for start_s, end_s in merged]
+
+
+def add_weighted_interval_to_bins(
+    totals: dict[int, float],
+    start_s: float,
+    end_s: float,
+    value: float,
+    bin_s: float,
+) -> None:
+    current_s = start_s
+    while current_s < end_s:
+        bin_id = int(np.floor(current_s / bin_s))
+        bin_end_s = min(end_s, (bin_id + 1) * bin_s)
+        if bin_end_s <= current_s:
+            bin_end_s = end_s
+        overlap_s = bin_end_s - current_s
+        totals[bin_id] = totals.get(bin_id, 0.0) + value * overlap_s
+        current_s = bin_end_s
+
+
+def add_interval_weight_to_bins(
+    weights: dict[int, float],
+    start_s: float,
+    end_s: float,
+    bin_s: float,
+) -> None:
+    current_s = start_s
+    while current_s < end_s:
+        bin_id = int(np.floor(current_s / bin_s))
+        bin_end_s = min(end_s, (bin_id + 1) * bin_s)
+        if bin_end_s <= current_s:
+            bin_end_s = end_s
+        weights[bin_id] = weights.get(bin_id, 0.0) + bin_end_s - current_s
+        current_s = bin_end_s
+
+
+def find_overlaps(
+    start_s: float,
+    end_s: float,
+    windows: list[tuple[float, float]],
+    cursor: int,
+) -> tuple[list[tuple[float, float]], int]:
+    while cursor < len(windows) and windows[cursor][1] <= start_s:
+        cursor += 1
+    overlaps = []
+    idx = cursor
+    while idx < len(windows) and windows[idx][0] < end_s:
+        overlap_start = max(start_s, windows[idx][0])
+        overlap_end = min(end_s, windows[idx][1])
+        if overlap_end > overlap_start:
+            overlaps.append((overlap_start, overlap_end))
+        idx += 1
+    return overlaps, cursor
+
+
+def compute_process_phase_cpu_series(
+    raw_cpu_path: Path,
+    process_windows: list[ProcessWindow],
+    bin_s: float = 1.0,
+    clock_ticks_per_second: int | None = None,
+) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+    """Build total process-attributed CPU utilization series by phase.
+
+    Values use ``100% == one fully busy CPU core``.
+    """
+    if not process_windows or not raw_cpu_path.exists():
+        return {}
+
+    clock_ticks_per_second = (
+        clock_ticks_per_second
+        if clock_ticks_per_second is not None
+        else os.sysconf(os.sysconf_names["SC_CLK_TCK"])
+    )
+    phase_pid_windows: dict[str, dict[int, list[tuple[float, float]]]] = {}
+    target_pids = set()
+    for window in process_windows:
+        target_pids.add(window.pid)
+        phase_pid_windows.setdefault(window.phase, {}).setdefault(window.pid, []).append(
+            (window.start.timestamp(), window.end.timestamp())
+        )
+    for phase, by_pid in phase_pid_windows.items():
+        phase_pid_windows[phase] = {
+            pid: merge_second_intervals(intervals)
+            for pid, intervals in by_pid.items()
+        }
+
+    totals: dict[str, dict[int, float]] = defaultdict(dict)
+    weights: dict[str, dict[int, float]] = defaultdict(dict)
+    cursors: dict[tuple[str, int], int] = defaultdict(int)
+    previous_timestamps: dict[int, float] = {}
+    seen_samples: set[tuple[int, float]] = set()
+    phase_wall_intervals: dict[str, list[tuple[float, float]]] = defaultdict(list)
+    for window in process_windows:
+        phase_wall_intervals[window.phase].append(
+            (window.start.timestamp(), window.end.timestamp())
+        )
+    for phase, intervals in phase_wall_intervals.items():
+        for start_s, end_s in merge_second_intervals(intervals, max_gap_s=0.10):
+            add_interval_weight_to_bins(weights[phase], start_s, end_s, bin_s)
+
+    with raw_cpu_path.open(newline="") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            try:
+                pid = int(row["pid"])
+                timestamp_s = float(row["timestamp"])
+                proc_delta_jiffies = float(row["proc_delta_jiffies"])
+            except (KeyError, ValueError):
+                continue
+            if pid not in target_pids:
+                continue
+            sample_key = (pid, timestamp_s)
+            if sample_key in seen_samples:
+                continue
+            seen_samples.add(sample_key)
+
+            previous_timestamp_s = previous_timestamps.get(pid)
+            previous_timestamps[pid] = timestamp_s
+            if previous_timestamp_s is None or timestamp_s <= previous_timestamp_s:
+                continue
+            elapsed_s = timestamp_s - previous_timestamp_s
+            cpu_percent = (
+                100.0 * proc_delta_jiffies / clock_ticks_per_second / elapsed_s
+            )
+            if cpu_percent < 0 or not np.isfinite(cpu_percent):
+                continue
+
+            for phase, by_pid in phase_pid_windows.items():
+                windows = by_pid.get(pid)
+                if not windows:
+                    continue
+                cursor_key = (phase, pid)
+                overlaps, cursor = find_overlaps(
+                    previous_timestamp_s,
+                    timestamp_s,
+                    windows,
+                    cursors[cursor_key],
+                )
+                cursors[cursor_key] = cursor
+                for overlap_start_s, overlap_end_s in overlaps:
+                    add_weighted_interval_to_bins(
+                        totals[phase],
+                        overlap_start_s,
+                        overlap_end_s,
+                        cpu_percent,
+                        bin_s,
+                    )
+
+    series = {}
+    for phase in ("Generation", "Simulator"):
+        phase_totals = totals.get(phase)
+        phase_weights = weights.get(phase)
+        if not phase_totals or not phase_weights:
+            continue
+        bin_ids = np.array(sorted(phase_totals), dtype=int)
+        values = np.array(
+            [
+                phase_totals[int(bin_id)] / phase_weights[int(bin_id)]
+                for bin_id in bin_ids
+                if phase_weights.get(int(bin_id), 0.0) > 0
+            ],
+            dtype=float,
+        )
+        valid_bin_ids = np.array(
+            [
+                int(bin_id)
+                for bin_id in bin_ids
+                if phase_weights.get(int(bin_id), 0.0) > 0
+            ],
+            dtype=float,
+        )
+        if len(values) == 0:
+            continue
+        series[phase] = ((valid_bin_ids + 0.5) * bin_s, values)
+    return series
+
+
+def read_cached_process_phase_cpu_series(
+    cache_path: Path,
+) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+    rows_by_phase: dict[str, list[tuple[float, float]]] = defaultdict(list)
+    with cache_path.open(newline="") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            try:
+                rows_by_phase[row["phase"]].append(
+                    (float(row["timestamp"]), float(row["cpu_percent"]))
+                )
+            except (KeyError, ValueError):
+                continue
+    return {
+        phase: (
+            np.array([timestamp for timestamp, _value in rows], dtype=float),
+            np.array([value for _timestamp, value in rows], dtype=float),
+        )
+        for phase, rows in rows_by_phase.items()
+        if rows
+    }
+
+
+def write_cached_process_phase_cpu_series(
+    cache_path: Path,
+    series: dict[str, tuple[np.ndarray, np.ndarray]],
+) -> None:
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    with cache_path.open("w", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=["timestamp", "datetime", "phase", "cpu_percent"],
+        )
+        writer.writeheader()
+        for phase in ("Generation", "Simulator"):
+            if phase not in series:
+                continue
+            timestamps, values = series[phase]
+            for timestamp_s, value in zip(timestamps, values, strict=True):
+                writer.writerow(
+                    {
+                        "timestamp": f"{timestamp_s:.6f}",
+                        "datetime": datetime.fromtimestamp(float(timestamp_s)).strftime(
+                            "%Y-%m-%d %H:%M:%S.%f"
+                        )[:-3],
+                        "phase": phase,
+                        "cpu_percent": f"{float(value):.6f}",
+                    }
+                )
+
+
+def read_process_phase_cpu_series(
+    run_dir: Path,
+    bin_s: float,
+    rebuild_cache: bool,
+) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+    cache_path = run_dir / "cpu" / f"process_phase_cpu_{bin_s:g}s.csv"
+    if cache_path.exists() and not rebuild_cache:
+        return read_cached_process_phase_cpu_series(cache_path)
+
+    series = compute_process_phase_cpu_series(
+        run_dir / "cpu" / "worker_cpu_core_util.csv",
+        read_process_detail_windows(run_dir),
+        bin_s=bin_s,
+    )
+    write_cached_process_phase_cpu_series(cache_path, series)
+    return series
+
+
+def build_process_phase_timeline_points(
+    process_cpu_series: dict[str, tuple[np.ndarray, np.ndarray]],
+    window: tuple[datetime, datetime],
+) -> list[tuple[str, datetime, float]]:
+    """Merge Gen/Sim process CPU samples into one time-ordered sequence."""
+    window_start_s = window[0].timestamp()
+    window_end_s = window[1].timestamp()
+    points = []
+    phase_order = {"Generation": 0, "Simulator": 1}
+    for phase in ("Generation", "Simulator"):
+        series = process_cpu_series.get(phase)
+        if series is None:
+            continue
+        phase_times, phase_values = series
+        mask = (
+            (phase_times >= window_start_s)
+            & (phase_times <= window_end_s)
+            & np.isfinite(phase_values)
+        )
+        for timestamp_s, value in zip(phase_times[mask], phase_values[mask], strict=True):
+            points.append((phase, datetime.fromtimestamp(float(timestamp_s)), float(value)))
+    return sorted(
+        points,
+        key=lambda point: (point[1], phase_order.get(point[0], 99)),
+    )
+
+
+def build_process_phase_line_series(
+    process_cpu_series: dict[str, tuple[np.ndarray, np.ndarray]],
+    window: tuple[datetime, datetime],
+) -> dict[str, tuple[list[datetime], np.ndarray]]:
+    """Build per-phase process CPU samples inside a plotting window."""
+    window_start_s = window[0].timestamp()
+    window_end_s = window[1].timestamp()
+    phase_series = {}
+    for phase in ("Generation", "Simulator"):
+        series = process_cpu_series.get(phase)
+        if series is None:
+            continue
+        phase_times, phase_values = series
+        mask = (
+            (phase_times >= window_start_s)
+            & (phase_times <= window_end_s)
+            & np.isfinite(phase_values)
+        )
+        if not np.any(mask):
+            continue
+        phase_series[phase] = (
+            [datetime.fromtimestamp(float(timestamp_s)) for timestamp_s in phase_times[mask]],
+            np.asarray(phase_values[mask], dtype=float),
+        )
+    return phase_series
+
+
+def compute_detail_points(
+    times: np.ndarray,
+    util: np.ndarray,
+    detail_windows: list[PhaseWindow],
+    window: tuple[datetime, datetime],
+) -> list[tuple[str, datetime, float]]:
+    """Compute one representative CPU-utilization point per detail phase."""
+    if len(times) < 2:
+        return []
+
+    window_start_s = window[0].timestamp()
+    window_end_s = window[1].timestamp()
+    sample_edges = np.concatenate(
+        [
+            times[:1],
+            (times[:-1] + times[1:]) / 2,
+            times[-1:],
+        ]
+    )
+    center_totals: dict[str, float] = {}
+    duration_weights: dict[str, float] = {}
+    util_totals: dict[str, float] = {}
+    util_weights: dict[str, float] = {}
+
+    for detail_window in merge_detail_windows(detail_windows):
+        detail_start_s = max(detail_window.start.timestamp(), window_start_s)
+        detail_end_s = min(detail_window.end.timestamp(), window_end_s)
+        if detail_end_s <= detail_start_s:
+            continue
+
+        duration_s = detail_end_s - detail_start_s
+        center_s = (detail_start_s + detail_end_s) / 2
+        center_totals[detail_window.name] = (
+            center_totals.get(detail_window.name, 0.0) + center_s * duration_s
+        )
+        duration_weights[detail_window.name] = (
+            duration_weights.get(detail_window.name, 0.0) + duration_s
+        )
+
+        for idx, value in enumerate(util):
+            if not np.isfinite(value):
+                continue
+            overlap_start = max(float(sample_edges[idx]), detail_start_s)
+            overlap_end = min(float(sample_edges[idx + 1]), detail_end_s)
+            overlap_s = overlap_end - overlap_start
+            if overlap_s <= 0:
+                continue
+            util_totals[detail_window.name] = (
+                util_totals.get(detail_window.name, 0.0) + float(value) * overlap_s
+            )
+            util_weights[detail_window.name] = (
+                util_weights.get(detail_window.name, 0.0) + overlap_s
+            )
+
+    phase_order = ["Generation", "Simulator"]
+    phase_order.extend(
+        sorted(name for name in duration_weights if name not in phase_order)
+    )
+    points = []
+    for name in phase_order:
+        if duration_weights.get(name, 0.0) <= 0 or util_weights.get(name, 0.0) <= 0:
+            continue
+        points.append(
+            (
+                name,
+                datetime.fromtimestamp(center_totals[name] / duration_weights[name]),
+                util_totals[name] / util_weights[name],
+            )
+        )
+    return points
+
+
+def draw_rollout_note(ax: plt.Axes, phases: list[PhaseWindow]) -> None:
+    del ax, phases
+
+
+def set_common_axis(
+    axes: list[plt.Axes],
+    start: datetime,
+    end: datetime,
+    x_pad_s: float,
+) -> None:
+    x_pad = timedelta(seconds=x_pad_s)
+    for ax in axes:
+        ax.set_xlim(start - x_pad, end + x_pad)
+        ax.set_ylim(0, 110)
+        ax.grid(axis="y", linestyle="--", linewidth=0.5, color="gray", alpha=0.55)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.tick_params(axis="both", which="both", length=0)
+        ax.xaxis.set_major_locator(mdates.MinuteLocator(interval=5))
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+
+
+def select_cpu_inset_window(
+    times: np.ndarray,
+    mean_util: np.ndarray,
+    phases: list[PhaseWindow],
+    detail_windows: list[PhaseWindow] | None = None,
+    window_s: float = 8.0,
+    process_cpu_series: dict[str, tuple[np.ndarray, np.ndarray]] | None = None,
+) -> tuple[datetime, datetime] | None:
+    """Select a short high-variation CPU interval for the inset panel."""
+    finite = np.isfinite(times) & np.isfinite(mean_util)
+    if np.count_nonzero(finite) < 2:
+        return None
+
+    valid_times = times[finite]
+    valid_util = mean_util[finite]
+    if valid_times[-1] <= valid_times[0]:
+        return None
+
+    window_s = min(window_s, float(valid_times[-1] - valid_times[0]))
+    if window_s <= 0:
+        return None
+
+    if process_cpu_series:
+        gen_series = process_cpu_series.get("Generation")
+        sim_series = process_cpu_series.get("Simulator")
+        if gen_series is not None and sim_series is not None:
+            gen_times, gen_values = gen_series
+            sim_times, sim_values = sim_series
+            candidate_starts = np.unique(
+                np.concatenate(
+                    [
+                        gen_times[
+                            (gen_times >= valid_times[0])
+                            & (gen_times <= valid_times[-1] - window_s)
+                        ],
+                        sim_times[
+                            (sim_times >= valid_times[0])
+                            & (sim_times <= valid_times[-1] - window_s)
+                        ],
+                    ]
+                )
+            )
+            best_window: tuple[datetime, datetime] | None = None
+            best_score = -np.inf
+            for start_s in candidate_starts:
+                end_s = float(start_s + window_s)
+                gen_mask = (gen_times >= start_s) & (gen_times <= end_s)
+                sim_mask = (sim_times >= start_s) & (sim_times <= end_s)
+                if np.count_nonzero(gen_mask) < 2 or np.count_nonzero(sim_mask) < 2:
+                    continue
+                gen_mean = float(np.nanmean(gen_values[gen_mask]))
+                sim_mean = float(np.nanmean(sim_values[sim_mask]))
+                score = sim_mean - gen_mean
+                if score > best_score:
+                    best_score = score
+                    best_window = (
+                        datetime.fromtimestamp(float(start_s)),
+                        datetime.fromtimestamp(end_s),
+                    )
+            if best_window is not None:
+                return best_window
+
+    if detail_windows:
+        detail_windows = merge_detail_windows(detail_windows)
+        gen_windows = [
+            detail_window
+            for detail_window in detail_windows
+            if detail_window.name == "Generation"
+        ]
+        sim_windows = [
+            detail_window
+            for detail_window in detail_windows
+            if detail_window.name == "Simulator"
+        ]
+        best_detail_window: tuple[datetime, datetime] | None = None
+        best_detail_score = -np.inf
+        for gen_window in gen_windows:
+            for sim_window in sim_windows:
+                pair_start = min(gen_window.start, sim_window.start)
+                pair_end = max(gen_window.end, sim_window.end)
+                pair_duration_s = (pair_end - pair_start).total_seconds()
+                if pair_duration_s > window_s:
+                    continue
+                center = pair_start + (pair_end - pair_start) / 2
+                start_s = max(
+                    float(valid_times[0]),
+                    min(
+                        center.timestamp() - window_s / 2,
+                        float(valid_times[-1] - window_s),
+                    ),
+                )
+                candidate = (
+                    datetime.fromtimestamp(start_s),
+                    datetime.fromtimestamp(start_s + window_s),
+                )
+                stats = summarize_detail_cpu_util(
+                    valid_times,
+                    valid_util,
+                    [gen_window, sim_window],
+                    candidate,
+                )
+                if "Generation" not in stats or "Simulator" not in stats:
+                    continue
+                score = abs(stats["Simulator"] - stats["Generation"])
+                if score > best_detail_score:
+                    best_detail_score = score
+                    best_detail_window = candidate
+        if best_detail_window is not None:
+            return best_detail_window
+
+    rollout_phases = [phase for phase in phases if phase.name == "Rollout"]
+    phase_ranges = [
+        (phase.start.timestamp(), phase.end.timestamp()) for phase in rollout_phases
+    ]
+    if not phase_ranges:
+        phase_ranges = [(float(valid_times[0]), float(valid_times[-1]))]
+
+    best_start: float | None = None
+    best_score = -np.inf
+    for range_start, range_end in phase_ranges:
+        range_start = max(range_start, float(valid_times[0]))
+        range_end = min(range_end, float(valid_times[-1]))
+        if range_end - range_start < window_s:
+            continue
+        candidate_starts = valid_times[
+            (valid_times >= range_start) & (valid_times <= range_end - window_s)
+        ]
+        for start_s in candidate_starts:
+            end_s = start_s + window_s
+            window_mask = (valid_times >= start_s) & (valid_times <= end_s)
+            if np.count_nonzero(window_mask) < 2:
+                continue
+            window_util = valid_util[window_mask]
+            spread = np.nanpercentile(window_util, 90) - np.nanpercentile(window_util, 10)
+            local_change = np.nanmean(np.abs(np.diff(window_util)))
+            score = float(spread + 0.5 * local_change)
+            if score > best_score:
+                best_score = score
+                best_start = float(start_s)
+
+    if best_start is None:
+        return None
+    return (
+        datetime.fromtimestamp(best_start),
+        datetime.fromtimestamp(best_start + window_s),
+    )
+
+
+def draw_cpu_inset(
+    ax: plt.Axes,
+    window: tuple[datetime, datetime],
+    detail_windows: list[PhaseWindow],
+    process_cpu_series: dict[str, tuple[np.ndarray, np.ndarray]],
+) -> None:
+    """Draw process-attributed Gen/Sim worker CPU traces inside CPU axes."""
+    if not hasattr(ax, "inset_axes"):
+        return
+
+    del detail_windows
+    phase_series = build_process_phase_line_series(process_cpu_series, window)
+    if "Generation" not in phase_series or "Simulator" not in phase_series:
+        return
+
+    inset_ax = ax.inset_axes([0.47, 0.18, 0.49, 0.58])
+    draw_process_cpu_window(inset_ax, window, phase_series, compact=True)
+    ax.indicate_inset_zoom(inset_ax, edgecolor="black", linewidth=0.7, alpha=0.8)
+
+
+def draw_process_cpu_window(
+    ax: plt.Axes,
+    window: tuple[datetime, datetime],
+    phase_series: dict[str, tuple[list[datetime], np.ndarray]],
+    *,
+    compact: bool,
+) -> None:
+    """Draw per-worker process CPU traces for a selected short window."""
+    tick_fontsize = 7 if compact else 10
+    label_fontsize = 10 if compact else 15
+    legend_fontsize = 12 if compact else 15
+    line_width = 0.95 if compact else 1.8
+    marker_size = 3.2 if compact else 5.2
+
+    window_start, window_end = window
+    y_values = np.concatenate([values for _times, values in phase_series.values()])
+    y_low = float(np.nanmin(y_values))
+    y_high = float(np.nanmax(y_values))
+    y_pad = max(80.0, (y_high - y_low) * 0.16)
+    y_min = max(0.0, y_low - y_pad)
+    y_max = y_high + y_pad
+    if y_max <= y_min:
+        y_min, y_max = 0.0, 100.0
+    ax.set_xlim(window_start, window_end)
+    ax.set_ylim(y_min, y_max)
+
+    colors = {"Generation": "#9DBDFF", "Simulator": "#EA5455"}
+    labels = {"Generation": "Gen", "Simulator": "Sim"}
+    for phase in ("Generation", "Simulator"):
+        series = phase_series.get(phase)
+        if series is None:
+            continue
+        phase_x, phase_y = series
+        mean_cpu = float(np.nanmean(phase_y))
+        ax.plot(
+            phase_x,
+            phase_y,
+            color=colors[phase],
+            linewidth=line_width,
+            marker="o",
+            markersize=marker_size,
+            markeredgecolor="black",
+            markeredgewidth=0.35 if compact else 0.5,
+            alpha=0.95,
+            label=f"{labels[phase]}: {mean_cpu:.0f}%",
+            zorder=7 if phase == "Simulator" else 6,
+        )
+
+    ax.grid(axis="y", linestyle="--", linewidth=0.4, color="gray", alpha=0.45)
+    ax.xaxis.set_major_locator(mdates.SecondLocator(interval=2))
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%S"))
+    ax.tick_params(
+        axis="both",
+        labelsize=tick_fontsize,
+        length=0 if compact else 3,
+        pad=1 if compact else 2,
+    )
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.set_ylabel("CPU %", fontsize=label_fontsize, labelpad=1 if compact else 4)
+    # if not compact:
+    #     ax.set_xlabel("Wall-clock second", fontsize=9, labelpad=3)
+    legend = ax.legend(
+        ncol=1,
+        fontsize=legend_fontsize,
+        handletextpad=0.25,
+        handlelength=1.2 if compact else 1.0,
+        labelspacing=0.2 if compact else 0.1,
+        loc="center",
+        bbox_to_anchor=(0.5, 0.44),
+        frameon=compact,
+        framealpha=0.88 if compact else 0.0,
+        fancybox=False,
+        borderpad=0.24 if compact else 0.3,
+    )
+    if compact:
+        legend.get_frame().set_edgecolor("black")
+        legend.get_frame().set_linewidth(0.5)
+
+
+def save_cpu_inset_svg(
+    output_path: Path,
+    window: tuple[datetime, datetime],
+    process_cpu_series: dict[str, tuple[np.ndarray, np.ndarray]],
+) -> Path | None:
+    """Save the selected process CPU inset as a standalone SVG."""
+    phase_series = build_process_phase_line_series(process_cpu_series, window)
+    if "Generation" not in phase_series or "Simulator" not in phase_series:
+        return None
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig, ax = plt.subplots(figsize=(3.0, 1))
+    fig.patch.set_alpha(0.0)
+    ax.patch.set_alpha(0.0)
+    draw_process_cpu_window(ax, window, phase_series, compact=False)
+    fig.savefig(output_path, bbox_inches="tight", transparent=True)
+    plt.close(fig)
+    return output_path
+
+
+def draw_cpu_panel(
+    ax: plt.Axes,
+    times: np.ndarray,
+    mean_util: np.ndarray,
+    p90_util: np.ndarray,
+    max_util: np.ndarray,
+    phases: list[PhaseWindow],
+    smooth_window_s: float,
+    detail_windows: list[PhaseWindow],
+    process_cpu_series: dict[str, tuple[np.ndarray, np.ndarray]] | None = None,
+    component_cpu_series: dict[str, tuple[np.ndarray, np.ndarray]] | None = None,
+    ylabel: str = "CPU Util. (%)",
+    line_label: str = "Mean",
+    draw_inset: bool = True,
+) -> tuple[datetime, datetime] | None:
+    process_cpu_series = process_cpu_series or {}
+    component_cpu_series = component_cpu_series or {}
+    x_values = np.array([datetime.fromtimestamp(float(timestamp)) for timestamp in times])
+    mean_smooth = smooth_series(times, mean_util, smooth_window_s)
+    inset_window = None
+    if draw_inset:
+        inset_window = select_cpu_inset_window(
+            times,
+            mean_util,
+            phases,
+            detail_windows,
+            process_cpu_series=process_cpu_series,
+        )
+
+    line_width = 1.0
+    # ax.plot(
+    #     x_values,
+    #     p90_smooth,
+    #     color="#EA5455",
+    #     linewidth=line_width,
+    #     alpha=0.95,
+    #     label="P90",
+    #     zorder=5,
+    # )
+    ax.plot(
+        x_values,
+        mean_smooth,
+        color="#2D4059",
+        linewidth=line_width,
+        alpha=0.65,
+        label=line_label,
+        zorder=3,
+    )
+    component_colors = {
+        "training": "#EA5455",
+        "generation": "#9DBDFF",
+        "env": "#76BA99",
+        "main": "#FFD460",
+        "other": "darkgray",
+    }
+    component_labels = {
+        "training": "Train CPU",
+        "generation": "Gen CPU",
+        "env": "Env CPU",
+        "main": "Main CPU",
+        "other": "Other CPU",
+    }
+    component_order = {"training": 0, "generation": 1, "env": 2, "main": 3, "other": 4}
+    for component, (component_times, component_values) in sorted(
+        component_cpu_series.items(),
+        key=lambda item: (component_order.get(item[0], 99), item[0]),
+    ):
+        if len(component_times) == 0:
+            continue
+        component_x = np.array(
+            [datetime.fromtimestamp(float(timestamp)) for timestamp in component_times]
+        )
+        component_smooth = smooth_series(
+            component_times,
+            component_values,
+            smooth_window_s,
+        )
+        ax.plot(
+            component_x,
+            component_smooth,
+            color=component_colors.get(component, "#16A3A6"),
+            linewidth=0.75,
+            alpha=0.72,
+            label=component_labels.get(component, component),
+            zorder=4,
+        )
+    if inset_window is not None:
+        draw_cpu_inset(
+            ax,
+            inset_window,
+            detail_windows,
+            process_cpu_series,
+        )
+    # ax.plot(
+    #     x_values,
+    #     max_smooth,
+    #     color="#16A3A6",
+    #     linewidth=line_width,
+    #     alpha=0.65,
+    #     label="Max",
+    #     zorder=2,
+    # )
+    draw_phase_markers(ax, phases, label=True)
+    ax.set_ylabel(ylabel)
+    legend = ax.legend(
+        ncol=1,
+        fontsize=8,
+        handletextpad=0.35,
+        handlelength=1.2,
+        labelspacing=0.2,
+        loc="upper left",
+        frameon=True,
+        framealpha=0.92,
+        fancybox=False,
+        borderpad=0.25,
+    )
+    legend.get_frame().set_edgecolor("black")
+    legend.get_frame().set_linewidth(0.6)
+    return inset_window
+
+
+def draw_gpu_panel(
+    ax: plt.Axes,
+    times: list[datetime],
+    gpus: list[int],
+    util: np.ndarray,
+    phases: list[PhaseWindow],
+    smooth_window_s: float,
+    smooth_mode: str,
+    smooth_quantile: float,
+    gpu_roles: dict[int, str] | None = None,
+) -> None:
+    gpu_roles = gpu_roles or {}
+    colors = [
+        "#2D4059",
+        "#EA5455",
+        "#76BA99",
+        "#FFD460",
+        "#16A3A6",
+        "#9DBDFF",
+        "#8E7DBE",
+        "#F08A5D",
+    ]
+    plot_util = smooth_utilization(
+        times,
+        util,
+        smooth_window_s,
+        mode=smooth_mode,
+        quantile=smooth_quantile,
+    )
+    mean_util = np.nanmean(plot_util, axis=1)
+    x_values = np.array(times)
+    ax.fill_between(x_values, mean_util, color="#EA5455", alpha=0.16, zorder=1)
+    for idx, gpu in enumerate(gpus):
+        role = gpu_roles.get(gpu)
+        label = f"GPU {gpu} {role}" if role else f"GPU {gpu}"
+        ax.plot(
+            x_values,
+            plot_util[:, idx],
+            color=colors[idx % len(colors)],
+            linewidth=0.9 if smooth_window_s > 0 else 0.65,
+            alpha=0.72 if smooth_window_s > 0 else 0.55,
+            zorder=3,
+            label=label,
+        )
+    draw_phase_markers(ax, phases, label=False)
+    draw_rollout_note(ax, phases)
+    ax.set_ylabel("GPU Util. (%)")
+    ax.set_xlabel("Wall-clock Time")
+    legend = ax.legend(
+        ncol=min(2, max(1, len(gpus))),
+        fontsize=8,
+        handletextpad=0.35,
+        handlelength=1.2,
+        labelspacing=0.2,
+        loc="upper left",
+        frameon=True,
+        framealpha=0.92,
+        fancybox=False,
+        borderpad=0.25,
+    )
+    legend.get_frame().set_edgecolor("black")
+    legend.get_frame().set_linewidth(0.6)
+
+
+def plot_cpu_gpu_util(
+    run_dir: Path,
+    output_prefix: Path,
+    cpu_csv: Path | None,
+    gpu_csv: Path | None,
+    cpu_smooth_window_s: float,
+    gpu_smooth_window_s: float,
+    gpu_smooth_mode: str,
+    gpu_smooth_quantile: float,
+    x_pad_s: float,
+    fig_width: float,
+    fig_height: float,
+    bin_s: float,
+    cache_prefix: Path | None,
+    phase_csv: Path | None,
+    rebuild_cache: bool,
+    num_cpus: int | None,
+    cpu_unit: str,
+    parallel_workers: int,
+    component_lines: bool,
+    draw_cpu_inset_panel: bool,
+    gpu_roles: dict[int, str],
+) -> None:
+    cpu_series = read_cpu_timeline_series(
+        run_dir,
+        cpu_csv=cpu_csv,
+        cache_prefix=cache_prefix,
+        bin_s=bin_s,
+        rebuild_cache=rebuild_cache,
+        num_cpus=num_cpus,
+        cpu_unit=cpu_unit,
+        parallel_workers=parallel_workers,
+        component_lines=component_lines,
+    )
+    if len(cpu_series.times) == 0:
+        raise ValueError("CPU timeline is empty")
+
+    phases = resolve_plot_phases(run_dir, phase_csv, cpu_series.times, cpu_series.p90)
+    detail_windows = read_rollout_detail_windows(run_dir)
+    process_cpu_series = (
+        read_process_phase_cpu_series(run_dir, bin_s, rebuild_cache)
+        if draw_cpu_inset_panel and (run_dir / "cpu" / "worker_cpu_core_util.csv").exists()
+        else {}
+    )
+    gpu_times, gpus, gpu_util = read_gpu_samples(resolve_gpu_csv(run_dir, gpu_csv))
+    if not gpu_times:
+        raise ValueError("GPU timeline is empty")
+
+    plt.rcParams.update(
+        {
+            "font.family": FONT_FAMILY,
+            "font.size": 12,
+            "axes.linewidth": 1.0,
+            "pdf.fonttype": 42,
+            "ps.fonttype": 42,
+        }
+    )
+    fig, axes = plt.subplots(
+        2,
+        1,
+        figsize=(fig_width, fig_height),
+        sharex=True,
+        gridspec_kw={"hspace": 0.08},
+    )
+    inset_window = draw_cpu_panel(
+        axes[0],
+        cpu_series.times,
+        cpu_series.total,
+        cpu_series.p90,
+        cpu_series.max_value,
+        phases,
+        smooth_window_s=cpu_smooth_window_s,
+        detail_windows=detail_windows,
+        process_cpu_series=process_cpu_series,
+        component_cpu_series=cpu_series.components,
+        ylabel=cpu_series.ylabel,
+        line_label=cpu_series.line_label,
+        draw_inset=draw_cpu_inset_panel,
+    )
+    draw_gpu_panel(
+        axes[1],
+        gpu_times,
+        gpus,
+        gpu_util,
+        phases,
+        smooth_window_s=gpu_smooth_window_s,
+        smooth_mode=gpu_smooth_mode,
+        smooth_quantile=gpu_smooth_quantile,
+        gpu_roles=gpu_roles,
+    )
+
+    x_start = min(datetime.fromtimestamp(float(cpu_series.times[0])), gpu_times[0])
+    x_end = max(datetime.fromtimestamp(float(cpu_series.times[-1])), gpu_times[-1])
+    set_common_axis(list(axes), x_start, x_end, x_pad_s)
+    axes[0].tick_params(labelbottom=False)
+    fig.autofmt_xdate(rotation=0)
+    fig.subplots_adjust(left=0.18, right=0.98, top=0.92, bottom=0.16, hspace=0.08)
+
+    output_prefix.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_prefix.with_suffix(".pdf"), bbox_inches="tight")
+    fig.savefig(output_prefix.with_suffix(".svg"), bbox_inches="tight")
+    fig.savefig(output_prefix.with_suffix(".png"), dpi=240, bbox_inches="tight")
+    plt.close(fig)
+    inset_svg_path = None
+    if inset_window is not None:
+        inset_svg_path = save_cpu_inset_svg(
+            output_prefix.parent / f"{output_prefix.name}_cpu_inset.svg",
+            inset_window,
+            process_cpu_series,
+        )
+    print(f"Read CPU cache {cpu_series.summary_path}")
+    if cpu_series.component_path is not None:
+        print(f"Read CPU component cache {cpu_series.component_path}")
+    print(f"Wrote {output_prefix.with_suffix('.pdf')}")
+    print(f"Wrote {output_prefix.with_suffix('.svg')}")
+    print(f"Wrote {output_prefix.with_suffix('.png')}")
+    if inset_svg_path is not None:
+        print(f"Wrote {inset_svg_path}")
+
+
+def main() -> None:
+    args = parse_args()
+    run_dir = args.run_dir
+    output_prefix = (
+        args.output_prefix
+        if args.output_prefix is not None
+        else run_dir / "cpu_gpu_util_timeline"
+    )
+    plot_cpu_gpu_util(
+        run_dir=run_dir,
+        output_prefix=output_prefix,
+        cpu_csv=args.cpu_csv,
+        gpu_csv=args.gpu_csv,
+        cpu_smooth_window_s=args.cpu_smooth_window_s,
+        gpu_smooth_window_s=args.gpu_smooth_window_s,
+        gpu_smooth_mode=args.gpu_smooth_mode,
+        gpu_smooth_quantile=args.gpu_smooth_quantile,
+        x_pad_s=args.x_pad_s,
+        fig_width=args.fig_width,
+        fig_height=args.fig_height,
+        bin_s=args.bin_s,
+        cache_prefix=args.cache_prefix,
+        phase_csv=args.phase_csv,
+        rebuild_cache=args.rebuild_cache,
+        num_cpus=args.num_cpus,
+        cpu_unit=args.cpu_unit,
+        parallel_workers=args.parallel_workers,
+        component_lines=not args.no_component_lines,
+        draw_cpu_inset_panel=not args.no_cpu_inset,
+        gpu_roles=parse_gpu_roles(args.gpu_role),
+    )
+
+
+if __name__ == "__main__":
+    main()

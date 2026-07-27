@@ -29,7 +29,8 @@ def test_gipo_actor_drains_envelopes_into_replay_buffer():
             segment_type="fixed_horizon",
             auto_reset=False,
             trajectory="traj",
-            completed_at=1.0,
+            started_at=1.0,
+            completed_at=3.0,
             last_policy_version=2,
         )
     )
@@ -37,6 +38,62 @@ def test_gipo_actor_drains_envelopes_into_replay_buffer():
     actor._drain_received_trajectories()
 
     assert actor.replay_buffer.items == ["traj"]
+
+
+def test_gipo_actor_records_rollout_trajectory_timestamps():
+    actor = object.__new__(AsyncGIPOEmbodiedFSDPActor)
+    actor._recv_queue = Queue()
+    actor.replay_buffer = _Buffer()
+    actor._recv_queue.put(
+        AsyncTrajectoryEnvelope(
+            env_rank=0,
+            stage_id=0,
+            segment_type="episode",
+            auto_reset=True,
+            trajectory="traj0",
+            started_at=1.0,
+            completed_at=1.0,
+            last_policy_version=2,
+        )
+    )
+    actor._recv_queue.put(
+        AsyncTrajectoryEnvelope(
+            env_rank=1,
+            stage_id=0,
+            segment_type="episode",
+            auto_reset=True,
+            trajectory="traj1",
+            started_at=2.0,
+            completed_at=5.0,
+            last_policy_version=3,
+        )
+    )
+
+    actor._drain_received_trajectories()
+
+    assert actor.replay_buffer.items == ["traj0", "traj1"]
+    assert actor._rollout_trajectory_timestamps == [
+        {
+            "env_rank": 0,
+            "stage_id": 0,
+            "segment_type": "episode",
+            "auto_reset": True,
+            "started_at": 1.0,
+            "completed_at": 1.0,
+            "duration_s": 0.0,
+            "last_policy_version": 2,
+        },
+        {
+            "env_rank": 1,
+            "stage_id": 0,
+            "segment_type": "episode",
+            "auto_reset": True,
+            "started_at": 2.0,
+            "completed_at": 5.0,
+            "duration_s": 3.0,
+            "last_policy_version": 3,
+        },
+    ]
 
 
 class _ReadyBuffer:
@@ -78,6 +135,39 @@ def test_gipo_actor_loads_replay_rollout_batch_before_training():
 
     assert metrics == {"reward": 1.0}
     assert actor.rollout_batch["prev_logprobs"].shape == (2, 1, 1)
+
+
+def test_gipo_actor_pads_replay_batch_to_common_time_dim():
+    actor = object.__new__(AsyncGIPOEmbodiedFSDPActor)
+    batch = {
+        "actions": torch.ones(3, 2, 7),
+        "intervene_flags": torch.ones(3, 2, 7, dtype=torch.bool),
+        "prev_logprobs": torch.ones(3, 2, 1),
+        "prev_values": torch.ones(4, 2, 1),
+        "rewards": torch.ones(3, 2, 1),
+        "dones": torch.zeros(4, 2, 1, dtype=torch.bool),
+        "terminations": torch.zeros(4, 2, 1, dtype=torch.bool),
+        "truncations": torch.zeros(4, 2, 1, dtype=torch.bool),
+        "versions": torch.ones(3, 2, 1),
+        "loss_mask": torch.ones(3, 2, 1, dtype=torch.bool),
+        "forward_inputs": {
+            "action": torch.ones(3, 2, 1),
+            "nested": {"token": torch.ones(3, 2, 4)},
+        },
+    }
+
+    actor._pad_gipo_replay_batch_to_step_time(batch, target_step_time=5)
+
+    assert batch["actions"].shape == (5, 2, 7)
+    assert batch["intervene_flags"].shape == (5, 2, 7)
+    assert batch["prev_logprobs"].shape == (5, 2, 1)
+    assert batch["prev_values"].shape == (6, 2, 1)
+    assert batch["dones"].shape == (6, 2, 1)
+    assert batch["forward_inputs"]["action"].shape == (5, 2, 1)
+    assert batch["forward_inputs"]["nested"]["token"].shape == (5, 2, 4)
+    assert not batch["intervene_flags"][3:].any()
+    assert not batch["loss_mask"][3:].any()
+    torch.testing.assert_close(batch["prev_logprobs"][3:], torch.zeros(2, 2, 1))
 
 
 class _DoneHandle:

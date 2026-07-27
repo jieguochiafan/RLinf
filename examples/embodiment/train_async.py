@@ -108,6 +108,7 @@ def main(cfg) -> None:
         cluster,
         name=cfg.rollout.group_name,
         placement_strategy=rollout_placement,
+        max_concurrency=2,
         resource_bindings=_get_resource_bindings(resource_pool, "rollout"),
     )
 
@@ -117,6 +118,7 @@ def main(cfg) -> None:
         cluster,
         name=cfg.env.group_name,
         placement_strategy=env_placement,
+        max_concurrency=2,
         resource_bindings=_get_resource_bindings(resource_pool, "env"),
     )
 

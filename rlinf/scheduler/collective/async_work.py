@@ -66,6 +66,7 @@ class AsyncFuncWork(AsyncWork):
         func: Callable,
         *args,
         pass_self: bool = False,
+        check_future: bool = True,
         **kwargs,
     ):
         """Initialize the AsyncFuncWork with a function and its arguments.
@@ -78,6 +79,8 @@ class AsyncFuncWork(AsyncWork):
                 this when the wrapped function needs to attribute timing or
                 other side effects back to this work without going through a
                 global / thread-local.
+            check_future (bool): Whether to stop before invoking ``func`` if the
+                upstream Future completed with an exception.
             **kwargs: Keyword arguments to pass to the function.
 
         """
@@ -85,12 +88,20 @@ class AsyncFuncWork(AsyncWork):
         self._args = args
         self._kwargs = kwargs
         self._pass_self = pass_self
+        self._check_future = check_future
         self._done = Future()
         self._result = None
         self._next_work = None
         self._cuda_event = None
         self._exec_time = None  # Time spent in the function execution
         self._perf_time = None  # Time set externally
+
+    def _complete_from_chained_work(self, chained_work: "AsyncWork"):
+        try:
+            chained_work.wait()
+            self._done.set_result(True)
+        except Exception as error:
+            self._done.set_exception(error)
 
     @property
     def time(self) -> float:
@@ -114,37 +125,52 @@ class AsyncFuncWork(AsyncWork):
     def __call__(self, future: Future):
         """Execute the function and set the done flag."""
         start = time.perf_counter()
-        if self._pass_self:
-            self._result = self._func(self, *self._args, **self._kwargs)
-        else:
-            self._result = self._func(*self._args, **self._kwargs)
-        self._exec_time = time.perf_counter() - start
-        if (
-            Worker.current_worker.has_accelerator
-            and Worker.torch_platform.is_initialized()
-        ):
-            self._cuda_event = Worker.torch_platform.Event()
-            self._cuda_event.record()
-        if isinstance(self._result, AsyncWork):
-            # If the result is another AsyncWork, find the last work in the chain
-            # Set the flag only after all works are done
-            last_work_in_chain = self._result.get_last_work()
-            last_work_in_chain.then(self._done.set_result, True)
-        else:
-            self._done.set_result(True)
+        try:
+            if self._check_future and future is not None:
+                future.wait()
+            if self._pass_self:
+                self._result = self._func(self, *self._args, **self._kwargs)
+            else:
+                self._result = self._func(*self._args, **self._kwargs)
+            self._exec_time = time.perf_counter() - start
+            if (
+                Worker.current_worker is not None
+                and Worker.current_worker.has_accelerator
+                and Worker.torch_platform.is_initialized()
+            ):
+                self._cuda_event = Worker.torch_platform.Event()
+                self._cuda_event.record()
+            if isinstance(self._result, AsyncWork):
+                # If the result is another AsyncWork, find the last work in the chain
+                # Set the flag only after all works are done
+                last_work_in_chain = self._result.get_last_work()
+                last_work_in_chain.then(
+                    self._complete_from_chained_work,
+                    last_work_in_chain,
+                    check_future=False,
+                )
+            else:
+                self._done.set_result(True)
+        except Exception as error:
+            self._exec_time = time.perf_counter() - start
+            self._done.set_exception(error)
 
-    def then(self, func: Callable, *args, **kwargs) -> "AsyncFuncWork":
+    def then(
+        self, func: Callable, *args, check_future: bool = True, **kwargs
+    ) -> "AsyncFuncWork":
         """Set a callback function to be called when the work is completed.
 
         Args:
             func (Callable): The function to call when the work is completed. Currently doesn't support return values.
             *args: Positional arguments to pass to the function.
+            check_future (bool): Whether to stop before invoking ``func`` if the
+                upstream Future completed with an exception.
             **kwargs: Keyword arguments to pass to the function.
 
         """
         # NOTE: If the _done flag is already set, the next work will be executed in the current thread
         # Do not make any assumptions about which thread the next work will be executed
-        next_work = AsyncFuncWork(func, *args, **kwargs)
+        next_work = AsyncFuncWork(func, *args, check_future=check_future, **kwargs)
         self._next_work = next_work
         self._done.then(next_work)
         return next_work
@@ -156,7 +182,9 @@ class AsyncFuncWork(AsyncWork):
             Any: The result of the work if applicable, otherwise None.
 
         """
-        if not self._done.done():
+        if self._done.done():
+            self._done.wait()
+        else:
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(None, self._done.wait)
         if self._cuda_event is not None:

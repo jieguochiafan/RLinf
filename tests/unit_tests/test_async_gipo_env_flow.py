@@ -81,3 +81,52 @@ def test_env_waits_on_request_specific_response_key():
 
     assert got is response
     assert channel.keys == [(build_inference_response_key(3, 1, "req"), True)]
+
+
+def test_gipo_interact_bootstraps_initial_observations_when_missing():
+    worker = object.__new__(AsyncEnvWorker)
+    worker.stage_num = 1
+    worker.last_obs_list = []
+    worker.last_intervened_info_list = []
+    bootstrap_output = EnvOutput(obs={"states": torch.ones(1, 3)})
+    bootstrap_calls = []
+
+    def bootstrap_step():
+        bootstrap_calls.append(True)
+        return [bootstrap_output]
+
+    worker.bootstrap_step = bootstrap_step
+    worker.store_last_obs_and_intervened_info = (
+        lambda outputs: setattr(worker, "last_obs_list", [output.obs for output in outputs])
+    )
+
+    worker._ensure_gipo_initial_observations()
+
+    assert bootstrap_calls == [True]
+    assert worker.last_obs_list == [bootstrap_output.obs]
+
+
+def test_gipo_request_observation_uses_env_output_schema():
+    worker = object.__new__(AsyncEnvWorker)
+    raw_obs = {"states": torch.ones(1, 3)}
+    worker.last_obs_list = [raw_obs]
+
+    request_obs = worker._get_gipo_request_obs(stage_id=0)
+
+    assert request_obs["states"] is raw_obs["states"]
+    assert "extra_view_images" in request_obs
+    assert request_obs["extra_view_images"] is None
+    assert "task_descriptions" in request_obs
+
+
+def test_gipo_initializes_rollout_results_when_missing():
+    worker = object.__new__(AsyncEnvWorker)
+    worker.stage_num = 2
+    worker.cfg = type("Cfg", (), {})()
+    worker.cfg.env = type("EnvCfg", (), {})()
+    worker.cfg.env.train = type("TrainCfg", (), {"max_episode_steps": 11})()
+
+    worker._ensure_gipo_rollout_results()
+
+    assert len(worker.rollout_results) == 2
+    assert all(result.max_episode_length == 11 for result in worker.rollout_results)

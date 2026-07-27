@@ -7,7 +7,7 @@ TARGET=""
 MODEL=""
 ENV_NAME=""
 VENV_DIR=".venv"
-PYTHON_VERSION="3.11.14"
+PYTHON_VERSION="3.11.15"
 TORCH_VERSION=""
 PLATFORM="nvidia"
 ROCM_VERSION=""
@@ -944,9 +944,9 @@ clone_or_reuse_repo() {
 install_common_embodied_deps() {
     uv sync --extra embodied --active $NO_INSTALL_RLINF_CMD
     uv pip install -r $SCRIPT_DIR/embodied/envs/common.txt
-    if [ "$NO_ROOT" -eq 0 ]; then
-        bash $SCRIPT_DIR/embodied/sys_deps.sh "$PLATFORM"
-    fi
+    # if [ "$NO_ROOT" -eq 0 ]; then
+    #     bash $SCRIPT_DIR/embodied/sys_deps.sh "$PLATFORM"
+    # fi
     if [ ${#PLATFORM_VENV_EXPORTS[@]} -gt 0 ]; then
         printf '%s\n' "${PLATFORM_VENV_EXPORTS[@]}" >> "$VENV_DIR/bin/activate"
     fi

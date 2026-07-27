@@ -159,3 +159,26 @@ def make_rollout_profiler(cfg: Any, *, component: str, rank: int):
     if not config.enabled:
         return NoopRolloutProfiler()
     return RolloutProfiler(config)
+
+
+def write_profile_context_event(
+    context: dict[str, Any] | None,
+    record: dict[str, Any],
+) -> None:
+    if not context:
+        return
+    output_dir = context.get("rollout_profile_output_dir")
+    if not output_dir:
+        return
+    rank = int(context.get("rank", 0))
+    path = Path(str(output_dir)) / f"env_rank_{rank}.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "component": "env",
+        "rank": rank,
+        "pid": context.get("pid"),
+        "wall_ns": time.time_ns(),
+        **record,
+    }
+    with path.open("a", encoding="utf-8", buffering=1) as handle:
+        handle.write(json.dumps(payload, sort_keys=True, default=str) + "\n")

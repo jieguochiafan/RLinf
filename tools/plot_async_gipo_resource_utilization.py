@@ -506,7 +506,27 @@ def _add_phase_annotations(axes: Sequence[Any], phases: Sequence[PhaseWindow]) -
         )
 
 
-def draw_profile(profile: ProfileData) -> Figure:
+def smooth_series(values: np.ndarray, window: int = 15) -> np.ndarray:
+    """Return a centered rolling mean while preserving missing bins."""
+
+    if isinstance(window, bool) or not isinstance(window, int) or window <= 0:
+        raise ValueError("smooth_window must be a positive integer")
+    series = np.asarray(values, dtype=float)
+    if window == 1 or series.size == 0:
+        return series.copy()
+
+    finite_mask = np.isfinite(series)
+    effective_window = min(window, series.size)
+    weights = np.ones(effective_window, dtype=float)
+    sums = np.convolve(np.where(finite_mask, series, 0.0), weights, mode="same")
+    counts = np.convolve(finite_mask.astype(float), weights, mode="same")
+    smoothed = np.full(series.shape, np.nan, dtype=float)
+    np.divide(sums, counts, out=smoothed, where=counts > 0)
+    smoothed[~finite_mask] = np.nan
+    return smoothed
+
+
+def draw_profile(profile: ProfileData, smooth_window: int = 15) -> Figure:
     """Draw a three-panel paper-style resource utilization figure."""
 
     figure, axes = plt.subplots(
@@ -554,10 +574,11 @@ def draw_profile(profile: ProfileData) -> Figure:
     for index, (label, values) in enumerate(
         zip(profile.gpu_labels, profile.gpu_matrix, strict=True)
     ):
+        smoothed_values = smooth_series(values, smooth_window)
         gpu_handles.append(
             gpu_axis.plot(
                 gpu_x,
-                values,
+                smoothed_values,
                 color=GPU_COLORS[index % len(GPU_COLORS)],
                 linewidth=1.5,
                 label=f"GPU {label}",
@@ -629,10 +650,12 @@ def draw_profile(profile: ProfileData) -> Figure:
     return figure
 
 
-def create_figure(derived_dir: str | Path, num_cpus: int = 112) -> Figure:
+def create_figure(
+    derived_dir: str | Path, num_cpus: int = 112, smooth_window: int = 15
+) -> Figure:
     """Load a derived directory and create its resource figure."""
 
-    return draw_profile(load_profile(derived_dir, num_cpus))
+    return draw_profile(load_profile(derived_dir, num_cpus), smooth_window)
 
 
 def save_figure(figure: Figure, output_prefix: str | Path) -> tuple[Path, Path]:
@@ -662,6 +685,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=112,
         help="Number of logical CPUs shown in the CPU heatmap",
     )
+    parser.add_argument(
+        "--smooth-window",
+        type=int,
+        default=15,
+        help="Centered rolling-mean window for GPU line plots; use 1 to disable",
+    )
     return parser.parse_args(argv)
 
 
@@ -671,7 +700,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         profile = load_profile(args.derived_dir, args.num_cpus)
         for warning in profile.coverage_warnings:
             print(f"WARNING: {warning}", file=sys.stderr)
-        figure = draw_profile(profile)
+        figure = draw_profile(profile, args.smooth_window)
         pdf_path, png_path = save_figure(figure, args.output_prefix)
         plt.close(figure)
     except (FileNotFoundError, json.JSONDecodeError, ValueError) as error:

@@ -326,6 +326,39 @@ def test_build_gpu_device_series_validates_busy_percentage() -> None:
         )
 
 
+def test_smooth_series_uses_centered_nan_aware_average() -> None:
+    values = np.array([0.0, 100.0, np.nan, 100.0, 0.0])
+
+    smoothed = PLOT.smooth_series(values, window=3)
+
+    np.testing.assert_allclose(
+        smoothed,
+        [50.0, 50.0, np.nan, 50.0, 50.0],
+        equal_nan=True,
+    )
+
+
+def test_draw_profile_smooths_gpu_lines(tmp_path: Path) -> None:
+    profile = PLOT.load_profile(_write_profile(tmp_path), num_cpus=4)
+
+    figure = PLOT.draw_profile(profile, smooth_window=3)
+
+    try:
+        gpu_axis = next(
+            axis
+            for axis in figure.axes
+            if axis.get_ylabel() == "CUDA kernel busy by physical GPU (%)"
+        )
+        gpu_lines = [
+            line for line in gpu_axis.lines if line.get_label().startswith("GPU ")
+        ]
+        assert len(gpu_lines) == 2
+        np.testing.assert_allclose(gpu_lines[0].get_ydata(), [22.5, 25.0, 27.5])
+        np.testing.assert_allclose(gpu_lines[1].get_ydata(), [37.5, 40.0, 42.5])
+    finally:
+        PLOT.plt.close(figure)
+
+
 def test_read_phase_windows_uses_epoch_seconds_relative_to_origin(
     tmp_path: Path,
 ) -> None:

@@ -5,6 +5,7 @@ RLINF=/data1/miliang/RLinf
 RUN_DIR=${RUN_DIR:-/tmp/rlinf_async_gipo_resource_$(date +%Y%m%d_%H%M%S)}
 CPU_INTERVAL=${CPU_INTERVAL:-0.1}
 PROFILE_ACTIVE_STEPS=${PROFILE_ACTIVE_STEPS:-25}
+TRAJECTORIES_PER_TRAIN=${TRAJECTORIES_PER_TRAIN:-16}
 
 mkdir -p "$RUN_DIR/resource_profile/cpu" "$RUN_DIR/resource_profile/torch"
 
@@ -56,7 +57,11 @@ python examples/embodiment/train_async.py \
   runner.save_interval=-1 \
   runner.logger.logger_backends=[] \
   runner.logger.log_path="$RUN_DIR" \
-  +actor.recv_drain_max_trajectories=8 \
+  env.train.v17_continuous_collect.target_trajectories="$TRAJECTORIES_PER_TRAIN" \
+  algorithm.replay_buffer.min_buffer_size="$TRAJECTORIES_PER_TRAIN" \
+  algorithm.replay_buffer.cache_size="$TRAJECTORIES_PER_TRAIN" \
+  algorithm.replay_buffer.sample_window_size="$TRAJECTORIES_PER_TRAIN" \
+  +actor.recv_drain_max_trajectories="$TRAJECTORIES_PER_TRAIN" \
   "$@" \
   2>&1 | python tools/timestamp_stream.py | tee "$RUN_DIR/train.log"
 PIPE_STATUSES=("${PIPESTATUS[@]}")

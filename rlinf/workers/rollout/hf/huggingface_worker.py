@@ -35,7 +35,20 @@ from rlinf.models.embodiment.base_policy import BasePolicy
 from rlinf.scheduler import Channel, Cluster, Worker
 from rlinf.utils.comm_mapping import CommMapper
 from rlinf.utils.placement import HybridComponentPlacement
-from rlinf.utils.profile_timeline import write_time_anchor
+from rlinf.utils.profile_timeline import (
+    TraceChunkHandler,
+    stop_profiler_safely,
+    torch_profiler_schedule_kwargs,
+    write_time_anchor,
+)
+from rlinf.utils.rollout_profile import make_rollout_profiler
+
+_GENERATION_PROFILE_PHASES = frozenset(
+    {
+        "action_generation",
+        "gipo_action_generation",
+    }
+)
 
 
 class MultiStepRolloutWorker(Worker):
@@ -43,6 +56,7 @@ class MultiStepRolloutWorker(Worker):
         Worker.__init__(self)
 
         self.cfg = cfg
+        self._init_rollout_profiler()
         self.should_stop = False
         train_env_cfg = cfg.env.get("train", None)
         self.log_generation_timestamps = bool(
@@ -116,6 +130,19 @@ class MultiStepRolloutWorker(Worker):
         self.weight_syncer = WeightSyncer.create(weight_syncer_cfg)
         self._sync_weight_comm_options = self.weight_syncer.comm_options
         print(f"self._sync_weight_comm_options: {self._sync_weight_comm_options}")
+
+    def _init_rollout_profiler(self) -> None:
+        self.rollout_profiler = make_rollout_profiler(
+            self.cfg,
+            component="rollout",
+            rank=self._rank,
+        )
+
+    def _rollout_profile_span(self, event: str, **fields: Any):
+        profiler = getattr(self, "rollout_profiler", None)
+        if profiler is None:
+            return contextlib.nullcontext()
+        return profiler.span(event, **fields)
 
     def init_worker(self):
         rollout_model_config = copy.deepcopy(self.cfg.actor.model)
@@ -250,9 +277,7 @@ class MultiStepRolloutWorker(Worker):
             self._generation_timestamp_file = open(
                 path, "a", encoding="utf-8", buffering=1
             )
-        self._generation_timestamp_file.write(
-            json.dumps(event, sort_keys=True) + "\n"
-        )
+        self._generation_timestamp_file.write(json.dumps(event, sort_keys=True) + "\n")
 
     def _build_generation_timestamp_event(
         self,
@@ -276,58 +301,100 @@ class MultiStepRolloutWorker(Worker):
             return
         if os.environ.get("RLINF_TORCH_PROFILE") != "1":
             return
-        from torch.profiler import (
-            ProfilerActivity,
-            profile,
-            schedule,
-            tensorboard_trace_handler,
-        )
+        try:
+            from torch.profiler import (
+                ProfilerActivity,
+                profile,
+                schedule,
+            )
 
-        output_dir = os.path.join(
-            os.environ.get("RLINF_TORCH_PROFILE_DIR", "torch_prof"),
-            f"rollout_rank{self._rank}",
-        )
-        os.makedirs(output_dir, exist_ok=True)
-        self._torch_profiler_dir = output_dir
-        write_time_anchor(output_dir, component="generation", rank=self._rank)
-        self._torch_profiler = profile(
-            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-            schedule=schedule(wait=5, warmup=3, active=10, repeat=1),
-            on_trace_ready=tensorboard_trace_handler(output_dir),
-            record_shapes=False,
-            profile_memory=False,
-            with_stack=False,
-        )
-        self._torch_profiler.start()
-        self._torch_profiler_step_enabled = True
+            output_dir = os.path.join(
+                os.environ.get("RLINF_TORCH_PROFILE_DIR", "torch_prof"),
+                f"rollout_rank{self._rank}",
+            )
+            os.makedirs(output_dir, exist_ok=True)
+            self._torch_profiler_dir = output_dir
+            write_time_anchor(output_dir, component="generation", rank=self._rank)
+            self._torch_profiler = profile(
+                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                schedule=schedule(**torch_profiler_schedule_kwargs()),
+                on_trace_ready=TraceChunkHandler(
+                    output_dir,
+                    component="generation",
+                    rank=self._rank,
+                ),
+                record_shapes=False,
+                profile_memory=False,
+                with_stack=False,
+            )
+            self._torch_profiler.start()
+            self._torch_profiler_step_enabled = True
+        except Exception as exc:
+            partial_profiler = self._torch_profiler
+            self._torch_profiler = None
+            self._torch_profiler_dir = None
+            self._torch_profiler_step_enabled = False
+            self.log_warning(f"Disabling rollout torch profiler: {exc}")
+            if partial_profiler is not None:
+                stop_error = stop_profiler_safely(partial_profiler)
+                if stop_error is not None:
+                    self.log_warning(
+                        f"Partial rollout torch profiler cleanup failed: {stop_error}"
+                    )
 
     def _step_torch_profiler(self) -> None:
         if self._torch_profiler is not None and self._torch_profiler_step_enabled:
-            self._torch_profiler.step()
+            profiler = self._torch_profiler
+            try:
+                profiler.step()
+            except Exception as exc:
+                self._torch_profiler = None
+                self._torch_profiler_dir = None
+                self._torch_profiler_step_enabled = False
+                self.log_warning(f"Rollout torch profiler step failed: {exc}")
+                stop_error = stop_profiler_safely(profiler)
+                if stop_error is not None:
+                    self.log_warning(
+                        "Rollout torch profiler cleanup after step failure failed: "
+                        f"{stop_error}"
+                    )
 
     def _stop_torch_profiler(self) -> None:
         if self._torch_profiler is None:
             return
-        self._torch_profiler.stop()
-        if self._torch_profiler_dir is not None:
-            with open(
-                os.path.join(self._torch_profiler_dir, "op_summary.txt"),
-                "w",
-                encoding="utf-8",
-            ) as f:
-                f.write(
-                    self._torch_profiler.key_averages().table(
-                        sort_by="cuda_time_total", row_limit=40
+        try:
+            self._torch_profiler.stop()
+            if self._torch_profiler_dir is not None:
+                with open(
+                    os.path.join(self._torch_profiler_dir, "op_summary.txt"),
+                    "w",
+                    encoding="utf-8",
+                ) as f:
+                    f.write(
+                        self._torch_profiler.key_averages().table(
+                            sort_by="cuda_time_total", row_limit=40
+                        )
                     )
-                )
-        self._torch_profiler = None
-        self._torch_profiler_step_enabled = False
+        except Exception as exc:
+            self.log_warning(f"Rollout torch profiler cleanup failed: {exc}")
+        finally:
+            self._torch_profiler = None
+            self._torch_profiler_dir = None
+            self._torch_profiler_step_enabled = False
+
+    def _should_step_generation_profiler(
+        self, profile_context: dict[str, Any] | None
+    ) -> bool:
+        return (
+            profile_context is None
+            or profile_context.get("phase") in _GENERATION_PROFILE_PHASES
+        )
 
     def _profile_generation_context(self, profile_context: dict[str, Any] | None):
         if (
             self._torch_profiler is None
             or profile_context is None
-            or profile_context.get("phase") != "action_generation"
+            or not self._should_step_generation_profiler(profile_context)
         ):
             return contextlib.nullcontext()
         return torch.profiler.record_function("generation")
@@ -377,9 +444,7 @@ class MultiStepRolloutWorker(Worker):
         if self.log_generation_timestamps:
             perf_start = time.perf_counter()
             self._write_generation_timestamp_event(
-                self._build_generation_timestamp_event(
-                    "start", mode, profile_context
-                )
+                self._build_generation_timestamp_event("start", mode, profile_context)
             )
 
         kwargs = (
@@ -417,7 +482,14 @@ class MultiStepRolloutWorker(Worker):
         else:
             use_expert = False
 
-        with torch.no_grad():
+        with (
+            self._rollout_profile_span(
+                "rollout.predict",
+                mode=mode,
+                **(profile_context or {}),
+            ),
+            torch.no_grad(),
+        ):
             expert_label_flag = False
             # Decide which model to act via use_expert
             with self._profile_generation_context(profile_context):
@@ -455,9 +527,9 @@ class MultiStepRolloutWorker(Worker):
                 if self._torch_profiler is not None and torch.cuda.is_available():
                     torch.cuda.synchronize()
 
-            if self._torch_profiler is not None and (
-                profile_context is None
-                or profile_context.get("phase") == "action_generation"
+            if (
+                self._torch_profiler is not None
+                and self._should_step_generation_profiler(profile_context)
             ):
                 self._step_torch_profiler()
 
@@ -484,19 +556,26 @@ class MultiStepRolloutWorker(Worker):
         final_obs: dict[str, Any] | None,
         profile_context: dict[str, Any] | None = None,
     ) -> torch.Tensor | None:
-        if final_obs is None:
-            return None
-        if not (
-            hasattr(self.hf_model, "value_head") or hasattr(self.hf_model, "q_head")
+        with self._rollout_profile_span(
+            "rollout.bootstrap_values",
+            **(profile_context or {}),
         ):
-            return None
-        with torch.no_grad():
-            actions, result = self.predict(final_obs, profile_context=profile_context)
-            if "prev_values" in result and result["prev_values"] is not None:
-                final_values = result["prev_values"]
-            else:
-                final_values = torch.zeros_like(actions[:, :1], dtype=torch.float32)
-        return final_values[:, :1].cpu().contiguous()
+            if final_obs is None:
+                return None
+            if not (
+                hasattr(self.hf_model, "value_head") or hasattr(self.hf_model, "q_head")
+            ):
+                return None
+            with torch.no_grad():
+                actions, result = self.predict(
+                    final_obs,
+                    profile_context=profile_context,
+                )
+                if "prev_values" in result and result["prev_values"] is not None:
+                    final_values = result["prev_values"]
+                else:
+                    final_values = torch.zeros_like(actions[:, :1], dtype=torch.float32)
+            return final_values[:, :1].cpu().contiguous()
 
     async def sync_model_from_actor(self):
         """Sync model parameters from the actor worker."""
@@ -728,23 +807,29 @@ class MultiStepRolloutWorker(Worker):
             A single env output dict. When multiple env ranks are mapped to this
             rollout worker, outputs are merged on batch dimension.
         """
-        assert mode in ["train", "eval"], f"{mode=} is not supported"
-        src_ranks_and_sizes = self.src_ranks[mode]
-        obs_batches = []
-        for src_rank, expected_size in src_ranks_and_sizes:
-            obs_batch = await input_channel.get(
-                key=CommMapper.build_channel_key(
-                    src_rank, self._rank, extra=f"{mode}_obs"
-                ),
-                async_op=True,
-            ).async_wait()
-            actual_size = self._infer_env_batch_size(obs_batch)
-            assert actual_size == expected_size, (
-                f"Expected env output batch size {expected_size} from env rank {src_rank}, "
-                f"got {actual_size}."
-            )
-            obs_batches.append(obs_batch)
-        return self._merge_obs_batches(obs_batches)
+        with self._rollout_profile_span("rollout.recv_env_output", mode=mode):
+            assert mode in ["train", "eval"], f"{mode=} is not supported"
+            src_ranks_and_sizes = self.src_ranks[mode]
+            obs_batches = []
+            for src_rank, expected_size in src_ranks_and_sizes:
+                obs_batch = await input_channel.get(
+                    key=CommMapper.build_channel_key(
+                        src_rank, self._rank, extra=f"{mode}_obs"
+                    ),
+                    async_op=True,
+                ).async_wait()
+                actual_size = self._infer_env_batch_size(obs_batch)
+                assert actual_size == expected_size, (
+                    f"Expected env output batch size {expected_size} from env rank {src_rank}, "
+                    f"got {actual_size}."
+                )
+                obs_batches.append(obs_batch)
+            with self._rollout_profile_span(
+                "rollout.merge_obs_batches",
+                mode=mode,
+                source_count=len(obs_batches),
+            ):
+                return self._merge_obs_batches(obs_batches)
 
     def _split_actions(
         self, actions: torch.Tensor | np.ndarray, sizes: list[int]
@@ -902,20 +987,24 @@ class MultiStepRolloutWorker(Worker):
         rollout_result: RolloutResult,
         mode: Literal["train", "eval"] = "train",
     ):
-        assert mode in ["train", "eval"], f"{mode=} is not supported"
-        dst_ranks_and_sizes = self.dst_ranks[mode]
-        split_sizes = [size for _, size in dst_ranks_and_sizes]
-        split_rollout_results = self._split_rollout_result(rollout_result, split_sizes)
-        for (dst_rank, _), rollout_result_i in zip(
-            dst_ranks_and_sizes, split_rollout_results
-        ):
-            output_channel.put(
-                rollout_result_i,
-                key=CommMapper.build_channel_key(
-                    self._rank, dst_rank, extra=f"{mode}_rollout_results"
-                ),
-                async_op=True,
+        with self._rollout_profile_span("rollout.send_rollout_result", mode=mode):
+            assert mode in ["train", "eval"], f"{mode=} is not supported"
+            dst_ranks_and_sizes = self.dst_ranks[mode]
+            split_sizes = [size for _, size in dst_ranks_and_sizes]
+            split_rollout_results = self._split_rollout_result(
+                rollout_result,
+                split_sizes,
             )
+            for (dst_rank, _), rollout_result_i in zip(
+                dst_ranks_and_sizes, split_rollout_results
+            ):
+                output_channel.put(
+                    rollout_result_i,
+                    key=CommMapper.build_channel_key(
+                        self._rank, dst_rank, extra=f"{mode}_rollout_results"
+                    ),
+                    async_op=True,
+                )
 
     def set_global_step(self, global_step: int):
         if hasattr(self.hf_model, "set_global_step"):

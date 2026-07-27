@@ -19,6 +19,7 @@ import time
 import warnings
 from abc import ABC, abstractmethod
 from collections import OrderedDict
+from contextlib import contextmanager
 from multiprocessing import Array, Pipe, connection
 from multiprocessing.context import Process
 from typing import Any, Callable, Optional, Union
@@ -30,6 +31,7 @@ import numpy as np
 from rlinf.envs.chunk_runner import stack_vector_chunk_returns
 from rlinf.scheduler.resource_pool.cpu_binding import (
     apply_process_cpu_affinity,
+    get_cpu_affinity_scope_from_env,
     get_env_core_group_from_env,
     parse_env_cpu_core_groups,
 )
@@ -254,9 +256,33 @@ def _setup_buf(space: gym.Space) -> Union[dict, tuple, ShArray]:
 
 
 def _apply_subproc_env_cpu_affinity(local_env_index: int) -> None:
+    if get_cpu_affinity_scope_from_env(os.environ) != "process":
+        return
     core_group = get_env_core_group_from_env(os.environ, local_env_index)
     if core_group is not None:
         apply_process_cpu_affinity(core_group)
+
+
+@contextmanager
+def _subproc_env_step_cpu_affinity(local_env_index: int):
+    if local_env_index < 0 or get_cpu_affinity_scope_from_env(os.environ) != "step_only":
+        yield
+        return
+    core_group = get_env_core_group_from_env(os.environ, local_env_index)
+    if core_group is None:
+        yield
+        return
+    previous_affinity = (
+        tuple(sorted(os.sched_getaffinity(0)))
+        if hasattr(os, "sched_getaffinity")
+        else ()
+    )
+    apply_process_cpu_affinity(core_group)
+    try:
+        yield
+    finally:
+        if previous_affinity and previous_affinity != core_group:
+            apply_process_cpu_affinity(previous_affinity)
 
 
 def _worker(
@@ -291,7 +317,8 @@ def _worker(
                 p.close()
                 break
             if cmd == "step":
-                env_return = env.step(data)
+                with _subproc_env_step_cpu_affinity(local_env_index):
+                    env_return = env.step(data)
                 if obs_bufs is not None:
                     _encode_obs(env_return[0], obs_bufs)
                     env_return = (None, *env_return[1:])
@@ -311,10 +338,11 @@ def _worker(
                         f"got {action_repeat}"
                     )
                 env_returns = []
-                for action in data:
-                    for _ in range(action_repeat):
-                        env_return = env.step(action)
-                    env_returns.append(env_return)
+                with _subproc_env_step_cpu_affinity(local_env_index):
+                    for action in data:
+                        for _ in range(action_repeat):
+                            env_return = env.step(action)
+                        env_returns.append(env_return)
                 p.send(tuple(zip(*env_returns)))
             elif cmd == "set_cpu_affinity":
                 apply_process_cpu_affinity(tuple(data))
@@ -749,6 +777,8 @@ class BaseVectorEnv(object):
         context = self._sim_timestamp_context
         if context is None:
             return None
+        if not context.get("output_dir"):
+            return None
         if self._sim_timestamp_file is None:
             output_dir = str(context["output_dir"])
             os.makedirs(output_dir, exist_ok=True)
@@ -801,6 +831,8 @@ class BaseVectorEnv(object):
     ) -> None:
         context = self._sim_timestamp_context
         if context is None:
+            return
+        if not context.get("output_dir"):
             return
         handle = self._get_sim_timestamp_file()
         if handle is None:

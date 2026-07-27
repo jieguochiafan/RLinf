@@ -36,11 +36,16 @@ from rlinf.envs.venv import (
     SubprocVectorEnv,
     _setup_buf,
 )
-from rlinf.envs.venv.venv import _apply_subproc_env_cpu_affinity, _to_jsonable
+from rlinf.envs.venv.venv import (
+    _apply_subproc_env_cpu_affinity,
+    _subproc_env_step_cpu_affinity,
+    _to_jsonable,
+)
 from rlinf.scheduler.resource_pool.cpu_binding import (
     apply_process_cpu_affinity,
     get_env_core_group_from_env,
 )
+from rlinf.utils.rollout_profile import write_profile_context_event
 
 
 def _json_list(value: Any) -> list:
@@ -190,7 +195,8 @@ def _worker(
                 break
             if cmd == "step":
                 # Robosuite returns (obs, reward, done, info), not 5 values like gymnasium
-                env_return = _step_with_timing(env, data)
+                with _subproc_env_step_cpu_affinity(local_env_index):
+                    env_return = _step_with_timing(env, data)
                 if obs_bufs is not None:
                     _encode_obs(env_return[0], obs_bufs)
                     env_return = (None, *env_return[1:])
@@ -216,28 +222,29 @@ def _worker(
                         f"got {action_repeat}"
                     )
                 env_returns = []
-                for chunk_action_index, action in enumerate(data):
-                    step_timings = []
-                    for repeat_index in range(action_repeat):
-                        env_return = _step_with_timing(
-                            env,
-                            action,
-                            chunk_action_index=chunk_action_index,
-                            repeat_index=repeat_index,
-                        )
-                        step_timings.extend(
-                            env_return[-1].get("robocasa_step_timings", [])
-                        )
-                        if hasattr(env, "_check_success"):
-                            env_return = _check_success(env, env_return)
-                        if hasattr(env, "get_ep_meta"):
-                            env_return = get_ep_meta(env, env_return)
-                    env_return = list(env_return)
-                    info = env_return[-1]
-                    info["robocasa_step_timings"] = step_timings
-                    env_return[-1] = info
-                    env_return = tuple(env_return)
-                    env_returns.append(env_return)
+                with _subproc_env_step_cpu_affinity(local_env_index):
+                    for chunk_action_index, action in enumerate(data):
+                        step_timings = []
+                        for repeat_index in range(action_repeat):
+                            env_return = _step_with_timing(
+                                env,
+                                action,
+                                chunk_action_index=chunk_action_index,
+                                repeat_index=repeat_index,
+                            )
+                            step_timings.extend(
+                                env_return[-1].get("robocasa_step_timings", [])
+                            )
+                            if hasattr(env, "_check_success"):
+                                env_return = _check_success(env, env_return)
+                            if hasattr(env, "get_ep_meta"):
+                                env_return = get_ep_meta(env, env_return)
+                        env_return = list(env_return)
+                        info = env_return[-1]
+                        info["robocasa_step_timings"] = step_timings
+                        env_return[-1] = info
+                        env_return = tuple(env_return)
+                        env_returns.append(env_return)
                 p.send(tuple(zip(*env_returns)))
             elif cmd == "set_cpu_affinity":
                 apply_process_cpu_affinity(tuple(data))
@@ -394,9 +401,7 @@ class RobocasaSubprocEnv(SubprocVectorEnv):
         context = getattr(self, "_sim_timestamp_context", None)
         if context is None:
             return
-        handle = self._get_sim_timestamp_file()
-        if handle is None:
-            return
+        handle = self._get_sim_timestamp_file() if context.get("output_dir") else None
         for info in info_lists:
             for timing in info.get("robocasa_step_timings", []):
                 local_env = int(timing.get("local_env", -1))
@@ -417,4 +422,31 @@ class RobocasaSubprocEnv(SubprocVectorEnv):
                     "wall_start_ns": timing.get("wall_start_ns"),
                     "wall_end_ns": timing.get("wall_end_ns"),
                 }
-                handle.write(json.dumps(_to_jsonable(record), sort_keys=True) + "\n")
+                if handle is not None:
+                    handle.write(
+                        json.dumps(_to_jsonable(record), sort_keys=True) + "\n"
+                    )
+                if bool(context.get("record_child_steps", False)):
+                    interval = max(
+                        1,
+                        int(context.get("child_step_sample_interval", 1)),
+                    )
+                    if int(vector_step) % interval == 0:
+                        write_profile_context_event(
+                            context,
+                            {
+                                "event": "robocasa.child_step",
+                                "epoch": record["epoch"],
+                                "chunk_step": record["chunk_step"],
+                                "stage": record["stage"],
+                                "local_env": record["local_env"],
+                                "global_env": record["global_env"],
+                                "operation": record["operation"],
+                                "vector_step": record["vector_step"],
+                                "chunk_action_index": record["chunk_action_index"],
+                                "repeat_index": record["repeat_index"],
+                                "duration_s": record["duration_s"],
+                                "wall_start_ns": record["wall_start_ns"],
+                                "wall_end_ns": record["wall_end_ns"],
+                            },
+                        )

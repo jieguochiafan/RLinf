@@ -31,6 +31,9 @@ class _OpenPILike(torch.nn.Module):
         self.paligemma_with_expert.paligemma = torch.nn.Linear(4, 4)
         self.action_out_proj = torch.nn.Linear(4, 4)
 
+    def sample_mean_var_val(self, x):
+        return x
+
 
 class _GR00TLike(torch.nn.Module):
     def __init__(self) -> None:
@@ -242,10 +245,14 @@ def test_openpi_backbone_profile_when_forward_called_directly() -> None:
             self.paligemma_with_expert = torch.nn.Linear(4, 4)
             self.action_out_proj = torch.nn.Linear(4, 4)
 
+        def sample_mean_var_val(self, x):
+            return x
+
         def predict_action_batch(self, env_obs, mode="eval", **kwargs):
             x = env_obs["states"]
             # Simulate OpenPI-style direct module.forward() call.
             hidden = self.paligemma_with_expert.forward(x)
+            hidden = self.sample_mean_var_val(hidden)
             actions = self.action_out_proj(hidden)
             return actions, {}
 
@@ -264,13 +271,17 @@ def test_openpi_backbone_profile_when_forward_called_directly() -> None:
 
     assert any("model.backbone.openpi" in key for key in keys)
     assert any("model.action_head.openpi" in key for key in keys)
+    assert any("model.action_head.openpi.denoise_step" in key for key in keys)
 
 
 def test_gr00t_logic_stage_profile_hooks_capture_backbone_and_action_head() -> None:
     class _DummyActionHead:
+        def sample_mean_var_val(self, x):
+            return x
+
         def get_rl_action(self, backbone_outputs, action_inputs, mode="eval"):
             bsz = backbone_outputs.shape[0]
-            actions = backbone_outputs[:, None, :]
+            actions = self.sample_mean_var_val(backbone_outputs)[:, None, :]
             return backbone_outputs, {
                 "actions": actions,
                 "chains": torch.zeros(bsz, 2, 1, 4),
@@ -326,6 +337,7 @@ def test_gr00t_logic_stage_profile_hooks_capture_backbone_and_action_head() -> N
 
     assert any("model.backbone.gr00t.backbone" in key for key in keys)
     assert any("model.action_head.gr00t.action_head.get_rl_action" in key for key in keys)
+    assert any("model.action_head.gr00t.denoise_step" in key for key in keys)
 
 
 def test_openvla_oft_logic_stage_profile_capture_backbone_and_action_head() -> None:

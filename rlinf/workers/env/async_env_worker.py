@@ -23,7 +23,12 @@ from rlinf.data.embodied_async import (
     build_inference_request_id,
     build_inference_response_key,
 )
-from rlinf.data.embodied_io_struct import ChunkStepResult, EnvOutput, RolloutResult
+from rlinf.data.embodied_io_struct import (
+    ChunkStepResult,
+    EmbodiedRolloutResult,
+    EnvOutput,
+    RolloutResult,
+)
 from rlinf.scheduler import Channel
 from rlinf.workers.env.env_worker import EnvWorker
 
@@ -137,6 +142,27 @@ class AsyncEnvWorker(EnvWorker):
             )
         return response
 
+    def _ensure_gipo_initial_observations(self) -> None:
+        if len(self.last_obs_list) >= self.stage_num:
+            return
+        bootstrap_outputs = self.bootstrap_step()
+        self.store_last_obs_and_intervened_info(bootstrap_outputs)
+
+    def _get_gipo_request_obs(self, stage_id: int) -> dict:
+        return EnvOutput(obs=self.last_obs_list[stage_id]).to_dict()["obs"]
+
+    def _ensure_gipo_rollout_results(self) -> None:
+        if len(getattr(self, "rollout_results", [])) >= self.stage_num:
+            return
+        self.rollout_results = [
+            EmbodiedRolloutResult(
+                max_episode_length=self.cfg.env.train.max_episode_steps,
+            )
+            for _ in range(self.stage_num)
+        ]
+        now = time.perf_counter()
+        self._gipo_trajectory_started_at = [now for _ in range(self.stage_num)]
+
     async def interact_gipo_async(
         self,
         request_channel: Channel,
@@ -167,11 +193,20 @@ class AsyncEnvWorker(EnvWorker):
         trajectory_channel: Channel,
         metric_channel: Channel,
     ) -> None:
+        self._ensure_gipo_rollout_results()
+        self._ensure_gipo_initial_observations()
+        if len(getattr(self, "_gipo_trajectory_started_at", [])) < self.stage_num:
+            now = time.perf_counter()
+            self._gipo_trajectory_started_at = [now for _ in range(self.stage_num)]
         while True:
             for chunk_step_idx in range(self.n_train_chunk_steps):
                 for stage_id in range(self.stage_num):
+                    if not self.rollout_results[stage_id].rewards:
+                        self._gipo_trajectory_started_at[stage_id] = (
+                            time.perf_counter()
+                        )
                     env_output = EnvOutput(
-                        obs=self.last_obs_list[stage_id],
+                        obs=self._get_gipo_request_obs(stage_id),
                     )
                     request_id = build_inference_request_id(
                         env_rank=self._rank,
@@ -209,6 +244,7 @@ class AsyncEnvWorker(EnvWorker):
                     )
                     self.last_obs_list[stage_id] = next_output.obs
                     if should_flush:
+                        completed_at = time.perf_counter()
                         trajectory = self.rollout_results[stage_id].to_trajectory()
                         trajectory_channel.put(
                             AsyncTrajectoryEnvelope(
@@ -219,9 +255,11 @@ class AsyncEnvWorker(EnvWorker):
                                 else "episode",
                                 auto_reset=self.cfg.env.train.auto_reset,
                                 trajectory=trajectory,
-                                completed_at=time.perf_counter(),
+                                started_at=self._gipo_trajectory_started_at[stage_id],
+                                completed_at=completed_at,
                                 last_policy_version=response.policy_version,
                             ),
                             async_op=True,
                         )
                         self.rollout_results[stage_id].clear()
+                        self._gipo_trajectory_started_at[stage_id] = completed_at

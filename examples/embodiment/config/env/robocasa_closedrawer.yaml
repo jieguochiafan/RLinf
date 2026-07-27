@@ -39,3 +39,4 @@ state_space: 25d
 image_space: 2views
 reset_optimization_enabled: true
 reset_mode: task_aware
+cpu_affinity_scope: process

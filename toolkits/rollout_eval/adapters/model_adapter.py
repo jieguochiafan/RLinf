@@ -276,9 +276,19 @@ class GenericModelAdapter:
             with torch.profiler.record_function(
                 "model.action_head.gr00t.action_head.get_rl_action"
             ):
-                action_head_outputs, rlinf_outputs = self.model.action_head.get_rl_action(
-                    backbone_outputs, action_inputs, mode=mode
-                )
+                with ExitStack() as stack:
+                    stack.enter_context(
+                        _temporary_profile_wrapper(
+                            self.model.action_head,
+                            "sample_mean_var_val",
+                            "model.action_head.gr00t.denoise_step",
+                        )
+                    )
+                    action_head_outputs, rlinf_outputs = (
+                        self.model.action_head.get_rl_action(
+                            backbone_outputs, action_inputs, mode=mode
+                        )
+                    )
 
         actions = rlinf_outputs["actions"]
         self.model.validate_data(action_head_outputs, backbone_outputs, is_training=False)
@@ -346,6 +356,14 @@ class GenericModelAdapter:
                             action_head,
                             "forward",
                             "model.action_head.openpi.action_out_proj.forward",
+                        )
+                    )
+                if hasattr(self.model, "sample_mean_var_val"):
+                    stack.enter_context(
+                        _temporary_profile_wrapper(
+                            self.model,
+                            "sample_mean_var_val",
+                            "model.action_head.openpi.denoise_step",
                         )
                     )
             actions, extra = self.model.predict_action_batch(

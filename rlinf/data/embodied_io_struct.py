@@ -775,56 +775,125 @@ def convert_trajectories_to_batch(
 
     batch: dict[str, torch.Tensor] = {}
 
-    # -------- obs / forward_inputs: dict[str, Tensor] --------
-    if trajectories[0].curr_obs:
-        all_keys: set[str] = set()
-        for traj in trajectories:
-            all_keys.update(traj.curr_obs.keys())
-        batch["curr_obs"] = {}
-        for key in all_keys:
-            tensors = [
-                traj.curr_obs[key] for traj in trajectories if key in traj.curr_obs
-            ]
-            if tensors:
-                batch["curr_obs"][key] = torch.cat(tensors, dim=1)
+    def _normalize_trajectory_tensor_field(
+        traj: Trajectory, field_name: str
+    ) -> torch.Tensor | None:
+        tensor = getattr(traj, field_name)
+        if not isinstance(tensor, torch.Tensor):
+            return None
+        if (
+            field_name in ("dones", "terminations", "truncations")
+            and isinstance(traj.rewards, torch.Tensor)
+            and tensor.shape[0] == traj.rewards.shape[0]
+        ):
+            initial = torch.zeros_like(tensor[:1])
+            return torch.cat([initial, tensor], dim=0)
+        if (
+            field_name == "prev_values"
+            and isinstance(traj.rewards, torch.Tensor)
+            and tensor.shape[0] == traj.rewards.shape[0]
+        ):
+            return torch.cat([tensor, tensor[-1:]], dim=0)
+        return tensor
 
-    if trajectories[0].next_obs:
-        all_keys: set[str] = set()
-        for traj in trajectories:
-            all_keys.update(traj.next_obs.keys())
-        batch["next_obs"] = {}
-        for key in all_keys:
-            tensors = [
-                traj.next_obs[key] for traj in trajectories if key in traj.next_obs
-            ]
-            if tensors:
-                batch["next_obs"][key] = torch.cat(tensors, dim=1)
+    def _pad_time_dim(
+        tensor: torch.Tensor,
+        target_time: int,
+        *,
+        pad_value: float | bool = 0,
+    ) -> torch.Tensor:
+        if tensor.shape[0] == target_time:
+            return tensor
+        pad_shape = (target_time - tensor.shape[0], *tensor.shape[1:])
+        padding = torch.full(
+            pad_shape,
+            fill_value=pad_value,
+            dtype=tensor.dtype,
+            device=tensor.device,
+        )
+        return torch.cat([tensor, padding], dim=0)
 
-    if trajectories[0].forward_inputs:
+    def _cat_time_padded_tensors(
+        tensors: list[torch.Tensor],
+        *,
+        pad_value: float | bool = 0,
+    ) -> torch.Tensor:
+        max_time = max(int(tensor.shape[0]) for tensor in tensors)
+        padded_tensors = [
+            _pad_time_dim(tensor, max_time, pad_value=pad_value)
+            for tensor in tensors
+        ]
+        return torch.cat(padded_tensors, dim=1)
+
+    def _cat_time_padded_tensor_dict(
+        dict_name: str,
+    ) -> dict[str, torch.Tensor]:
         all_keys: set[str] = set()
         for traj in trajectories:
-            all_keys.update(traj.forward_inputs.keys())
-        batch["forward_inputs"] = {}
+            values = getattr(traj, dict_name)
+            if values:
+                all_keys.update(values.keys())
+
+        tensor_dict: dict[str, torch.Tensor] = {}
         for key in all_keys:
             tensors = [
-                traj.forward_inputs[key]
+                value
                 for traj in trajectories
-                if key in traj.forward_inputs
+                if isinstance((value := getattr(traj, dict_name).get(key)), torch.Tensor)
             ]
             if tensors:
-                batch["forward_inputs"][key] = torch.cat(tensors, dim=1)
+                tensor_dict[key] = _cat_time_padded_tensors(tensors)
+        return tensor_dict
+
+    # -------- obs / forward_inputs: dict[str, Tensor] --------
+    for dict_name in ("curr_obs", "next_obs", "forward_inputs"):
+        tensor_dict = _cat_time_padded_tensor_dict(dict_name)
+        if tensor_dict:
+            batch[dict_name] = tensor_dict
 
     # -------- tensor fields --------
     reference_trajectory = trajectories[0]
     for field_name in reference_trajectory.__dataclass_fields__.keys():
-        if not isinstance(getattr(reference_trajectory, field_name), torch.Tensor):
+        if field_name == "loss_mask":
+            continue
+        if not isinstance(
+            _normalize_trajectory_tensor_field(reference_trajectory, field_name),
+            torch.Tensor,
+        ):
             continue
         field_list = [
-            getattr(traj, field_name)
+            normalized
             for traj in trajectories
-            if getattr(traj, field_name) is not None
+            if (
+                normalized := _normalize_trajectory_tensor_field(traj, field_name)
+            )
+            is not None
         ]
         if field_list:
-            batch[field_name] = torch.cat(field_list, dim=1)
+            batch[field_name] = _cat_time_padded_tensors(field_list)
+
+    if all(isinstance(traj.rewards, torch.Tensor) for traj in trajectories):
+        loss_masks = []
+        for traj in trajectories:
+            if isinstance(traj.loss_mask, torch.Tensor) and traj.loss_mask.numel() > 0:
+                loss_masks.append(traj.loss_mask.to(dtype=torch.bool))
+            else:
+                loss_masks.append(torch.ones_like(traj.rewards, dtype=torch.bool))
+        batch["loss_mask"] = _cat_time_padded_tensors(
+            loss_masks,
+            pad_value=False,
+        )
+    elif isinstance(reference_trajectory.loss_mask, torch.Tensor):
+        field_list = [
+            traj.loss_mask
+            for traj in trajectories
+            if isinstance(traj.loss_mask, torch.Tensor)
+            and traj.loss_mask.numel() > 0
+        ]
+        if field_list:
+            batch["loss_mask"] = _cat_time_padded_tensors(
+                field_list,
+                pad_value=False,
+            )
 
     return batch

@@ -65,6 +65,8 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
             await self._generate_task
         except asyncio.CancelledError:
             pass
+        finally:
+            self._generate_task = None
 
     async def _generate(
         self,
@@ -72,22 +74,19 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
         output_channel: Channel,
         metric_channel: Channel,
     ):
-        while True:
-            if self._background_weight_sync_active:
-                await self._poll_background_weight_sync()
-            await self.wait_if_stale()
-            for _ in range(self.rollout_epoch):
-                await self.generate_one_epoch(input_channel, output_channel)
-            if self.finished_episodes is not None:
-                self.finished_episodes += self.total_num_train_envs * self.rollout_epoch
-            rollout_metrics = self.pop_execution_times()
-            rollout_metrics = {
-                f"time/rollout/{k}": v for k, v in rollout_metrics.items()
-            }
-            metric_channel.put(
-                {"rank": self._rank, "time": rollout_metrics},
-                async_op=True,
-            )
+        if self._background_weight_sync_active:
+            await self._poll_background_weight_sync()
+        await self.wait_if_stale()
+        for _ in range(self.rollout_epoch):
+            await self.generate_one_epoch(input_channel, output_channel)
+        if self.finished_episodes is not None:
+            self.finished_episodes += self.total_num_train_envs * self.rollout_epoch
+        rollout_metrics = self.pop_execution_times()
+        rollout_metrics = {f"time/rollout/{k}": v for k, v in rollout_metrics.items()}
+        metric_channel.put(
+            {"rank": self._rank, "time": rollout_metrics},
+            async_op=True,
+        )
 
     async def wait_if_stale(self) -> None:
         if self.staleness_threshold is None:
@@ -224,28 +223,34 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
         response_channel: Channel,
         metric_channel: Channel,
     ) -> None:
-        async_cfg = self.cfg.algorithm.get("async_inference", {})
-        batch_state = DynamicBatchState(
-            target_batch_size=async_cfg.get("target_batch_size", 1),
-            max_wait_time_s=async_cfg.get("max_wait_time_s", 0.0),
-        )
-        pending: list[InferenceRequest] = []
-        while True:
-            if self._background_weight_sync_active:
-                await self._poll_background_weight_sync()
-            try:
-                request = request_channel.get_nowait()
-            except asyncio.QueueEmpty:
+        self._start_torch_profiler()
+        try:
+            async_cfg = self.cfg.algorithm.get("async_inference", {})
+            batch_state = DynamicBatchState(
+                target_batch_size=async_cfg.get("target_batch_size", 1),
+                max_wait_time_s=async_cfg.get("max_wait_time_s", 0.0),
+            )
+            pending: list[InferenceRequest] = []
+            while True:
+                if self._background_weight_sync_active:
+                    await self._poll_background_weight_sync()
+                try:
+                    request = request_channel.get_nowait()
+                except asyncio.QueueEmpty:
+                    if batch_state.should_flush(len(pending), time.perf_counter()):
+                        await self._flush_gipo_inference_requests(
+                            pending, response_channel
+                        )
+                        pending.clear()
+                        batch_state.reset()
+                    await asyncio.sleep(0)
+                    continue
+
+                pending.append(request)
+                batch_state.mark_first_request(time.perf_counter())
                 if batch_state.should_flush(len(pending), time.perf_counter()):
                     await self._flush_gipo_inference_requests(pending, response_channel)
                     pending.clear()
                     batch_state.reset()
-                await asyncio.sleep(0)
-                continue
-
-            pending.append(request)
-            batch_state.mark_first_request(time.perf_counter())
-            if batch_state.should_flush(len(pending), time.perf_counter()):
-                await self._flush_gipo_inference_requests(pending, response_channel)
-                pending.clear()
-                batch_state.reset()
+        finally:
+            self._stop_torch_profiler()

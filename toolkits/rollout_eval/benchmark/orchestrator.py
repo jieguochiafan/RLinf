@@ -212,9 +212,10 @@ def _make_random_model_obs(cfg, case: BenchmarkCase) -> dict:
         batch_size = int(_get_cfg_value(cfg, ("env", "eval", "total_num_envs"), 1))
     batch_size = int(batch_size)
 
-    if case.env_type == "libero" and case.model_type == "openpi":
+    if case.env_type == "libero" and case.model_type in {"openpi", "gr00t"}:
         state_dim = int(_get_cfg_value(cfg, ("actor", "model", "state_dim"), 8))
-        image_shape = (batch_size, 224, 224, 3)
+        image_size = 256 if case.model_type == "gr00t" else 224
+        image_shape = (batch_size, image_size, image_size, 3)
         return {
             "main_images": torch.randint(0, 256, image_shape, dtype=torch.uint8),
             "wrist_images": torch.randint(0, 256, image_shape, dtype=torch.uint8),
@@ -224,7 +225,8 @@ def _make_random_model_obs(cfg, case: BenchmarkCase) -> dict:
         }
 
     raise SkipCase(
-        "random model-only input is currently implemented for libero_openpi only"
+        "random model-only input is currently implemented for libero_openpi "
+        "and libero_gr00t only"
     )
 
 

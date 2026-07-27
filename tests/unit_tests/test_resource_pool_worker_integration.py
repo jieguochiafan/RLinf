@@ -204,6 +204,28 @@ def test_worker_applies_process_cpu_affinity_from_resource_binding() -> None:
     assert worker.resource_binding == binding
 
 
+def test_worker_skips_env_process_affinity_for_step_only_binding() -> None:
+    binding = WorkerResourceBinding(
+        component="env",
+        rank=0,
+        cluster_node_rank=0,
+        node_group_label="cluster",
+        cpu=CpuBinding(process_cpu_cores=(2, 3), affinity_scope="step_only"),
+    )
+    worker = object.__new__(Worker)
+
+    with (
+        mock.patch.dict("os.environ", {RESOURCE_BINDING_ENV: binding.to_json()}),
+        mock.patch(
+            "rlinf.scheduler.worker.worker.apply_process_cpu_affinity"
+        ) as apply_affinity,
+    ):
+        worker._setup_resource_binding()
+
+    apply_affinity.assert_not_called()
+    assert worker.resource_binding == binding
+
+
 def test_worker_uses_mig_parent_gpu_for_available_accelerators(monkeypatch) -> None:
     binding = _make_binding(
         node_group_label="cluster",

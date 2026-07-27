@@ -6,7 +6,7 @@ from .bindings import (
     GpuBinding,
 )
 
-ALLOWED_SM_PERCENTAGES = (0, 20, 40, 60, 80, 100)
+ALLOWED_SM_PERCENTAGES = (0, 20, 40, 50, 60, 80, 100)
 
 
 def validate_sm_percent(value: int | None) -> int:

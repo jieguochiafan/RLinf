@@ -849,6 +849,11 @@ def validate_embodied_cfg(cfg):
                 mode = "parallel_shard"
         else:
             mode = env_cfg.chunk_step_mode
+        cpu_affinity_scope = str(env_cfg.get("cpu_affinity_scope", "process"))
+        assert cpu_affinity_scope in ("process", "step_only"), (
+            f"{cfg_path}.cpu_affinity_scope must be one of "
+            f"{['process', 'step_only']}, got {cpu_affinity_scope!r}"
+        )
         num_shards = int(
             env_cfg.get(
                 "chunk_step_num_shards",
@@ -948,6 +953,7 @@ def validate_embodied_cfg(cfg):
         with open_dict(env_cfg):
             env_cfg.chunk_step_mode = mode
             env_cfg.chunk_step_num_shards = num_shards
+            env_cfg.cpu_affinity_scope = cpu_affinity_scope
 
     if cfg.runner.val_check_interval > 0 or cfg.runner.get("only_eval", False):
         assert cfg.env.eval.total_num_envs > 0, (

@@ -48,7 +48,13 @@ from rlinf.utils.nested_dict_process import (
     update_nested_cfg,
 )
 from rlinf.utils.placement import HybridComponentPlacement
-from rlinf.utils.profile_timeline import write_time_anchor
+from rlinf.utils.profile_timeline import (
+    TraceChunkHandler,
+    stop_profiler_safely,
+    torch_profiler_schedule_kwargs,
+    write_time_anchor,
+)
+from rlinf.utils.rollout_profile import make_rollout_profiler
 from rlinf.workers.env.history_manager import HistoryManager
 
 
@@ -65,6 +71,7 @@ class EnvWorker(Worker):
         Worker.__init__(self)
 
         self.cfg = cfg
+        self._init_rollout_profiler()
         self.train_video_cnt = 0
         self.eval_video_cnt = 0
         self.should_stop = False
@@ -251,6 +258,19 @@ class EnvWorker(Worker):
                 ]
                 self.history_lengths = [{} for _ in range(self.stage_num)]
 
+    def _init_rollout_profiler(self) -> None:
+        self.rollout_profiler = make_rollout_profiler(
+            self.cfg,
+            component="env",
+            rank=self._rank,
+        )
+
+    def _rollout_profile_span(self, event: str, **fields: Any):
+        profiler = getattr(self, "rollout_profiler", None)
+        if profiler is None:
+            return contextlib.nullcontext()
+        return profiler.span(event, **fields)
+
     def _log_cpu_binding_status(self, phase: str) -> None:
         binding = getattr(self, "_resource_binding", None)
         if binding is None or binding.cpu is None:
@@ -300,52 +320,86 @@ class EnvWorker(Worker):
             return
         if os.environ.get("RLINF_TORCH_PROFILE") != "1":
             return
-        from torch.profiler import (
-            ProfilerActivity,
-            profile,
-            schedule,
-            tensorboard_trace_handler,
-        )
+        try:
+            from torch.profiler import (
+                ProfilerActivity,
+                profile,
+                schedule,
+            )
 
-        output_dir = os.path.join(
-            os.environ.get("RLINF_TORCH_PROFILE_DIR", "torch_prof"),
-            f"env_rank{self._rank}",
-        )
-        os.makedirs(output_dir, exist_ok=True)
-        self._torch_profiler_dir = output_dir
-        write_time_anchor(output_dir, component="env", rank=self._rank)
-        self._torch_profiler = profile(
-            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-            schedule=schedule(wait=5, warmup=3, active=10, repeat=1),
-            on_trace_ready=tensorboard_trace_handler(output_dir),
-            record_shapes=False,
-            profile_memory=False,
-            with_stack=False,
-        )
-        self._torch_profiler.start()
-        self._torch_profiler_step_enabled = True
+            output_dir = os.path.join(
+                os.environ.get("RLINF_TORCH_PROFILE_DIR", "torch_prof"),
+                f"env_rank{self._rank}",
+            )
+            os.makedirs(output_dir, exist_ok=True)
+            self._torch_profiler_dir = output_dir
+            write_time_anchor(output_dir, component="env", rank=self._rank)
+            self._torch_profiler = profile(
+                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                schedule=schedule(**torch_profiler_schedule_kwargs()),
+                on_trace_ready=TraceChunkHandler(
+                    output_dir,
+                    component="env",
+                    rank=self._rank,
+                ),
+                record_shapes=False,
+                profile_memory=False,
+                with_stack=False,
+            )
+            self._torch_profiler.start()
+            self._torch_profiler_step_enabled = True
+        except Exception as exc:
+            partial_profiler = self._torch_profiler
+            self._torch_profiler = None
+            self._torch_profiler_dir = None
+            self._torch_profiler_step_enabled = False
+            self.log_warning(f"Disabling env torch profiler: {exc}")
+            if partial_profiler is not None:
+                stop_error = stop_profiler_safely(partial_profiler)
+                if stop_error is not None:
+                    self.log_warning(
+                        f"Partial env torch profiler cleanup failed: {stop_error}"
+                    )
 
     def _step_torch_profiler(self) -> None:
         if self._torch_profiler is not None and self._torch_profiler_step_enabled:
-            self._torch_profiler.step()
+            profiler = self._torch_profiler
+            try:
+                profiler.step()
+            except Exception as exc:
+                self._torch_profiler = None
+                self._torch_profiler_dir = None
+                self._torch_profiler_step_enabled = False
+                self.log_warning(f"Env torch profiler step failed: {exc}")
+                stop_error = stop_profiler_safely(profiler)
+                if stop_error is not None:
+                    self.log_warning(
+                        f"Env torch profiler cleanup after step failure failed: "
+                        f"{stop_error}"
+                    )
 
     def _stop_torch_profiler(self) -> None:
         if self._torch_profiler is None:
             return
-        self._torch_profiler.stop()
-        if self._torch_profiler_dir is not None:
-            with open(
-                os.path.join(self._torch_profiler_dir, "op_summary.txt"),
-                "w",
-                encoding="utf-8",
-            ) as f:
-                f.write(
-                    self._torch_profiler.key_averages().table(
-                        sort_by="cuda_time_total", row_limit=40
+        try:
+            self._torch_profiler.stop()
+            if self._torch_profiler_dir is not None:
+                with open(
+                    os.path.join(self._torch_profiler_dir, "op_summary.txt"),
+                    "w",
+                    encoding="utf-8",
+                ) as f:
+                    f.write(
+                        self._torch_profiler.key_averages().table(
+                            sort_by="cuda_time_total", row_limit=40
+                        )
                     )
-                )
-        self._torch_profiler = None
-        self._torch_profiler_step_enabled = False
+        except Exception as exc:
+            self.log_warning(f"Env torch profiler cleanup failed: {exc}")
+        finally:
+            self._torch_profiler = None
+            self._torch_profiler_dir = None
+            self._torch_profiler_step_enabled = False
 
     def _profile_env_step_context(self):
         if self._torch_profiler is None:
@@ -390,6 +444,8 @@ class EnvWorker(Worker):
     def _validate_child_cpu_affinity(self) -> None:
         binding = getattr(self, "_resource_binding", None)
         if binding is None or binding.cpu is None:
+            return
+        if binding.cpu.affinity_scope == "step_only":
             return
         expected_process_cores = tuple(binding.cpu.process_cpu_cores)
         if expected_process_cores and hasattr(os, "sched_getaffinity"):
@@ -735,15 +791,21 @@ class EnvWorker(Worker):
         """
         This function is used to interact with the environment.
         """
-        chunk_actions = prepare_actions(
-            raw_chunk_actions=chunk_actions,
-            env_type=self.cfg.env.train.env_type,
-            model_type=self.cfg.actor.model.model_type,
-            num_action_chunks=self.cfg.actor.model.num_action_chunks,
-            action_dim=self.cfg.actor.model.action_dim,
-            policy=self.cfg.actor.model.get("policy_setup", None),
-            wm_env_type=self.cfg.env.train.get("wm_env_type", None),
-        )
+        profile_fields = {
+            "epoch": epoch,
+            "chunk_step": chunk_step_idx,
+            "stage": stage_id,
+        }
+        with self._rollout_profile_span("env.prepare_actions", **profile_fields):
+            chunk_actions = prepare_actions(
+                raw_chunk_actions=chunk_actions,
+                env_type=self.cfg.env.train.env_type,
+                model_type=self.cfg.actor.model.model_type,
+                num_action_chunks=self.cfg.actor.model.num_action_chunks,
+                action_dim=self.cfg.actor.model.action_dim,
+                policy=self.cfg.actor.model.get("policy_setup", None),
+                wm_env_type=self.cfg.env.train.get("wm_env_type", None),
+            )
         env_info = {}
 
         # Compute denoising_curvature from forward_inputs if available
@@ -793,22 +855,44 @@ class EnvWorker(Worker):
 
         target_env = self.env_list[stage_id]
         subenv_timestamp_context = None
-        if log_sim_timestamps:
-            subenv_timestamp_context = {
-                "output_dir": os.path.join(
+        profiler_config = getattr(
+            getattr(self, "rollout_profiler", None),
+            "config",
+            None,
+        )
+        if log_sim_timestamps or profiler_config is not None:
+            subenv_timestamp_context = {}
+            if log_sim_timestamps:
+                subenv_timestamp_context["output_dir"] = os.path.join(
                     str(self.cfg.runner.logger.log_path), "env_sim_timestamps"
-                ),
-                "rank": self._rank,
-                "pid": os.getpid(),
-                "epoch": epoch,
-                "chunk_step": chunk_step_idx,
-                "stage": stage_id,
-                "stage_num": self.stage_num,
-                "local_envs": self.train_num_envs_per_stage,
-            }
+                )
+            subenv_timestamp_context.update(
+                {
+                    "rank": self._rank,
+                    "pid": os.getpid(),
+                    "epoch": epoch,
+                    "chunk_step": chunk_step_idx,
+                    "stage": stage_id,
+                    "stage_num": self.stage_num,
+                    "local_envs": self.train_num_envs_per_stage,
+                }
+            )
+            if profiler_config is not None:
+                subenv_timestamp_context.update(
+                    {
+                        "rollout_profile_output_dir": profiler_config.output_dir,
+                        "record_child_steps": profiler_config.record_child_steps,
+                        "child_step_sample_interval": (
+                            profiler_config.child_step_sample_interval
+                        ),
+                    }
+                )
         self._set_subenv_timestamp_context(target_env, subenv_timestamp_context)
         try:
-            with self._profile_env_step_context():
+            with (
+                self._rollout_profile_span("env.chunk_step", **profile_fields),
+                self._profile_env_step_context(),
+            ):
                 (
                     obs_list,
                     chunk_rewards,
@@ -840,6 +924,21 @@ class EnvWorker(Worker):
             if chunk_profile:
                 end_event["chunk_profile"] = chunk_profile
             self._write_sim_timestamp_event(end_event)
+        else:
+            chunk_profile = self._get_env_last_chunk_profile(target_env)
+        if chunk_profile:
+            profiler = getattr(self, "rollout_profiler", None)
+            record_chunk_profile = getattr(
+                getattr(profiler, "config", None),
+                "record_chunk_profile",
+                True,
+            )
+            if profiler is not None and record_chunk_profile:
+                profiler.record_metrics(
+                    "env.chunk_profile",
+                    chunk_profile,
+                    **profile_fields,
+                )
         if isinstance(obs_list, (list, tuple)):
             extracted_obs = obs_list[-1] if obs_list else None
         if isinstance(infos_list, (list, tuple)):
@@ -1058,43 +1157,50 @@ class EnvWorker(Worker):
     def recv_rollout_results(
         self, input_channel: Channel, mode="train"
     ) -> RolloutResult:
-        assert mode in ["train", "eval"], f"{mode=} is not supported"
-        src_ranks_and_sizes = self.src_rank_map[f"rollout_{mode}"]
-        rollout_results: list[RolloutResult] = []
+        profiler = getattr(self, "rollout_profiler", None)
+        span = (
+            profiler.span("env.recv_rollout_results", mode=mode)
+            if profiler is not None
+            else contextlib.nullcontext()
+        )
+        with span:
+            assert mode in ["train", "eval"], f"{mode=} is not supported"
+            src_ranks_and_sizes = self.src_rank_map[f"rollout_{mode}"]
+            rollout_results: list[RolloutResult] = []
 
-        def _infer_rollout_batch_size(rollout_result: RolloutResult) -> int:
-            for field_name in (
-                "actions",
-                "prev_logprobs",
-                "prev_values",
-                "bootstrap_values",
-                "versions",
-            ):
-                value = getattr(rollout_result, field_name, None)
-                if isinstance(value, torch.Tensor):
-                    return value.shape[0]
-            if rollout_result.forward_inputs:
-                first_tensor = next(iter(rollout_result.forward_inputs.values()))
-                if isinstance(first_tensor, torch.Tensor):
-                    return first_tensor.shape[0]
-            raise ValueError("Cannot infer batch size from rollout result.")
+            def _infer_rollout_batch_size(rollout_result: RolloutResult) -> int:
+                for field_name in (
+                    "actions",
+                    "prev_logprobs",
+                    "prev_values",
+                    "bootstrap_values",
+                    "versions",
+                ):
+                    value = getattr(rollout_result, field_name, None)
+                    if isinstance(value, torch.Tensor):
+                        return value.shape[0]
+                if rollout_result.forward_inputs:
+                    first_tensor = next(iter(rollout_result.forward_inputs.values()))
+                    if isinstance(first_tensor, torch.Tensor):
+                        return first_tensor.shape[0]
+                raise ValueError("Cannot infer batch size from rollout result.")
 
-        for src_rank, expected_size in src_ranks_and_sizes:
-            rollout_result = input_channel.get(
-                key=CommMapper.build_channel_key(
-                    src_rank, self._rank, extra=f"{mode}_rollout_results"
-                ),
-            )
+            for src_rank, expected_size in src_ranks_and_sizes:
+                rollout_result = input_channel.get(
+                    key=CommMapper.build_channel_key(
+                        src_rank, self._rank, extra=f"{mode}_rollout_results"
+                    ),
+                )
 
-            actual_size = _infer_rollout_batch_size(rollout_result)
-            assert actual_size == expected_size, (
-                f"Expected rollout result size {expected_size} from rollout rank {src_rank}, "
-                f"got batch size {actual_size}."
-            )
+                actual_size = _infer_rollout_batch_size(rollout_result)
+                assert actual_size == expected_size, (
+                    f"Expected rollout result size {expected_size} from rollout rank {src_rank}, "
+                    f"got batch size {actual_size}."
+                )
 
-            rollout_results.append(rollout_result)
+                rollout_results.append(rollout_result)
 
-        return RolloutResult.merge_rollout_results(rollout_results)
+            return RolloutResult.merge_rollout_results(rollout_results)
 
     @Worker.timer("compute_bootstrap_rewards")
     def compute_bootstrap_rewards(
@@ -1172,15 +1278,18 @@ class EnvWorker(Worker):
             env_batch: Env output dictionary for one pipeline stage.
             mode: Rollout mode, either ``"train"`` or ``"eval"``.
         """
-        assert mode in ["train", "eval"], f"{mode=} is not supported"
-        dst_ranks_and_sizes = self.dst_rank_map[f"rollout_{mode}"]
-        split_sizes = [size for _, size in dst_ranks_and_sizes]
-        env_batches = split_dict(env_batch, split_sizes)
-        for (rank, _), env_batch_i in zip(dst_ranks_and_sizes, env_batches):
-            rollout_channel.put(
-                item=env_batch_i,
-                key=CommMapper.build_channel_key(self._rank, rank, extra=f"{mode}_obs"),
-            )
+        with self._rollout_profile_span("env.send_env_batch", mode=mode):
+            assert mode in ["train", "eval"], f"{mode=} is not supported"
+            dst_ranks_and_sizes = self.dst_rank_map[f"rollout_{mode}"]
+            split_sizes = [size for _, size in dst_ranks_and_sizes]
+            env_batches = split_dict(env_batch, split_sizes)
+            for (rank, _), env_batch_i in zip(dst_ranks_and_sizes, env_batches):
+                rollout_channel.put(
+                    item=env_batch_i,
+                    key=CommMapper.build_channel_key(
+                        self._rank, rank, extra=f"{mode}_obs"
+                    ),
+                )
 
     def send_reward_input(
         self,

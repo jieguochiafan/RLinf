@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from collections.abc import Mapping
 
-from .bindings import ENV_CPU_CORE_GROUPS_ENV
+from .bindings import CPU_AFFINITY_SCOPE_ENV, ENV_CPU_CORE_GROUPS_ENV
 
 
 def parse_cpu_core_set(spec: str) -> tuple[int, ...]:
@@ -88,6 +88,17 @@ def get_env_core_group_from_env(
             f"available groups: {len(groups)}"
         )
     return groups[local_env_index]
+
+
+def get_cpu_affinity_scope_from_env(env: Mapping[str, str]) -> str:
+    """Return the configured CPU affinity scope for env subprocesses."""
+    scope = str(env.get(CPU_AFFINITY_SCOPE_ENV, "process")).strip()
+    if scope not in ("process", "step_only"):
+        raise ValueError(
+            "CPU affinity scope must be one of 'process' or 'step_only', "
+            f"got {scope!r}"
+        )
+    return scope
 
 
 def apply_process_cpu_affinity(cpus: tuple[int, ...]) -> None:

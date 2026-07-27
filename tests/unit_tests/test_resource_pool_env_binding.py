@@ -6,8 +6,12 @@ import types
 import pytest
 from omegaconf import OmegaConf
 
-from rlinf.envs.venv.venv import _apply_subproc_env_cpu_affinity
+from rlinf.envs.venv.venv import (
+    _apply_subproc_env_cpu_affinity,
+    _subproc_env_step_cpu_affinity,
+)
 from rlinf.scheduler.resource_pool.bindings import (
+    CPU_AFFINITY_SCOPE_ENV,
     ENV_CPU_CORE_GROUPS_ENV,
     CpuBinding,
     WorkerResourceBinding,
@@ -203,6 +207,48 @@ def test_subproc_env_affinity_uses_local_env_index(monkeypatch) -> None:
     _apply_subproc_env_cpu_affinity(local_env_index=1)
 
     assert captured == {"cpus": (1, 2)}
+
+
+def test_subproc_env_affinity_skips_startup_binding_for_step_only(
+    monkeypatch,
+) -> None:
+    calls = []
+
+    def fake_apply(cpus):
+        calls.append(cpus)
+
+    monkeypatch.setattr(
+        "rlinf.envs.venv.venv.apply_process_cpu_affinity",
+        fake_apply,
+    )
+    monkeypatch.setenv(ENV_CPU_CORE_GROUPS_ENV, "0;1,2;3")
+    monkeypatch.setenv(CPU_AFFINITY_SCOPE_ENV, "step_only")
+
+    _apply_subproc_env_cpu_affinity(local_env_index=1)
+
+    assert calls == []
+
+
+def test_subproc_env_step_affinity_binds_then_restores_for_step_only(
+    monkeypatch,
+) -> None:
+    calls = []
+
+    def fake_apply(cpus):
+        calls.append(cpus)
+
+    monkeypatch.setattr(
+        "rlinf.envs.venv.venv.apply_process_cpu_affinity",
+        fake_apply,
+    )
+    monkeypatch.setattr(os, "sched_getaffinity", lambda pid: {8, 9})
+    monkeypatch.setenv(ENV_CPU_CORE_GROUPS_ENV, "0;1,2;3")
+    monkeypatch.setenv(CPU_AFFINITY_SCOPE_ENV, "step_only")
+
+    with _subproc_env_step_cpu_affinity(local_env_index=1):
+        assert calls == [(1, 2)]
+
+    assert calls == [(1, 2), (8, 9)]
 
 
 def test_custom_subproc_workers_accept_local_env_index(monkeypatch) -> None:

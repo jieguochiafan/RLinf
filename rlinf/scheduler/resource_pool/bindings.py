@@ -6,6 +6,7 @@ from typing import Any, Literal
 
 RESOURCE_BINDING_ENV = "RLINF_RESOURCE_BINDING_JSON"
 CPU_AFFINITY_ENV = "RLINF_CPU_AFFINITY"
+CPU_AFFINITY_SCOPE_ENV = "RLINF_CPU_AFFINITY_SCOPE"
 ENV_CPU_CORE_GROUPS_ENV = "RLINF_ENV_CPU_CORE_GROUPS"
 ACCELERATOR_TYPE_ENV = "ACCELERATOR_TYPE"
 CUDA_VISIBLE_DEVICES_ENV = "CUDA_VISIBLE_DEVICES"
@@ -23,17 +24,25 @@ class CpuBinding:
 
     process_cpu_cores: tuple[int, ...] = ()
     env_cpu_core_groups: tuple[tuple[int, ...], ...] = ()
+    affinity_scope: Literal["process", "step_only"] = "process"
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any] | None) -> "CpuBinding | None":
         """Build a CPU binding from JSON-compatible data."""
         if payload is None:
             return None
+        affinity_scope = str(payload.get("affinity_scope", "process"))
+        if affinity_scope not in ("process", "step_only"):
+            raise ValueError(
+                "CPU affinity_scope must be one of 'process' or 'step_only', "
+                f"got {affinity_scope!r}"
+            )
         return cls(
             process_cpu_cores=_tuple_int(payload.get("process_cpu_cores", ())),
             env_cpu_core_groups=tuple(
                 _tuple_int(group) for group in payload.get("env_cpu_core_groups", ())
             ),
+            affinity_scope=affinity_scope,
         )
 
 
@@ -111,6 +120,8 @@ class WorkerResourceBinding:
         env = {RESOURCE_BINDING_ENV: self.to_json()}
         if self.cpu is not None and self.cpu.process_cpu_cores:
             env[CPU_AFFINITY_ENV] = ",".join(map(str, self.cpu.process_cpu_cores))
+            if self.cpu.affinity_scope != "process":
+                env[CPU_AFFINITY_SCOPE_ENV] = self.cpu.affinity_scope
             if self.cpu.env_cpu_core_groups:
                 env[ENV_CPU_CORE_GROUPS_ENV] = ";".join(
                     ",".join(map(str, group)) for group in self.cpu.env_cpu_core_groups

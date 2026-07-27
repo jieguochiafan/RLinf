@@ -70,6 +70,60 @@ export MUJOCO_EGL_DEVICE_ID=0
 # --override actor.model.model_path=/mnt/RLinf/models/RLinf-Gr00t-SFT-Spatial \
 # --profile-batch-sizes 1,4,8,16,32
 
+### OpenPI model-only torch profiler SM profile（LIBERO，单卡 MPS SM=100%）
+
+# export EMBODIED_PATH=/data1/miliang/RLinf/examples/embodiment && \
+# export REPO_PATH=/data1/miliang/RLinf && \
+# export MUJOCO_GL=egl && \
+# /data1/miliang/RLinf/libero_openpi/bin/python -m toolkits.rollout_eval.benchmark.openpi_sm_profile \
+#   --config-path examples/embodiment/config \
+#   --config-name libero_goal_ppo_openpi_pi05 \
+#   --gpu 0 \
+#   --mps-sm 100 \
+#   --batch-sizes 1,2,4,8,16,32 \
+#   --warmup-steps 5 \
+#   --measure-steps 20 \
+#   --output-dir /data1/miliang/RLinf/rollout_eval_output/openpi_sm_profile_libero \
+#   --override rollout.model.model_path=/data1/gaobowen/model/RLinf-Pi05-LIBERO-SFT \
+#   --override actor.model.model_path=/data1/gaobowen/model/RLinf-Pi05-LIBERO-SFT
+
+### OpenPI roofline profile（LIBERO，单卡 synthetic model-only）
+
+# export EMBODIED_PATH=/data1/miliang/RLinf/examples/embodiment && \
+# export REPO_PATH=/data1/miliang/RLinf && \
+# export MUJOCO_GL=egl && \
+# /data1/miliang/RLinf/libero_openpi/bin/python -m toolkits.rollout_eval.benchmark.roofline_profile \
+#   --config-path examples/embodiment/config \
+#   --config-name libero_goal_ppo_openpi_pi05 \
+#   --model-type openpi \
+#   --gpu 0 \
+#   --batch-sizes 1,8,32,128 \
+#   --warmup-steps 3 \
+#   --measure-steps 10 \
+#   --peak-tflops 312 \
+#   --peak-bw-gbs 1555 \
+#   --output-dir /data1/miliang/RLinf/rollout_eval_output/roofline_openpi \
+#   --override rollout.model.model_path=/data1/gaobowen/model/RLinf-Pi05-LIBERO-SFT \
+#   --override actor.model.model_path=/data1/gaobowen/model/RLinf-Pi05-LIBERO-SFT
+
+### GR00T roofline profile（LIBERO，单卡 synthetic model-only）
+
+# export EMBODIED_PATH=/data1/miliang/RLinf/examples/embodiment && \
+# export REPO_PATH=/data1/miliang/RLinf && \
+# export MUJOCO_GL=egl && \
+# /data1/miliang/RLinf/libero_gr00t/bin/python -m toolkits.rollout_eval.benchmark.roofline_profile \
+#   --config-path examples/embodiment/config \
+#   --config-name libero_spatial_ppo_gr00t \
+#   --model-type gr00t \
+#   --gpu 0 \
+#   --batch-sizes 1,8,32,128 \
+#   --warmup-steps 3 \
+#   --measure-steps 10 \
+#   --peak-tflops 312 \
+#   --peak-bw-gbs 1555 \
+#   --output-dir /data1/miliang/RLinf/rollout_eval_output/roofline_gr00t \
+#   --override rollout.model.model_path=/data1/gaobowen/model/RLinf-Gr00t-SFT-Spatial \
+#   --override actor.model.model_path=/data1/gaobowen/model/RLinf-Gr00t-SFT-Spatial
 
 ### BENCHMARK: MPS/MIG 场景矩阵（注：MIG 需提前手动创建）
 

@@ -12,7 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import os
+from collections.abc import Callable
+from pathlib import Path
 from typing import Any, Optional
 
 import numpy as np
@@ -21,10 +24,128 @@ import torch
 from rlinf.algorithms.registry import calculate_adv_and_returns, policy_loss
 from rlinf.config import SupportedModel
 from rlinf.utils.distributed import all_reduce_dict, masked_normalization
+from rlinf.utils.logging import get_logger
 from rlinf.utils.metric_utils import append_to_dict, compute_rollout_metrics
 from rlinf.utils.nested_dict_process import put_tensor_device, split_dict_to_chunk
+from rlinf.utils.profile_timeline import (
+    TraceChunkHandler,
+    stop_profiler_safely,
+    torch_profiler_schedule_kwargs,
+    write_time_anchor,
+)
 from rlinf.utils.utils import clear_memory, masked_mean, reshape_entropy
 from rlinf.workers.actor.fsdp_actor_worker import EmbodiedFSDPActor
+
+
+def _actor_profiler_rank(rank: int | None) -> int:
+    if rank is not None:
+        return int(rank)
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return int(torch.distributed.get_rank())
+    return 0
+
+
+def create_actor_torch_profiler(
+    rank: int | None = None,
+    *,
+    start: bool = True,
+) -> tuple[Any | None, Callable[[str], Any], Path | None]:
+    """Create the optional torch profiler used by async actor training."""
+    if os.environ.get("RLINF_TORCH_PROFILE") != "1":
+        return None, lambda _name: contextlib.nullcontext(), None
+
+    profiler = None
+    try:
+        from torch.profiler import (
+            ProfilerActivity,
+            profile,
+            record_function,
+            schedule,
+        )
+
+        resolved_rank = _actor_profiler_rank(rank)
+        output_dir = (
+            Path(os.environ.get("RLINF_TORCH_PROFILE_DIR", "torch_prof"))
+            / f"rank{resolved_rank}"
+        )
+        output_dir.mkdir(parents=True, exist_ok=True)
+        write_time_anchor(str(output_dir), component="training", rank=resolved_rank)
+
+        activities = [ProfilerActivity.CPU]
+        if torch.cuda.is_available():
+            activities.append(ProfilerActivity.CUDA)
+        profiler = profile(
+            activities=activities,
+            schedule=schedule(**torch_profiler_schedule_kwargs()),
+            on_trace_ready=TraceChunkHandler(
+                output_dir,
+                component="training",
+                rank=resolved_rank,
+            ),
+            record_shapes=False,
+            profile_memory=False,
+            with_stack=False,
+        )
+        if start:
+            profiler.start()
+        return profiler, record_function, output_dir
+    except Exception:
+        get_logger().warning(
+            "Disabling actor torch profiler after initialization failure",
+            exc_info=True,
+        )
+        if profiler is not None:
+            stop_error = stop_profiler_safely(profiler)
+            if stop_error is not None:
+                get_logger().warning(
+                    "Partial actor torch profiler cleanup failed: %s",
+                    stop_error,
+                )
+        return None, lambda _name: contextlib.nullcontext(), None
+
+
+def step_actor_torch_profiler(profiler: Any) -> Any | None:
+    """Advance the optional actor profiler and disable it after failure."""
+    try:
+        profiler.step()
+        return profiler
+    except Exception:
+        get_logger().warning("Actor torch profiler step failed", exc_info=True)
+        stop_error = stop_profiler_safely(profiler)
+        if stop_error is not None:
+            get_logger().warning(
+                "Actor torch profiler cleanup after step failure failed: %s",
+                stop_error,
+            )
+        return None
+
+
+def stop_actor_torch_profiler(profiler: Any, profiler_dir: Path | None) -> None:
+    """Stop the optional actor profiler without changing training semantics."""
+    stop_error = stop_profiler_safely(profiler)
+    if stop_error is not None:
+        get_logger().warning("Actor torch profiler stop failed: %s", stop_error)
+    if profiler_dir is None:
+        return
+    try:
+        with (profiler_dir / "op_summary.txt").open("w", encoding="utf-8") as f:
+            f.write(
+                profiler.key_averages().table(
+                    sort_by="cuda_time_total",
+                    row_limit=40,
+                )
+            )
+    except Exception:
+        get_logger().warning("Actor torch profiler summary failed", exc_info=True)
+
+
+def reduce_actor_training_metrics(metrics: dict[str, list]) -> dict[str, float]:
+    """Average local actor metrics and all-reduce them across actor ranks."""
+    mean_metric_dict = {k: float(np.mean(v)) for k, v in metrics.items()}
+    return all_reduce_dict(
+        mean_metric_dict,
+        op=torch.distributed.ReduceOp.AVG,
+    )
 
 
 def flatten_rollout_batch_for_train(
@@ -199,168 +320,199 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
         metrics: dict[str, list] = {}
         update_epoch = int(self.cfg.algorithm.get("update_epoch", 1))
 
-        for _ in range(update_epoch):
-            global_batch_iter = split_dict_to_chunk(
-                self.rollout_batch,
-                num_global_batches,
-            )
-
-            for train_global_batch in global_batch_iter:
-                train_global_batch_size = int(
-                    train_global_batch["prev_logprobs"].shape[0]
-                )
-                assert train_global_batch_size == per_rank_batch_size, (
-                    f"Expected per-rank global batch size {per_rank_batch_size}, "
-                    f"got {train_global_batch_size}"
-                )
-                assert train_global_batch_size % micro_batch_size == 0
-
-                micro_batch_iter = split_dict_to_chunk(
-                    train_global_batch,
-                    micro_per_rank,
+        profiler, prof_section, profiler_dir = create_actor_torch_profiler(
+            rank=self._rank
+        )
+        try:
+            for _ in range(update_epoch):
+                global_batch_iter = split_dict_to_chunk(
+                    self.rollout_batch,
+                    num_global_batches,
                 )
 
-                self.optimizer.zero_grad()
-
-                for mb_idx, data in enumerate(micro_batch_iter):
-                    data = put_tensor_device(
-                        data,
-                        f"cuda:{int(os.environ['LOCAL_RANK'])}",
+                for train_global_batch in global_batch_iter:
+                    train_global_batch_size = int(
+                        train_global_batch["prev_logprobs"].shape[0]
                     )
-                    backward_ctx = self.before_micro_batch(
-                        self.model,
-                        is_last_micro_batch=(mb_idx + 1) == self.gradient_accumulation,
+                    assert train_global_batch_size == per_rank_batch_size, (
+                        f"Expected per-rank global batch size {per_rank_batch_size}, "
+                        f"got {train_global_batch_size}"
+                    )
+                    assert train_global_batch_size % micro_batch_size == 0
+
+                    micro_batch_iter = split_dict_to_chunk(
+                        train_global_batch,
+                        micro_per_rank,
                     )
 
-                    advantages = data["advantages"]
-                    old_logprobs = data["prev_logprobs"]
-                    returns = data.get("returns", None)
-                    prev_values = data.get("prev_values", None)
-                    loss_mask = data.get("loss_mask", None)
-                    loss_mask_sum = data.get("loss_mask_sum", None)
+                    self.optimizer.zero_grad()
 
-                    versions = data.get("versions", None)
-                    proximal_logprobs = data.get("proximal_logprobs", None)
-                    proximal_values = data.get("proximal_values", None)
-                    current_version = int(self.version) + 1
-
-                    forward_inputs = data.get("forward_inputs", None)
-                    if forward_inputs is None:
-                        raise ValueError(
-                            "Missing forward_inputs in run_training. "
-                            "This usually means batch splitting dropped nested dict fields."
+                    for mb_idx, data in enumerate(micro_batch_iter):
+                        data = put_tensor_device(
+                            data,
+                            f"cuda:{int(os.environ['LOCAL_RANK'])}",
+                        )
+                        backward_ctx = self.before_micro_batch(
+                            self.model,
+                            is_last_micro_batch=(mb_idx + 1)
+                            == self.gradient_accumulation,
                         )
 
-                    model_kwargs = {}
-                    if SupportedModel(self.cfg.actor.model.model_type) in [
-                        SupportedModel.OPENVLA,
-                        SupportedModel.OPENVLA_OFT,
-                    ]:
-                        model_kwargs["temperature"] = (
-                            self.cfg.algorithm.sampling_params.temperature_train
+                        advantages = data["advantages"]
+                        old_logprobs = data["prev_logprobs"]
+                        returns = data.get("returns", None)
+                        prev_values = data.get("prev_values", None)
+                        loss_mask = data.get("loss_mask", None)
+                        loss_mask_sum = data.get("loss_mask_sum", None)
+
+                        versions = data.get("versions", None)
+                        proximal_logprobs = data.get("proximal_logprobs", None)
+                        proximal_values = data.get("proximal_values", None)
+                        current_version = int(self.version) + 1
+
+                        forward_inputs = data.get("forward_inputs", None)
+                        if forward_inputs is None:
+                            raise ValueError(
+                                "Missing forward_inputs in run_training. "
+                                "This usually means batch splitting dropped nested dict fields."
+                            )
+
+                        model_kwargs = {}
+                        if SupportedModel(self.cfg.actor.model.model_type) in [
+                            SupportedModel.OPENVLA,
+                            SupportedModel.OPENVLA_OFT,
+                        ]:
+                            model_kwargs["temperature"] = (
+                                self.cfg.algorithm.sampling_params.temperature_train
+                            )
+                            model_kwargs["top_k"] = (
+                                self.cfg.algorithm.sampling_params.top_k
+                            )
+                        elif (
+                            SupportedModel(self.cfg.actor.model.model_type)
+                            == SupportedModel.GR00T
+                        ):
+                            model_kwargs["prev_logprobs"] = old_logprobs
+
+                        compute_values = self.cfg.algorithm.adv_type == "gae"
+
+                        with prof_section("fwd"):
+                            with self.amp_context:
+                                out = self.model(
+                                    forward_inputs=forward_inputs,
+                                    compute_logprobs=True,
+                                    compute_entropy=(
+                                        self.cfg.algorithm.entropy_bonus > 0
+                                    ),
+                                    compute_values=compute_values,
+                                    use_cache=False,
+                                    **model_kwargs,
+                                )
+
+                        if (
+                            SupportedModel(self.cfg.actor.model.model_type)
+                            == SupportedModel.GR00T
+                        ):
+                            old_logprobs = out["prev_logprobs"]
+
+                        with prof_section("loss"):
+                            loss_kwargs = {
+                                "loss_type": self.cfg.algorithm.loss_type,
+                                "logprob_type": self.cfg.algorithm.logprob_type,
+                                "reward_type": self.cfg.algorithm.reward_type,
+                                "single_action_dim": self.cfg.actor.model.get(
+                                    "action_dim", 7
+                                ),
+                                "logprobs": out["logprobs"],
+                                "values": out.get("values", None),
+                                "old_logprobs": old_logprobs,
+                                "advantages": advantages,
+                                "returns": returns,
+                                "prev_values": proximal_values
+                                if proximal_values is not None
+                                else prev_values,
+                                "proximal_logprobs": proximal_logprobs,
+                                "versions": versions,
+                                "current_version": current_version,
+                                "behave_weight_threshold": self.cfg.algorithm.get(
+                                    "behave_weight_threshold", None
+                                ),
+                                "clip_ratio_c": self.cfg.algorithm.get(
+                                    "clip_ratio_c", 3.0
+                                ),
+                                "clip_ratio_high": self.cfg.algorithm.clip_ratio_high,
+                                "clip_ratio_low": self.cfg.algorithm.clip_ratio_low,
+                                "value_clip": self.cfg.algorithm.get(
+                                    "value_clip", None
+                                ),
+                                "huber_delta": self.cfg.algorithm.get(
+                                    "huber_delta", None
+                                ),
+                                "loss_mask": loss_mask,
+                                "loss_mask_sum": loss_mask_sum,
+                                "max_episode_steps": (
+                                    self.cfg.env.train.max_episode_steps
+                                ),
+                                "task_type": self.cfg.runner.task_type,
+                                "critic_warmup": self.optimizer_steps
+                                < self.critic_warmup_steps,
+                            }
+
+                            loss, metrics_data = policy_loss(**loss_kwargs)
+
+                            entropy_loss = torch.tensor(
+                                0.0, device=torch.cuda.current_device()
+                            )
+                            if (
+                                self.cfg.algorithm.entropy_bonus > 0
+                                and not loss_kwargs["critic_warmup"]
+                            ):
+                                entropy = out["entropy"]
+                                entropy = reshape_entropy(
+                                    entropy,
+                                    entropy_type=self.cfg.algorithm.entropy_type,
+                                    action_dim=self.cfg.actor.model.get(
+                                        "action_dim", 7
+                                    ),
+                                    batch_size=out["logprobs"].shape[0],
+                                )
+                                entropy_loss = masked_mean(entropy, mask=loss_mask)
+                                loss = (
+                                    loss
+                                    - self.cfg.algorithm.entropy_bonus * entropy_loss
+                                )
+
+                            loss = loss / self.gradient_accumulation
+                        with prof_section("backward"):
+                            with backward_ctx:
+                                self.grad_scaler.scale(loss).backward()
+
+                        metrics_data["actor/entropy_loss"] = float(
+                            entropy_loss.detach().item()
                         )
-                        model_kwargs["top_k"] = self.cfg.algorithm.sampling_params.top_k
-                    elif (
-                        SupportedModel(self.cfg.actor.model.model_type)
-                        == SupportedModel.GR00T
-                    ):
-                        model_kwargs["prev_logprobs"] = old_logprobs
+                        metrics_data["actor/total_loss"] = float(loss.detach().item())
+                        append_to_dict(metrics, metrics_data)
 
-                    compute_values = self.cfg.algorithm.adv_type == "gae"
+                        if profiler is not None:
+                            profiler = step_actor_torch_profiler(profiler)
 
-                    with self.amp_context:
-                        out = self.model(
-                            forward_inputs=forward_inputs,
-                            compute_logprobs=True,
-                            compute_entropy=(self.cfg.algorithm.entropy_bonus > 0),
-                            compute_values=compute_values,
-                            use_cache=False,
-                            **model_kwargs,
-                        )
+                    torch.cuda.empty_cache()
 
-                    if (
-                        SupportedModel(self.cfg.actor.model.model_type)
-                        == SupportedModel.GR00T
-                    ):
-                        old_logprobs = out["prev_logprobs"]
-
-                    loss_kwargs = {
-                        "loss_type": self.cfg.algorithm.loss_type,
-                        "logprob_type": self.cfg.algorithm.logprob_type,
-                        "reward_type": self.cfg.algorithm.reward_type,
-                        "single_action_dim": self.cfg.actor.model.get("action_dim", 7),
-                        "logprobs": out["logprobs"],
-                        "values": out.get("values", None),
-                        "old_logprobs": old_logprobs,
-                        "advantages": advantages,
-                        "returns": returns,
-                        "prev_values": proximal_values
-                        if proximal_values is not None
-                        else prev_values,
-                        "proximal_logprobs": proximal_logprobs,
-                        "versions": versions,
-                        "current_version": current_version,
-                        "behave_weight_threshold": self.cfg.algorithm.get(
-                            "behave_weight_threshold", None
-                        ),
-                        "clip_ratio_c": self.cfg.algorithm.get("clip_ratio_c", 3.0),
-                        "clip_ratio_high": self.cfg.algorithm.clip_ratio_high,
-                        "clip_ratio_low": self.cfg.algorithm.clip_ratio_low,
-                        "value_clip": self.cfg.algorithm.get("value_clip", None),
-                        "huber_delta": self.cfg.algorithm.get("huber_delta", None),
-                        "loss_mask": loss_mask,
-                        "loss_mask_sum": loss_mask_sum,
-                        "max_episode_steps": self.cfg.env.train.max_episode_steps,
-                        "task_type": self.cfg.runner.task_type,
-                        "critic_warmup": self.optimizer_steps
-                        < self.critic_warmup_steps,
+                    with prof_section("optimizer.step"):
+                        grad_norm, lr_list = self.optimizer_step()
+                    extra_metrics = {
+                        "actor/grad_norm": grad_norm,
+                        "actor/lr": lr_list[0],
                     }
-
-                    loss, metrics_data = policy_loss(**loss_kwargs)
-
-                    entropy_loss = torch.tensor(0.0, device=torch.cuda.current_device())
-                    if (
-                        self.cfg.algorithm.entropy_bonus > 0
-                        and not loss_kwargs["critic_warmup"]
-                    ):
-                        entropy = out["entropy"]
-                        entropy = reshape_entropy(
-                            entropy,
-                            entropy_type=self.cfg.algorithm.entropy_type,
-                            action_dim=self.cfg.actor.model.get("action_dim", 7),
-                            batch_size=out["logprobs"].shape[0],
-                        )
-                        entropy_loss = masked_mean(entropy, mask=loss_mask)
-                        loss = loss - self.cfg.algorithm.entropy_bonus * entropy_loss
-
-                    loss = loss / self.gradient_accumulation
-                    with backward_ctx:
-                        self.grad_scaler.scale(loss).backward()
-
-                    metrics_data["actor/entropy_loss"] = float(
-                        entropy_loss.detach().item()
-                    )
-                    metrics_data["actor/total_loss"] = float(loss.detach().item())
-                    append_to_dict(metrics, metrics_data)
-
-                torch.cuda.empty_cache()
-
-                grad_norm, lr_list = self.optimizer_step()
-                extra_metrics = {
-                    "actor/grad_norm": grad_norm,
-                    "actor/lr": lr_list[0],
-                }
-                if len(lr_list) > 1:
-                    extra_metrics["critic/lr"] = lr_list[1]
-                append_to_dict(metrics, extra_metrics)
+                    if len(lr_list) > 1:
+                        extra_metrics["critic/lr"] = lr_list[1]
+                    append_to_dict(metrics, extra_metrics)
+            mean_metric_dict = reduce_actor_training_metrics(metrics)
+        finally:
+            if profiler is not None:
+                stop_actor_torch_profiler(profiler, profiler_dir)
 
         self.lr_scheduler.step()
         self.optimizer.zero_grad()
         clear_memory()
-
-        mean_metric_dict = {k: float(np.mean(v)) for k, v in metrics.items()}
-        mean_metric_dict = all_reduce_dict(
-            mean_metric_dict,
-            op=torch.distributed.ReduceOp.AVG,
-        )
         return mean_metric_dict

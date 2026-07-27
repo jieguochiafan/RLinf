@@ -13,7 +13,11 @@
 # limitations under the License.
 
 import asyncio
+import json
+import os
 import time
+from contextlib import contextmanager
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from omegaconf.omegaconf import DictConfig
@@ -49,6 +53,10 @@ class AsyncPPOEmbodiedRunner(EmbodiedRunner):
         self.env_metric_channel = Channel.create("EnvMetric")
         self.rollout_metric_channel = Channel.create("RolloutMetric")
         self.recompute_logprobs = bool(self.cfg.rollout.get("recompute_logprobs", True))
+        self._resource_profile_events_enabled = (
+            os.environ.get("RLINF_RESOURCE_PROFILE") == "1"
+        )
+        self._resource_profile_events_handle = None
 
         if self.cfg.runner.val_check_interval > 0:
             self.logger.warning(
@@ -104,6 +112,72 @@ class AsyncPPOEmbodiedRunner(EmbodiedRunner):
         self.actor.sync_model_to_rollout().wait()
         rollout_handle.wait()
 
+    def _write_resource_profile_event(self, event: str, *, step: int) -> None:
+        if not hasattr(self, "_resource_profile_events_enabled"):
+            self._resource_profile_events_enabled = (
+                os.environ.get("RLINF_RESOURCE_PROFILE") == "1"
+            )
+            self._resource_profile_events_handle = None
+
+        if not self._resource_profile_events_enabled:
+            return
+
+        try:
+            if self._resource_profile_events_handle is None:
+                profile_dir = Path(self.cfg.runner.logger.log_path) / "resource_profile"
+                profile_dir.mkdir(parents=True, exist_ok=True)
+                self._resource_profile_events_handle = (
+                    profile_dir / "runner_events.jsonl"
+                ).open("a", encoding="utf-8")
+
+            record = {
+                "event": event,
+                "pid": os.getpid(),
+                "step": int(step),
+                "wall_ns": time.time_ns(),
+            }
+            self._resource_profile_events_handle.write(
+                json.dumps(record, sort_keys=True) + "\n"
+            )
+            self._resource_profile_events_handle.flush()
+        except (OSError, ValueError) as error:
+            self._disable_resource_profile_events(error)
+
+    def _disable_resource_profile_events(self, error: Exception) -> None:
+        self._resource_profile_events_enabled = False
+        handle = getattr(self, "_resource_profile_events_handle", None)
+        self._resource_profile_events_handle = None
+        if handle is not None:
+            try:
+                handle.close()
+            except (OSError, ValueError):
+                pass
+        self.logger.warning(
+            "Disabling runner resource profile events after an I/O error: %s",
+            error,
+        )
+
+    def _close_resource_profile_events(self) -> None:
+        handle = getattr(self, "_resource_profile_events_handle", None)
+        self._resource_profile_events_handle = None
+        self._resource_profile_events_enabled = False
+        if handle is None:
+            return
+        try:
+            handle.close()
+        except (OSError, ValueError) as error:
+            self.logger.warning(
+                "Failed to close runner resource profile events: %s", error
+            )
+
+    @contextmanager
+    def _resource_profile_stage(self, event: str, *, step: int):
+        self._write_resource_profile_event(f"{event}.start", step=step)
+        try:
+            yield
+        finally:
+            self._write_resource_profile_event(f"{event}.end", step=step)
+
     def run(self) -> None:
         start_step = self.global_step
         start_time = time.time()
@@ -120,134 +194,149 @@ class AsyncPPOEmbodiedRunner(EmbodiedRunner):
             actor_channel=self.actor_channel,
             metric_channel=self.env_metric_channel,
         )
-        rollout_handle: Handle = self.rollout.generate(
-            input_channel=self.rollout_channel,
-            output_channel=self.env_channel,
-            metric_channel=self.rollout_metric_channel,
-        )
 
-        while self.global_step < self.max_steps:
-            with self.timer("step"):
-                with self.timer("recv_rollout_trajectories"):
-                    self.actor.recv_rollout_trajectories(
-                        input_channel=self.actor_channel
-                    ).wait()
+        try:
+            while self.global_step < self.max_steps:
+                step = self.global_step + 1
+                with self._resource_profile_stage("step", step=step):
+                    with self.timer("step"):
+                        rollout_handle: Handle = self.rollout.generate(
+                            input_channel=self.rollout_channel,
+                            output_channel=self.env_channel,
+                            metric_channel=self.rollout_metric_channel,
+                        )
+                        with self.timer("recv_rollout_trajectories"):
+                            self.actor.recv_rollout_trajectories(
+                                input_channel=self.actor_channel
+                            ).wait()
+                        rollout_handle.wait()
 
-                if self.recompute_logprobs:
-                    with self.timer("recompute_logprobs"):
-                        self.actor.compute_proximal_logprobs().wait()
+                        if self.recompute_logprobs:
+                            with self.timer("recompute_logprobs"):
+                                self.actor.compute_proximal_logprobs().wait()
 
-                with self.timer("cal_adv_and_returns"):
-                    rollout_metrics_list = (
-                        self.actor.compute_advantages_and_returns().wait()
+                        with self.timer("cal_adv_and_returns"):
+                            rollout_metrics_list = (
+                                self.actor.compute_advantages_and_returns().wait()
+                            )
+
+                        with self.timer("actor_training"):
+                            with self._resource_profile_stage(
+                                "actor_training", step=step
+                            ):
+                                actor_training_handle = self.actor.run_training()
+                                training_metrics = actor_training_handle.wait()
+
+                        self.global_step += 1
+                        self.actor.set_global_step(self.global_step).wait()
+                        self.rollout.set_global_step(self.global_step).wait()
+                        self.env.set_global_step(self.global_step).wait()
+                        with self.timer("update_rollout_weights"):
+                            self.update_rollout_weights()
+
+                    time_metrics = self.timer.consume_durations()
+                    time_metrics = {f"time/{k}": v for k, v in time_metrics.items()}
+                    actor_time_metrics, actor_time_metrics_per_rank = (
+                        actor_training_handle.consume_durations(return_per_rank=True)
+                    )
+                    actor_time_metrics = {
+                        f"time/actor/{k}": v for k, v in actor_time_metrics.items()
+                    }
+                    time_metrics.update(actor_time_metrics)
+
+                    train_metrics = {
+                        f"train/{k}": v
+                        for k, v in self._aggregate_numeric_metrics(
+                            training_metrics
+                        ).items()
+                    }
+                    rollout_metrics = {
+                        f"rollout/{k}": v
+                        for k, v in self._aggregate_numeric_metrics(
+                            rollout_metrics_list
+                        ).items()
+                    }
+                    env_metrics, env_time_metrics_per_rank, env_metrics_per_rank = (
+                        self.get_env_metrics()
+                    )
+                    rollout_time_metrics, rollout_time_metrics_per_rank = (
+                        self.get_rollout_metrics()
+                    )
+                    self.metric_logger.log(train_metrics, self.global_step)
+                    if env_metrics:
+                        self.metric_logger.log(env_metrics, self.global_step)
+                    if rollout_time_metrics:
+                        self.metric_logger.log(rollout_time_metrics, self.global_step)
+                    self.metric_logger.log(rollout_metrics, self.global_step)
+                    self.metric_logger.log(time_metrics, self.global_step)
+                    self._log_ranked_metrics(
+                        metrics_list=training_metrics,
+                        step=self.global_step,
+                        prefix="train",
+                        worker_group_name=self.actor.worker_group_name,
+                    )
+                    self._log_ranked_metrics(
+                        metrics_list=actor_time_metrics_per_rank,
+                        step=self.global_step,
+                        prefix="time/actor",
+                        worker_group_name=self.actor.worker_group_name,
+                    )
+                    self._log_ranked_metrics(
+                        metrics_list=rollout_metrics_list,
+                        step=self.global_step,
+                        prefix="rollout",
+                        worker_group_name=self.actor.worker_group_name,
+                    )
+                    self._log_ranked_metrics(
+                        metrics_list=env_time_metrics_per_rank,
+                        step=self.global_step,
+                        prefix="time/env",
+                        worker_group_name=self.env.worker_group_name,
+                        add_prefix=False,
+                    )
+                    self._log_ranked_metrics(
+                        metrics_list=env_metrics_per_rank,
+                        step=self.global_step,
+                        prefix="env",
+                        worker_group_name=self.env.worker_group_name,
+                        add_prefix=False,
+                    )
+                    self._log_ranked_metrics(
+                        metrics_list=rollout_time_metrics_per_rank,
+                        step=self.global_step,
+                        prefix="time/rollout",
+                        worker_group_name=self.rollout.worker_group_name,
+                        add_prefix=False,
                     )
 
-                with self.timer("actor_training"):
-                    actor_training_handle = self.actor.run_training()
-                    training_metrics = actor_training_handle.wait()
+                    logging_metrics = {
+                        **time_metrics,
+                        **train_metrics,
+                        **rollout_metrics,
+                    }
+                    if env_metrics:
+                        logging_metrics.update(env_metrics)
 
-                self.global_step += 1
-                self.actor.set_global_step(self.global_step).wait()
-                self.rollout.set_global_step(self.global_step).wait()
-                self.env.set_global_step(self.global_step).wait()
-                with self.timer("update_rollout_weights"):
-                    self.update_rollout_weights()
+                    self.print_metrics_table_async(
+                        self.global_step - 1,
+                        self.max_steps,
+                        start_time,
+                        logging_metrics,
+                        start_step,
+                    )
 
-            time_metrics = self.timer.consume_durations()
-            time_metrics = {f"time/{k}": v for k, v in time_metrics.items()}
-            actor_time_metrics, actor_time_metrics_per_rank = (
-                actor_training_handle.consume_durations(return_per_rank=True)
-            )
-            actor_time_metrics = {
-                f"time/actor/{k}": v for k, v in actor_time_metrics.items()
-            }
-            time_metrics.update(actor_time_metrics)
-
-            train_metrics = {
-                f"train/{k}": v
-                for k, v in self._aggregate_numeric_metrics(training_metrics).items()
-            }
-            rollout_metrics = {
-                f"rollout/{k}": v
-                for k, v in self._aggregate_numeric_metrics(
-                    rollout_metrics_list
-                ).items()
-            }
-            env_metrics, env_time_metrics_per_rank, env_metrics_per_rank = (
-                self.get_env_metrics()
-            )
-            rollout_time_metrics, rollout_time_metrics_per_rank = (
-                self.get_rollout_metrics()
-            )
-            self.metric_logger.log(train_metrics, self.global_step)
-            if env_metrics:
-                self.metric_logger.log(env_metrics, self.global_step)
-            if rollout_time_metrics:
-                self.metric_logger.log(rollout_time_metrics, self.global_step)
-            self.metric_logger.log(rollout_metrics, self.global_step)
-            self.metric_logger.log(time_metrics, self.global_step)
-            self._log_ranked_metrics(
-                metrics_list=training_metrics,
-                step=self.global_step,
-                prefix="train",
-                worker_group_name=self.actor.worker_group_name,
-            )
-            self._log_ranked_metrics(
-                metrics_list=actor_time_metrics_per_rank,
-                step=self.global_step,
-                prefix="time/actor",
-                worker_group_name=self.actor.worker_group_name,
-            )
-            self._log_ranked_metrics(
-                metrics_list=rollout_metrics_list,
-                step=self.global_step,
-                prefix="rollout",
-                worker_group_name=self.actor.worker_group_name,
-            )
-            self._log_ranked_metrics(
-                metrics_list=env_time_metrics_per_rank,
-                step=self.global_step,
-                prefix="time/env",
-                worker_group_name=self.env.worker_group_name,
-                add_prefix=False,
-            )
-            self._log_ranked_metrics(
-                metrics_list=env_metrics_per_rank,
-                step=self.global_step,
-                prefix="env",
-                worker_group_name=self.env.worker_group_name,
-                add_prefix=False,
-            )
-            self._log_ranked_metrics(
-                metrics_list=rollout_time_metrics_per_rank,
-                step=self.global_step,
-                prefix="time/rollout",
-                worker_group_name=self.rollout.worker_group_name,
-                add_prefix=False,
-            )
-
-            logging_metrics = {**time_metrics, **train_metrics, **rollout_metrics}
-            if env_metrics:
-                logging_metrics.update(env_metrics)
-
-            self.print_metrics_table_async(
-                self.global_step - 1,
-                self.max_steps,
-                start_time,
-                logging_metrics,
-                start_step,
-            )
-
-            _, save_model, _ = check_progress(
-                self.global_step,
-                self.max_steps,
-                self.cfg.runner.val_check_interval,
-                self.cfg.runner.save_interval,
-                1.0,
-                run_time_exceeded=False,
-            )
-            if save_model:
-                self._save_checkpoint()
+                    _, save_model, _ = check_progress(
+                        self.global_step,
+                        self.max_steps,
+                        self.cfg.runner.val_check_interval,
+                        self.cfg.runner.save_interval,
+                        1.0,
+                        run_time_exceeded=False,
+                    )
+                    if save_model:
+                        self._save_checkpoint()
+        finally:
+            self._close_resource_profile_events()
 
         self.metric_logger.finish()
 
@@ -256,7 +345,5 @@ class AsyncPPOEmbodiedRunner(EmbodiedRunner):
         self.log_thread.join(timeout=1.0)
 
         self.env.stop().wait()
-        self.rollout.stop().wait()
 
         env_handle.wait()
-        rollout_handle.wait()

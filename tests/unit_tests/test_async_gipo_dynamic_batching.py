@@ -1,5 +1,8 @@
 import asyncio
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
+import pytest
 import torch
 
 from rlinf.data.embodied_async import InferenceRequest
@@ -114,3 +117,47 @@ def test_gipo_flush_sends_one_response_per_request():
     assert len(puts) == 2
     assert puts[0][0] == "action:0:0:r0"
     assert puts[1][1].rollout_result.actions.shape == (2, 2)
+
+
+class _CancellingRequestChannel:
+    def get_nowait(self):
+        raise asyncio.CancelledError
+
+
+def test_gipo_inference_service_starts_and_stops_torch_profiler():
+    worker = object.__new__(AsyncMultiStepRolloutWorker)
+    worker.cfg = SimpleNamespace(
+        algorithm={"async_inference": {"target_batch_size": 1, "max_wait_time_s": 0.0}}
+    )
+    worker._background_weight_sync_active = False
+    worker._start_torch_profiler = MagicMock()
+    worker._stop_torch_profiler = MagicMock()
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(
+            worker._serve_inference_gipo(
+                _CancellingRequestChannel(),
+                _QueueChannel(),
+                _QueueChannel(),
+            )
+        )
+
+    worker._start_torch_profiler.assert_called_once_with()
+    worker._stop_torch_profiler.assert_called_once_with()
+
+
+def test_gipo_action_generation_phase_uses_generation_profiler(monkeypatch):
+    worker = object.__new__(AsyncMultiStepRolloutWorker)
+    worker._torch_profiler = object()
+    context = object()
+    record_function = MagicMock(return_value=context)
+    monkeypatch.setattr("torch.profiler.record_function", record_function)
+
+    assert (
+        worker._profile_generation_context({"phase": "gipo_action_generation"})
+        is context
+    )
+    assert worker._should_step_generation_profiler(
+        {"phase": "gipo_action_generation"}
+    )
+    record_function.assert_called_once_with("generation")
