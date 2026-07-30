@@ -16,8 +16,8 @@ hydra:
 cluster:
   num_nodes: 1
   component_placement:
-    env,rollout: 0-7
-    actor: 0-7
+    env,rollout: 0-1
+    actor: 0-1
   resource_pool:
     enabled: false
     allocation_mode: default
@@ -121,7 +121,7 @@ env:
   enable_offload: False
 
   train:
-    total_num_envs: 96
+    total_num_envs: 16
     max_episode_steps: 300
     auto_reset: False
     max_steps_per_rollout_epoch: 300
@@ -162,8 +162,8 @@ rollout:
 actor:
   group_name: "ActorGroup"
   training_backend: "fsdp"
-  micro_batch_size: 45
-  global_batch_size: 360
+  micro_batch_size: 15
+  global_batch_size: 120
   seed: 42
   enable_offload: False
 
