@@ -194,7 +194,8 @@ include-package-data = true
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["rlinf*"]
-exclude = ["tests*", "docs*", "examples*", "docker*", "toolkits*"]
+# rlinf_rollout is a separate distribution with its own pyproject.toml.
+exclude = ["tests*", "docs*", "examples*", "docker*", "toolkits*", "rlinf_rollout*"]
 
 [tool.setuptools.package-data]
 rlinf = ["**/*.yaml", "**/*.yml"]
@@ -205,7 +206,7 @@ indent-width = 4
 target-version = "py311"
 
 [tool.ruff.lint]
-isort = {known-first-party = ["rlinf"]}
+isort = {known-first-party = ["rlinf", "rlinf_rollout"]}
 select = ["C", "E", "F", "I", "W", "CPY001", "RUF013", "UP006", "PERF102", "PLC1802", "PLC0208", "D", "RUF002", "DOC102", "DOC202", "DOC403", "DOC502"]
 ignore = [
     "C901", # "complex-structure"

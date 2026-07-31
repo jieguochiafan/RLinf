@@ -84,13 +84,30 @@ rlinf_rollout/
 
 ## 4. 实施计划
 
-### Phase 0 — 骨架与协议先行
+### Phase 0 — 骨架与协议先行 ✅ 已完成
 
 1. 新建顶层 `rlinf_rollout/`，独立 `pyproject.toml`（extras：`embodied`/`sglang`/`vllm`），禁止 import 主仓 `rlinf.*`。
 2. 编写 `api/v1/` 冻结协议：
    - `WeightUpdateRequest/Ack`（version、bucket/patch 模式、张量清单、src 拓扑描述）
    - `Trajectory` / `RolloutResult`（从 `rlinf/data/embodied_io_struct.py`、`io_struct.py` 提炼；去掉按 actor world_size 切分；`forward_inputs` 改为策略自描述字段）
    - `RolloutTask` + 三个 ABC：`WeightReceiver`、`TrajectorySink`、`TaskSource`
+
+落地情况：
+
+- `rlinf_rollout/{__init__.py,pyproject.toml,README.md,LICENSE}`：`package-dir = {"rlinf_rollout" = "."}`，
+  在主仓可直接 `import rlinf_rollout`，subtree split 后同一份配置仍可用。
+- `rlinf_rollout/api/v1/common.py`：`SCHEMA_VERSION = "v1"`、`SchemaBase`（`schema_version` 字段 +
+  `field_names()` / `to_dict()` / 严格 `from_dict()`）、`SchemaError`、`Metadata`。
+- `weight.py`：`WeightSyncMode`/`WeightTransport`/`WeightUpdateStatus`、`TensorSpec`、
+  `SourceTopology`（group_name / src_ranks / parallel_sizes / rank_map，取代硬编码 actor 拓扑）、
+  `WeightUpdateRequest`、`WeightUpdateAck`、`WeightReceiver`。
+- `trajectory.py`：`TensorLayout`/`PartitionAxis`/`FinishReason`、`PolicyInputs`（替代 `forward_inputs`）、
+  `ActionChunkResult`、`Trajectory`、`RolloutResult`（LLM）、`ConsumerSpec`（消费方声明切分粒度）、`TrajectorySink`；
+  不含 advantages / returns / ref_logprobs / bootstrap_values。
+- `task.py`：`TaskKind`/`RolloutMode`、`SamplingParams`、`PromptSpec`、`EpisodeSpec`、`RolloutTask`、`TaskSource`。
+- `rlinf_rollout/tests/test_api_v1_schema.py`：锁定全部字段集合与枚举值、校验行为、ABC 可实现性，
+  并断言 `rlinf_rollout/` 内不出现 `rlinf.*` import；主仓 CI 经
+  `tests/unit_tests/test_rlinf_rollout.py` 代跑该套件。
 
 ### Phase 1 — 基建复制（机械性，最小改动）
 
@@ -127,7 +144,8 @@ rlinf_rollout/
 ## 5. 验收标准
 
 - [ ] `pip install -e rlinf_rollout[embodied]` / `[sglang]` 可独立安装，不依赖主仓 `rlinf` 包
-- [ ] `api/v1` 全部类型带 `SCHEMA_VERSION`，有单元测试锁定字段集合（防止意外破坏兼容）
+      （Phase 0 已验证 core：wheel 构建 + `pip install -e --no-deps` 可 import；extras 依赖待 Phase 2/3 实机验证）
+- [x] `api/v1` 全部类型带 `SCHEMA_VERSION`，有单元测试锁定字段集合（防止意外破坏兼容）
 - [ ] 具身链路 eval-only 冒烟通过；LLM 链路固定权重生成冒烟通过
 - [ ] rollout/env worker 代码中不再出现 `cfg.actor.` / `cfg.algorithm.` / actor 组名硬编码
 - [ ] `rollout-serve` 可独立启动并常驻，客户端 SDK 可 push 权重、拉取轨迹
