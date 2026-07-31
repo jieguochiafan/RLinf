@@ -24,6 +24,7 @@ from rlinf.envs.chunk_runner import (
     maybe_apply_ignore_terminations,
 )
 from rlinf.envs.reset_mode import robocasa_hard_reset_from_cfg
+from rlinf.envs.robocasa.reset_randomization import install_reset_randomization
 from rlinf.envs.robocasa.utils import (
     OBS_KEY_CAMERA_NAME_MAPPING,
     OBS_KEY_ROBOCASA_IMAGE_MAPPING,
@@ -135,6 +136,12 @@ class RobocasaEnv(gym.Env):
         """Create environment factory functions for each parallel environment."""
         env_fns = []
         hard_reset = robocasa_hard_reset_from_cfg(self.cfg)
+        reset_randomization_cfg = self.cfg.get("reset_randomization", {})
+        reset_randomization = (
+            OmegaConf.to_container(reset_randomization_cfg, resolve=True)
+            if OmegaConf.is_config(reset_randomization_cfg)
+            else dict(reset_randomization_cfg)
+        )
 
         for env_id in range(self.num_envs):
             task_idx = self.task_ids[env_id]
@@ -153,6 +160,7 @@ class RobocasaEnv(gym.Env):
                 height=camera_heights,
                 robot=robot_name,
                 hard_reset=hard_reset,
+                reset_randomization=reset_randomization,
             ):
                 """Factory function to create a robosuite environment in subprocess."""
                 import robocasa  # noqa: F401 RoboCasa must register envs per subprocess
@@ -182,7 +190,7 @@ class RobocasaEnv(gym.Env):
                     hard_reset=hard_reset,
                     render_camera="robot0_agentview_center",  # Use same camera as observation
                 )
-                return env
+                return install_reset_randomization(env, reset_randomization)
 
             env_fns.append(env_fn)
 

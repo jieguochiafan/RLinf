@@ -86,6 +86,25 @@ RoboCasa maps this to `hard_reset=False`, reusing simulator assets across resets
 
 Current `examples/embodiment/config/env/robocasa_closedrawer.yaml` includes this optimized mode.
 
+### Low-cost reset randomization
+
+RoboCasa's optimized reset reuses the compiled MuJoCo model, but it can still
+vary physical initial state on every reset:
+
+```yaml
+reset_randomization:
+  enabled: true
+  drawer_open_range: [0.65, 1.0]
+  resample_object_placements: true
+  placement_sampling_attempts: 3
+```
+
+`drawer_open_range` overrides the task's drawer state during its normal reset.
+For tasks with movable objects, `resample_object_placements` samples new poses
+from the existing placement initializer. Neither operation rebuilds the MuJoCo
+model or render context. Layout, style, fixture selection, and object identity
+remain fixed until a full reset.
+
 ## Measured Results
 
 ### LIBERO

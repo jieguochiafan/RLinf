@@ -39,3 +39,11 @@ state_space: 25d
 image_space: 2views
 reset_optimization_enabled: true
 reset_mode: task_aware
+reset_randomization:
+  enabled: true
+  # Keep the compiled kitchen model, but vary the task's physical start state.
+  drawer_open_range: [0.65, 1.0]
+  # Used by RoboCasa tasks that contain movable task objects. CloseDrawer has
+  # no such objects, so its variation comes from drawer and robot joint state.
+  resample_object_placements: true
+  placement_sampling_attempts: 3
