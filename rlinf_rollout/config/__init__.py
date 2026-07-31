@@ -22,8 +22,10 @@ from rlinf_rollout.config.models import (
 from rlinf_rollout.config.rollout import (
     DEFAULT_LLM_ROLLOUT_CONFIG,
     DEFAULT_ROLLOUT_CONFIG,
+    DEFAULT_SERVE_CONFIG,
     FORBIDDEN_SECTIONS,
     SUPPORTED_LLM_ROLLOUT_BACKENDS,
+    SUPPORTED_TASK_SOURCES,
     LLMRolloutConfig,
     RolloutConfig,
     RolloutConfigError,
@@ -37,6 +39,7 @@ from rlinf_rollout.config.rollout import (
 __all__ = [
     "DEFAULT_LLM_ROLLOUT_CONFIG",
     "DEFAULT_ROLLOUT_CONFIG",
+    "DEFAULT_SERVE_CONFIG",
     "EMBODIED_MODEL",
     "FORBIDDEN_SECTIONS",
     "LLMRolloutConfig",
@@ -45,6 +48,7 @@ __all__ = [
     "RolloutKind",
     "RolloutMode",
     "SUPPORTED_LLM_ROLLOUT_BACKENDS",
+    "SUPPORTED_TASK_SOURCES",
     "SupportedModel",
     "build_rollout_config",
     "rollout_kind",

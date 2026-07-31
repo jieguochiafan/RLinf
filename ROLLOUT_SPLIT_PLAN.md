@@ -76,7 +76,7 @@ rlinf_rollout/
 │       └── server/           # OpenAI 兼容 HTTP server / router
 ├── postprocess/              # 可选：bootstrap 塑形 + TrajectoryPostprocessor hook
 ├── plugins/                  # 可选：DAgger expert / RLT
-├── serve/                    # rollout-serve 守护入口
+├── serve/                    # rollout-serve 守护入口（protocol/control/task_source/controller/service/main + configs/）
 └── client/                   # 训练侧接入 SDK：push_weights / get_trajectories / submit_tasks
 ```
 
@@ -367,8 +367,10 @@ rlinf_rollout/
   `RolloutManager` / `ActorManager` / `SchedulerWorker` 读 `cfg.algorithm.*` / `cfg.actor.*`，
   它们是 driver 侧的自动扩缩容编排，不在 rollout worker 进程内运行；rollout 侧只用
   `RolloutScalingScheduler`（仅依赖 worker + channel）。Phase 4 的 `serve/` 入口决定是否
-  把 driver 侧编排一并自包含。同理 `data/io_struct.py` 的 `BatchResizingIterator`
-  （actor 训练用迭代器）仍带 `cfg.actor.seed`，rollout 链路不引用它。
+  把 driver 侧编排一并自包含——结论是**暂不**：`RolloutController` 不启动 `dynamic_scheduler`
+  的 manager / scheduler worker（`rollout.placement_mode: auto` 下引擎侧的
+  `RolloutScalingScheduler` 仍可用，driver 侧编排留给使用方）。同理 `data/io_struct.py` 的
+  `BatchResizingIterator`（actor 训练用迭代器）仍带 `cfg.actor.seed`，rollout 链路不引用它。
 
 - **测试** `rlinf_rollout/tests/test_phase3_llm.py`（140 项，不需要 Ray / GPU / sglang / vllm）
   - vendor 完整性：25 个引擎/worker 模块存在、`hybrid_engines/` 已消失、两个引擎的版本闸门、
@@ -403,13 +405,164 @@ rlinf_rollout/
   `workers.rollout.*`，由测试与目录树比对保持同步）；`[sglang]` / `[vllm]` extras 补
   `fastapi` / `uvicorn`（HTTP server 与 router worker 需要）。
 
-### Phase 4 — 服务化入口 + 客户端 SDK
+### Phase 4 — 服务化入口 + 客户端 SDK ✅ 已完成
 
 8. `rollout-serve --config x.yaml` 守护入口：attach/启动 Ray → 按 placement 拉起 env+rollout（或 LLM engine）worker → 常驻协程 + `RolloutController`。
 9. `client/` SDK：`push_weights()`（NCCL 发送协程或 ckpt 路径）、`get_trajectories()`、`submit_tasks()`。
 10. 冒烟验证：
     - 具身：eval-only 配置（无 actor，参考 `evaluations/eval_embodied_agent.py`）跑通采集
     - LLM：固定权重 + prompt 文件跑通生成
+
+落地情况：
+
+- **控制面（对外唯一的“服务管理”入口）**
+  - `serve/protocol.py`：`ServiceState` / `WeightPushStatus` / `ServiceEndpoints` / `ServiceStatus` /
+    `TaskAck` / `WeightPushResult` + `control_group_name(name) -> "<name>_control"`。全部复用
+    `api/v1.SchemaBase`（带 `schema_version`、严格 `from_dict`），但**不属于**冻结的数据面协议：
+    它们描述“服务”而非“数据”。该模块只 import `api/v1`，客户端因此不必拖入 Ray/引擎/模拟器。
+  - `serve/control.py`：`ControlPlaneState`——任务队列（按 `priority` 出队）、权重请求 FIFO、
+    权重结果环形保留（`MAX_RETAINED_WEIGHT_RESULTS=64`，客户端不轮询也不会涨内存）、状态快照、
+    stop 标志。纯 Python，无 Ray，可独立单测。
+  - `serve/control_worker.py`：`ControlPlaneWorker(Worker)`，单 rank CPU worker，方法逐条转发给
+    `ControlPlaneState`。客户端用 `WorkerGroup.from_group_name(ControlPlaneWorker, "<name>_control")`
+    连上，driver 侧用同一个 group handle 轮询——**两侧都不接触 Ray 对象**。
+  - 任务准入是硬约束：控制面按 controller 的 `ACCEPTED_TASK_KINDS` 拒绝它跑不了的 kind，并在
+    `TaskAck.rejected` 里给出原因（具身链路只接受 `embodied_eval`，见下）。
+
+- **`serve/controller.py`（取代训练仓的 runner）**
+  - `RolloutController` 基类：`start()` / `serve_forever()` / `shutdown()` / `status()`，
+    poll 循环只做三件 driver 才能做的事——执行客户端权重推送、拉取 `TaskSource` 并派发、发布
+    `ServiceStatus`。worker group 与 channel 全部**鸭子类型**注入（`group.method(...) -> .wait()`、
+    `channel_factory`），因此完整控制流可以在无 Ray 环境下用 stub 驱动测试。
+    `resolve_group_call()` 统一把 `WorkerGroupFuncResult` 归一成 per-rank list。
+  - `EmbodiedRolloutController`：collect 模式下 `interact()` / `generate()` 作为常驻 handle 起在
+    `svc_env` / `svc_rollout` 两个 channel 上，轨迹经 `trajectory_channel`（= `endpoints.output_channel`）
+    出到客户端；metric channel 被 drain 成 `ServiceStatus.metrics`。
+    **采集是配置驱动、连续的**：episode 形状来自 `env.train`，`AsyncEnvWorker` 在 `init_worker()`
+    就建好 env，无法按任务重配，所以客户端只能提交 `EMBODIED_EVAL`（触发一轮 `env.eval` 评测，
+    metrics 经 `compute_evaluate_metrics` 汇总进 status）。`EMBODIED_EPISODE` 会被明确拒绝而不是
+    静默接受。
+  - `LLMRolloutController`：**任务驱动**。每个 `LLM_GENERATION` 任务按引擎数切分成
+    `num_engines` 个 `RolloutRequest` 投入 `svc_engine_in`，调 `rollout()`，从 `svc_engine_out`
+    收满“prompt 数”个 seq-group 结果（`rollout.serve.generation_timeout_seconds` 超时报错到任务上），
+    再经 `data/convert.rollout_result_to_api` 转成 `api/v1.RolloutResult` 交给 `TrajectorySink`。
+    **prompt 必须已 tokenize**：driver 不持有 tokenizer，纯文本 prompt 直接报错而不是错编码
+    （prompt 文件在 CLI 侧用引擎的 `AutoTokenizer` 编码）。
+
+- **权重推送（第 1 个对外接口的服务化）**
+  - `weight_sync/checkpoint.py`：`CheckpointWeightReceiver` 实现 `api/v1.WeightReceiver` 的
+    `CHECKPOINT` 传输——语义与 collective 相反，是**发送方定版**：`request.version` 权威，
+    不新于已服务版本则回 `SKIPPED`，加载失败回 `FAILED` ack（不抛异常）。支持嵌套
+    `{"state_dict"|"model"|...: ...}` 与自定义 `loader`。已加入 `weight_sync` 懒加载导出。
+  - `workers/rollout/hf/huggingface_worker.py` 新增 `receive_weight_update(request)`：按
+    `request.transport` 分派（`COLLECTIVE` → 既有 `CollectiveWeightReceiver`，`CHECKPOINT` →
+    惰性构建的 `CheckpointWeightReceiver`，其余 → `FAILED` ack），并统一维护 `self.version` 与
+    `finished_episodes`；`sync_weights()` 改为它的薄封装，另加 `served_weight_version()`。
+  - controller 侧的语义分层：具身 collect + `weight_sync.no_wait` → 只 `request_weight_sync()`，
+    结果为 `ACCEPTED`（后台协程稍后 apply，无法给出 per-receiver ack）；否则走
+    `receive_weight_update` 拿**权威 ack**（`served_version` 取各 rank 最小值）。
+    LLM 链路只支持 `COLLECTIVE`（引擎的 sender 在 init 时由 `EngineWeightSyncSetup` 固定，
+    没有自己的版本号，ack 回显请求版本），`CHECKPOINT` 明确报错。eval 模式两条链路都拒绝推送。
+
+- **`serve/service.py` + `serve/main.py`**
+  - `RolloutService`：`validate_rollout_config` → `Cluster(cluster_cfg=cfg.cluster)` →
+    launch 控制面（`NodePlacementStrategy([0])`）→ 按 `HybridComponentPlacement`（具身）/
+    `RolloutComponentPlacement`（LLM）launch worker group → 组装 controller。
+    LLM 的 `weight_reload` 由 `rollout.mode` 决定（`collect` → `"sync"`，`eval` → `None`）。
+  - `plan()`/`ServicePlan`：**不触碰 Ray** 就能回答“会启动什么”，`rollout-serve --dry-run` 直接
+    打印它（JSON）。worker 类通过静态映射表 `EMBODIED_WORKER_CLASS_PATHS` /
+    `LLM_WORKER_CLASS_PATHS`（`"module:Class"`）表达，launch 时才 importlib 解析——于是没装
+    SGLang/vLLM 也能 dry-run；测试在运行时可用时断言该表与 `get_rollout_backend_worker` 一致。
+  - CLI：`--config`、可重复的 `--set key=value`（按 YAML 解析，`null`/`true`/数字保型）、
+    `--name`、`--dry-run`、`--print-config`；配置错误只打印一行并返回 exit code 2。
+  - `reward.use_reward_model=true` 直接 `NotImplementedError`：reward worker 尚未 vendor
+    （仍在 Phase 2 的 forward-reference 白名单里），不做静默降级。
+
+- **`serve/task_source.py`**：`ControlPlaneTaskSource`（默认，服务是被动服务端，永不 exhausted）、
+  `StaticTaskSource`（`repeat` 可选）、`JsonlPromptTaskSource`（`input_ids` 直用 / 文本经
+  `encode` 编码 / `answer`、`image_data` 透传 / `batch_size`、`max_prompts`、`repeat`）、
+  `episode_task()` 助手。由 `rollout.serve.task_source.type` 选择：
+  `control_plane` | `prompt_file`（仅 LLM）| `eval_rounds`（仅具身）。
+
+- **配置** `config/rollout.py` 新增 `DEFAULT_SERVE_CONFIG`（合入两条链路默认值）与
+  `_validate_serve_config`。`rollout.serve` 只描述**服务**，不描述 rollout 本身：
+
+  | key | 含义 |
+  |---|---|
+  | `serve.name` | 服务名，控制面组名为 `<name>_control` |
+  | `serve.output_channel` | 客户端拉取 api/v1 payload 的 channel（默认 `<name>_output`） |
+  | `serve.poll_interval_seconds` / `status_interval_seconds` | 服务循环与状态发布节奏 |
+  | `serve.max_pending_tasks` | 控制面任务队列上限（0 = 无界） |
+  | `serve.generation_timeout_seconds` | LLM 单任务生成超时 |
+  | `serve.stop_when_done` | 任务源 drain 后是否退出（null = 有限源 true、`control_plane` false） |
+  | `serve.task_source.*` | `type` / `path` / `num_rounds` / `max_prompts` / `repeat` |
+
+- **`client/`（训练侧 SDK，三个动词）**
+  - `RolloutClient(service_name)`：懒连接（`Cluster()` attach + `WorkerGroup.from_group_name`），
+    `status()` / `wait_until_ready()` / `describe()` / `stop_service()`；
+    `submit_tasks()` / `submit_prompts()` / `request_eval()`；
+    `get_trajectories(max_items, timeout, key)`（`Channel.connect` + `get_nowait` 轮询，
+    channel 名从 `ServiceStatus.endpoints` 发现）/ `num_pending_outputs()`；
+    `push_weights(request, sender=..., wait=...)` / `push_checkpoint(path, version)` /
+    `wait_for_weights(version)`。
+  - `push_weights` 把 collective 的**时序约束编码进 API**：先入队（服务据此让 receiver 就位），
+    再跑 `sender`（可为协程，训练侧自己的广播），最后轮询结果——顺序错了就会死锁，所以不留给调用方。
+  - `client/weight_sender.py`：`CheckpointWeightPublisher`（写版本化 ckpt + 自动清理 `keep_last` +
+    直接产出 `CHECKPOINT` 请求）；collective sender **有意不封装**——它必须由训练侧自己的 worker
+    在自己的 collective 上发起，`describe_collective_sender()` 把契约（组名/root rank/world_size/
+    syncer 一致性/时序/版本语义）以数据形式给出，docstring 里附可运行的代码骨架。
+
+- **示例配置（wheel 内一并分发）** `serve/configs/`：
+  `embodied_eval_maniskill_mlp.yaml`（eval-only、`task_source: eval_rounds`、无 sink，
+  对应冒烟项 10 的具身场景）、`llm_generate_sglang.yaml`（`mode: eval` 固定权重 +
+  `task_source: prompt_file`，`model_path` 可由 `--set` 或 `RLINF_ROLLOUT_MODEL_PATH` 注入）、
+  `example_prompts.jsonl`（5 条，含一条预 tokenize 的）。
+
+- **测试** `rlinf_rollout/tests/test_phase4_serve.py`（155 项，不需要 Ray / GPU / 引擎 / 模拟器）
+  - 控制面协议：4 个消息的字段集合与 2 个枚举值锁定、`schema_version`、严格解码、
+    各条校验（`FAILED` 必带 error、`TaskAck` 计数一致、分区数为正）。
+  - `ControlPlaneState`：优先级出队、kind 拒绝、背压、stop 后拒收、完成计数与错误、
+    权重请求 FIFO、结果保留上限、status/describe。
+  - 任务源：三种源的批次/exhausted/repeat 行为，JSONL 的 4 类坏输入，`max_prompts`，
+    bundled prompt 文件可读。
+  - 两个 controller 的**全链路控制流**（stub group + fake channel）：start 起的常驻 handle 与
+    channel 接线、ckpt 推送 → `APPLIED` + `served_version`、失败 ack → `FAILED`、
+    `no_wait` → `ACCEPTED`、eval 模式拒绝、eval 轮次 metrics 与失败上报、metric drain、
+    shutdown 顺序（stop → 等 handle）、serve 循环三种退出（客户端 stop / 源 drain / 启动失败置
+    `FAILED` 并写进 status）；LLM 的切分/派发/收集/转换/发布计数、未 tokenize 报错、生成超时、
+    collective ack 逐 rank、ckpt 拒绝、sink 分片构建、shutdown 关 sink + abort。
+    引擎侧内部结构体（Ray 依赖）在本机用 stub 替身，并由
+    `test_internal_llm_structs_match_what_the_controller_uses` 在有运行时的环境里断言
+    stub 字段集与真实 `RolloutRequest`/`RolloutResult` 一致，防止替身漂移。
+    顺带把 `data/convert.py` 对 `data.io_struct` 的 import 改成 type-only，使边界转换本身无需 Ray。
+  - service/CLI：两个 bundled 配置的 `plan()` 快照、backend/serving_mode → worker 类映射
+    （并与 `get_rollout_backend_worker` 交叉核对）、`--name` 改名、reward 拒绝、
+    任务源构建、`stop_when_done` 推导、8 类非法 serve 配置、`--dry-run` 两个配置 exit 0 +
+    子进程 JSON 可解析、坏 override → exit 2、`--print-config`、flag 清单。
+  - 客户端：状态/就绪/失败/超时、任务提交与拒绝回传、**推送时序**（sender 内观测到请求已入队）、
+    同步与协程 sender、`wait=False`、`push_checkpoint` 请求字段、结果超时、
+    轨迹 drain 与 `timeout=0` 语义、stop/close、`CheckpointWeightPublisher` 写盘与清理、
+    collective 契约文档化。
+  - `CheckpointWeightReceiver`：apply/嵌套 state dict/`SKIPPED`/缺文件/错传输/自定义 loader/
+    describe/懒导出/ABC 一致性（用 `torch.nn.Linear` 真实加载并比对张量）。
+  - 结构与解耦：10 个新模块存在、pyproject 注册 `rollout-serve` 与两个新包、
+    package-data glob 覆盖 yaml/jsonl、对 `serve/` 与 `client/` 全部源文件 AST 扫描证明不含
+    `cfg.{actor,algorithm,runner,critic}.` 与以 `actor.`/`algorithm.`/`runner.`/`rollout_server.`
+    开头的字符串选择器、`serve` 包懒导出、`client` 导出面、HF worker 的 transport 分派存在。
+
+  验证（本机 torch 2.4 / ray 2.39，无 GPU / 无 sglang）：
+  `pytest rlinf_rollout/tests` = **504 passed, 55 skipped**；
+  主仓 `pytest tests/unit_tests/test_rlinf_rollout.py` = 1 passed；
+  `ruff check --preview rlinf_rollout` + `ruff format --check` 全绿；
+  `rollout-serve --dry-run` 对两个 bundled 配置均 exit 0；
+  wheel 含 **502** 个 py 文件（Phase 3 为 490）、3 个 `serve/configs/` 资产、不含 tests，
+  `entry_points.txt` 为 `rollout-serve = rlinf_rollout.serve.main:main`；
+  在 `--system-site-packages` 的临时 venv 里 `pip install --no-deps` 该 wheel 后，
+  于 `/tmp` 下执行 `rollout-serve --config ... --dry-run` 正常输出 plan。
+
+- **仍需真机的部分（不在本 Phase 的可验证范围内）**：起 SGLang/vLLM 引擎或模拟器、
+  跑真实 NCCL 权重广播、以及端到端吞吐。冒烟项 10 因此以「配置 + 装配 + 控制流」为界完成：
+  两个 bundled 配置的 dry-run 与 stub 驱动的全链路控制流已验证，真机执行留待有 GPU 的环境。
 
 ### Phase 5 —（暂不做）回接主仓 e2e 验证与效率优化
 
@@ -419,15 +572,23 @@ rlinf_rollout/
       （Phase 1 已验证 core：wheel 构建 + `pip install --no-deps` 后可在任意目录 import，
       且 `rlinf_rollout` 内不出现 `rlinf.*` import；Phase 2 wheel 含 461 py + 6 资产、不含 tests；
       Phase 3 wheel 含 490 py、13 个 `engines/` 与 16 个 `workers/rollout/` 模块；
+      Phase 4 wheel 含 502 py + `serve/configs/` 资产，并注册 `rollout-serve` console script，
+      在临时 venv 里 `pip install --no-deps` 后可从任意目录执行；
       `[embodied]` / `[sglang]` / `[vllm]` extras 的引擎与模拟器依赖待实机验证）
 - [x] `api/v1` 全部类型带 `SCHEMA_VERSION`，有单元测试锁定字段集合（防止意外破坏兼容）
+      （Phase 4 的控制面消息同样基于 `SchemaBase` 并锁定字段集，但明确划在数据面协议之外）
 - [ ] 具身链路 eval-only 冒烟通过；LLM 链路固定权重生成冒烟通过
+      （Phase 4 已提供两份 bundled 配置并验证 `rollout-serve --dry-run` + stub 驱动的全链路控制流；
+      真机执行需要 GPU / 模拟器，留待有硬件的环境）
 - [x] rollout/env worker 代码中不再出现 `cfg.actor.` / `cfg.algorithm.` / actor 组名硬编码
       （`test_phase2_embodied.py` 与 `test_phase3_llm.py` 以 AST 扫描锁定具身与 LLM 两条链路，
       含 `OmegaConf.select` 里的字符串选择器、`ModelParallelComponentPlacement` 与
-      `actor_{tp,world}_size`；`validate_rollout_config` 另在运行期拒绝
-      `actor` / `algorithm` / `critic` / `runner` 配置段）
-- [ ] `rollout-serve` 可独立启动并常驻，客户端 SDK 可 push 权重、拉取轨迹
+      `actor_{tp,world}_size`；`test_phase4_serve.py` 把同样的扫描扩到 `serve/` 与 `client/`；
+      `validate_rollout_config` 另在运行期拒绝 `actor` / `algorithm` / `critic` / `runner` 配置段）
+- [x] `rollout-serve` 可独立启动并常驻，客户端 SDK 可 push 权重、拉取轨迹
+      （`serve/` 常驻 `RolloutController` + 控制面 worker；`client/RolloutClient` 提供
+      `push_weights`/`push_checkpoint`、`get_trajectories`、`submit_tasks`；
+      控制流、时序约束与 ckpt 权重落地均有单测覆盖，真机 NCCL 广播与引擎启动待 GPU 环境）
 
 ## 6. 风险与注意事项
 

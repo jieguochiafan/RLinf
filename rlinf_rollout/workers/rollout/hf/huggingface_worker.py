@@ -31,7 +31,7 @@ every trainer coupling:
 import asyncio
 import copy
 import time
-from typing import Any, Callable, Literal, Optional
+from typing import TYPE_CHECKING, Any, Callable, Literal, Optional
 
 import numpy as np
 import torch
@@ -41,6 +41,7 @@ from rlinf_rollout.api.v1 import (
     SourceTopology,
     WeightSyncMode,
     WeightTransport,
+    WeightUpdateAck,
     WeightUpdateRequest,
     WeightUpdateStatus,
 )
@@ -52,6 +53,9 @@ from rlinf_rollout.postprocess import estimate_bootstrap_values
 from rlinf_rollout.scheduler import Channel, Cluster, Worker, split_channel_message
 from rlinf_rollout.utils.placement import HybridComponentPlacement
 from rlinf_rollout.weight_sync import CollectiveWeightReceiver, WeightSyncer
+
+if TYPE_CHECKING:
+    from rlinf_rollout.weight_sync import CheckpointWeightReceiver
 
 __all__ = ["AsyncMultiStepRolloutWorker"]
 
@@ -130,6 +134,7 @@ class AsyncMultiStepRolloutWorker(Worker):
         self.finished_episodes: Optional[int] = None
         self.hf_model: Optional[BasePolicy] = None
         self.weight_receiver: Optional[CollectiveWeightReceiver] = None
+        self._checkpoint_receiver: Optional["CheckpointWeightReceiver"] = None
         self._weight_syncer: Optional[WeightSyncer] = None
         self._weight_source: Optional[SourceTopology] = None
         self._weight_sync_mode = WeightSyncMode.BUCKET
@@ -632,18 +637,83 @@ class AsyncMultiStepRolloutWorker(Worker):
     @Worker.timer("sync_weights")
     async def sync_weights(self) -> int:
         """Apply one pushed weight update and return the version now served."""
-        assert self.weight_receiver is not None, (
-            "weight receiver is not initialized; call init_worker() first."
-        )
-        ack = await self.weight_receiver.recv(self.build_weight_update_request())
+        ack = await self.receive_weight_update(self.build_weight_update_request())
         if ack.status is WeightUpdateStatus.FAILED:
             raise RuntimeError(f"Weight update failed: {ack.error}")
+        return self.version
+
+    @Worker.timer("receive_weight_update")
+    async def receive_weight_update(
+        self, request: WeightUpdateRequest
+    ) -> WeightUpdateAck:
+        """Apply one client-described weight update, dispatching on its transport.
+
+        This is the entry point the service controller calls for a client-initiated
+        push (see :mod:`rlinf_rollout.serve.controller`); :meth:`sync_weights` is
+        the shorthand for "apply whatever the configured sender broadcasts next".
+
+        Args:
+            request: Update description. ``COLLECTIVE`` is served by the
+                configured :class:`~rlinf_rollout.weight_sync.CollectiveWeightReceiver`
+                (receiver-driven: the ack's ``served_version`` is authoritative);
+                ``CHECKPOINT`` loads a state dict from a shared path.
+
+        Returns:
+            The acknowledgement, with ``FAILED`` (rather than an exception) for an
+            unsupported transport or a receiver-side error.
+        """
+        if request.transport is WeightTransport.CHECKPOINT:
+            receiver = self._checkpoint_weight_receiver()
+        elif request.transport is WeightTransport.COLLECTIVE:
+            if self.weight_receiver is None:
+                return WeightUpdateAck(
+                    version=request.version,
+                    status=WeightUpdateStatus.FAILED,
+                    served_version=self.version,
+                    receiver_id=f"{self._group_name}:{self._rank}",
+                    error=(
+                        "collective weight sync is disabled on this worker "
+                        "(rollout.mode=eval, or init_worker() has not run)."
+                    ),
+                )
+            receiver = self.weight_receiver
+        else:
+            return WeightUpdateAck(
+                version=request.version,
+                status=WeightUpdateStatus.FAILED,
+                served_version=self.version,
+                receiver_id=f"{self._group_name}:{self._rank}",
+                error=(
+                    f"transport {request.transport.value!r} is not implemented by "
+                    f"the HuggingFace rollout worker."
+                ),
+            )
+
+        ack = await receiver.recv(request)
+        if ack.status is WeightUpdateStatus.FAILED:
+            return ack
 
         self.version = ack.served_version
         if self.finished_episodes is None:
             self.finished_episodes = (
                 self.version * self.total_num_train_envs * self.rollout_epoch
             )
+        return ack
+
+    def _checkpoint_weight_receiver(self) -> "CheckpointWeightReceiver":
+        """Return (and lazily build) the checkpoint-transport receiver."""
+        if self._checkpoint_receiver is None:
+            from rlinf_rollout.weight_sync import CheckpointWeightReceiver
+
+            self._checkpoint_receiver = CheckpointWeightReceiver(
+                model=self.hf_model,
+                receiver_id=f"{self._group_name}:{self._rank}",
+                strict=False,
+            )
+        return self._checkpoint_receiver
+
+    def served_weight_version(self) -> int:
+        """Weight version this worker currently serves (``0`` before any update)."""
         return self.version
 
     async def wait_if_stale(self) -> None:

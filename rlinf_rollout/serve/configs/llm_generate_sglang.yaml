@@ -1,0 +1,77 @@
+# LLM generation service with fixed weights (Phase 4 smoke run).
+#
+#   rollout-serve --config rlinf_rollout/serve/configs/llm_generate_sglang.yaml \
+#                 --set rollout.model.model_path=/models/Qwen2.5-1.5B-Instruct
+#
+# `rollout.mode: eval` means "serve the weights the engine loaded itself": the
+# engines start with `load_format: auto`, never open a weight-sync collective, and
+# `push_weights` is refused with an explanatory error. The service tokenizes
+# `serve.task_source.path` with the model's tokenizer, generates every prompt
+# batch, converts the results to api/v1 `RolloutResult` and publishes them on
+# `<serve.name>_output`, where a client drains them with `get_trajectories()`.
+#
+# To collect for a trainer instead: set `rollout.mode: collect` and fill in
+# `rollout.weight_sync` (type + source topology), then have the trainer push
+# weights over the collective.
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    rollout: 0
+
+rollout:
+  kind: llm
+  group_name: RolloutGroup
+  mode: eval
+  placement_mode: disaggregated
+  rollout_backend: sglang
+
+  model:
+    # Override on the command line (--set rollout.model.model_path=...) or via
+    # the RLINF_ROLLOUT_MODEL_PATH environment variable.
+    model_path: ${oc.env:RLINF_ROLLOUT_MODEL_PATH,/path/to/model}
+    precision: bf16
+    trust_remote_code: false
+
+  tensor_parallel_size: 1
+  pipeline_parallel_size: 1
+  gpu_memory_utilization: 0.6
+  max_running_requests: 16
+  cuda_graph_max_bs: 16
+  enforce_eager: true
+  detokenize: true
+  return_logprobs: false
+
+  max_model_len: 2048
+  group_size: 1
+  batch_size: 4
+
+  sampling_params:
+    do_sample: true
+    temperature: 0.7
+    top_k: 50
+    top_p: 0.95
+    repetition_penalty: 1.0
+    max_new_tokens: 128
+
+  sglang:
+    attention_backend: triton
+    decode_log_interval: 500000
+    use_torch_compile: false
+    torch_compile_max_bs: 16
+    tool_call_parser: null
+    serving_mode: null
+
+  serve:
+    name: rollout
+    poll_interval_seconds: 0.2
+    generation_timeout_seconds: 600
+    task_source:
+      type: prompt_file
+      path: ${oc.env:RLINF_ROLLOUT_PROMPTS,rlinf_rollout/serve/configs/example_prompts.jsonl}
+      max_prompts: 0
+      repeat: false
+
+sink:
+  enabled: true
+  num_shards: null

@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     # checkers and IDEs still resolve ``rlinf_rollout.weight_sync.X``.
     from .base import WeightSyncer  # noqa: F401
     from .bucket_syncer import BucketWeightSyncer  # noqa: F401
+    from .checkpoint import CheckpointWeightReceiver  # noqa: F401
     from .compressor import (  # noqa: F401
         IdentityCompressor,
         NVCompCompressor,
@@ -50,6 +51,7 @@ if TYPE_CHECKING:
 _EXPORTS: dict[str, str] = {
     "WeightSyncer": ".base",
     "BucketWeightSyncer": ".bucket_syncer",
+    "CheckpointWeightReceiver": ".checkpoint",
     "IdentityCompressor": ".compressor",
     "NVCompCompressor": ".compressor",
     "PatchCompressor": ".compressor",

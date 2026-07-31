@@ -65,9 +65,9 @@ vllm = [
 ]
 dev = ["pytest", "ruff"]
 
-# Phase 4 registers the daemon entry point here:
-#   [project.scripts]
-#   rollout-serve = "rlinf_rollout.serve.main:main"
+# The daemon entry point (Phase 4): `rollout-serve --config x.yaml`.
+[project.scripts]
+rollout-serve = "rlinf_rollout.serve.main:main"
 
 # The package directory doubles as the project root, so that `rlinf_rollout` is
 # importable straight from the RLinf checkout and the very same layout keeps
@@ -81,6 +81,7 @@ packages = [
     "rlinf_rollout",
     "rlinf_rollout.api",
     "rlinf_rollout.api.v1",
+    "rlinf_rollout.client",
     "rlinf_rollout.config",
     "rlinf_rollout.data",
     "rlinf_rollout.data.datasets",
@@ -189,6 +190,7 @@ packages = [
     "rlinf_rollout.scheduler.manager",
     "rlinf_rollout.scheduler.placement",
     "rlinf_rollout.scheduler.worker",
+    "rlinf_rollout.serve",
     "rlinf_rollout.sinks",
     "rlinf_rollout.utils",
     "rlinf_rollout.weight_sync",

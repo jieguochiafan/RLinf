@@ -1,0 +1,95 @@
+# Embodied eval-only rollout service (Phase 4 smoke run).
+#
+#   rollout-serve --config rlinf_rollout/serve/configs/embodied_eval_maniskill_mlp.yaml
+#
+# No trainer is involved: the policy is fixed (`rollout.mode: eval`), so there is
+# no weight sync and no trajectory sink. The service runs `task_source.num_rounds`
+# evaluation passes over `env.eval` and exits, publishing the metrics in its
+# `ServiceStatus`. Requires ManiSkill3 plus a checkpoint in `policy.ckpt_path`.
+#
+# Note the absent sections: `actor`, `algorithm`, `runner` and `critic` are
+# trainer-owned and rejected by `validate_rollout_config`.
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    env,rollout: 0
+
+policy:
+  # Checkpoint loaded into the policy after instantiation (torch.load).
+  ckpt_path: null
+  model:
+    model_type: mlp_policy
+    model_path: ""
+    policy_setup: panda-qpos
+    obs_dim: 42
+    action_dim: 8
+    num_action_chunks: 1
+    hidden_dim: 256
+    precision: "32"
+    add_value_head: true
+    is_lora: false
+    lora_rank: 32
+
+rollout:
+  kind: embodied
+  group_name: RolloutGroup
+  mode: eval
+  pipeline_stage_num: 1
+  enable_offload: false
+  enable_cuda_graph: false
+  enable_torch_compile: false
+  model:
+    model_path: ""
+    precision: "32"
+  sampling_params: null
+  serve:
+    name: rollout
+    poll_interval_seconds: 0.2
+    task_source:
+      type: eval_rounds
+      num_rounds: 1
+
+env:
+  group_name: EnvGroup
+  eval:
+    env_type: maniskill
+    total_num_envs: 8
+    rollout_epoch: 1
+    wrap_obs_mode: simple
+    use_full_state: false
+    auto_reset: true
+    ignore_terminations: true
+    use_rel_reward: false
+    reward_mode: raw
+    seed: 0
+    group_size: 1
+    use_fixed_reset_state_ids: true
+    max_steps_per_rollout_epoch: 50
+    max_episode_steps: 50
+    enable_offload: false
+    video_cfg:
+      save_video: false
+      info_on_video: true
+      video_base_dir: ./results/video/eval
+    init_params:
+      id: PickCube-v1
+      num_envs: null # set by ManiSkillEnv
+      obs_mode: state
+      control_mode: None
+      sim_backend: gpu
+      sim_config:
+        sim_freq: 100
+        control_freq: 20
+      max_episode_steps: ${..max_episode_steps}
+      sensor_configs:
+        shader_pack: default
+      render_mode: all
+
+# Eval publishes no trajectories.
+sink:
+  enabled: false
+  num_shards: null
+
+reward:
+  use_reward_model: false

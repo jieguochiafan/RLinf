@@ -75,12 +75,14 @@ from omegaconf import DictConfig, OmegaConf
 __all__ = [
     "DEFAULT_LLM_ROLLOUT_CONFIG",
     "DEFAULT_ROLLOUT_CONFIG",
+    "DEFAULT_SERVE_CONFIG",
     "LLMRolloutConfig",
     "RolloutConfig",
     "RolloutConfigError",
     "RolloutKind",
     "RolloutMode",
     "SUPPORTED_LLM_ROLLOUT_BACKENDS",
+    "SUPPORTED_TASK_SOURCES",
     "build_rollout_config",
     "validate_rollout_config",
 ]
@@ -90,6 +92,13 @@ FORBIDDEN_SECTIONS: tuple[str, ...] = ("actor", "algorithm", "critic", "runner")
 
 #: LLM engine backends the rollout system can drive.
 SUPPORTED_LLM_ROLLOUT_BACKENDS: tuple[str, ...] = ("sglang", "vllm")
+
+#: Values accepted by ``rollout.serve.task_source.type``.
+SUPPORTED_TASK_SOURCES: tuple[str, ...] = (
+    "control_plane",
+    "prompt_file",
+    "eval_rounds",
+)
 
 
 class RolloutKind:
@@ -118,6 +127,39 @@ class RolloutMode:
 
 class RolloutConfigError(ValueError):
     """Raised when a rollout config is missing required keys or is inconsistent."""
+
+
+#: Defaults of the Phase 4 daemon block (``rollout.serve``), shared by both chains.
+#:
+#: This block configures the *service*, not the rollout itself: how clients reach
+#: it and where its work comes from.
+DEFAULT_SERVE_CONFIG: dict[str, Any] = {
+    # Logical service name; the control plane is reachable as "<name>_control".
+    "name": "rollout",
+    # Client-facing channel carrying api/v1 payloads. Null derives "<name>_output".
+    "output_channel": None,
+    # Directory for per-worker logs; null disables distributed log splitting.
+    "log_dir": None,
+    "poll_interval_seconds": 0.5,
+    "status_interval_seconds": 5.0,
+    # Cap on the control plane's task queue (0 = unbounded).
+    "max_pending_tasks": 0,
+    # Abort a generation task that the engines do not finish in time (null/0 waits).
+    "generation_timeout_seconds": None,
+    # Shut the service down once the task source is exhausted. Null means "true for
+    # a finite source (prompt_file / eval_rounds), false for control_plane".
+    "stop_when_done": None,
+    "task_source": {
+        # control_plane: serve client-submitted tasks (default, keeps running).
+        # prompt_file:   read a JSONL prompt file (LLM smoke run).
+        # eval_rounds:   submit N embodied eval passes (eval-only smoke run).
+        "type": "control_plane",
+        "path": None,
+        "num_rounds": 1,
+        "max_prompts": 0,
+        "repeat": False,
+    },
+}
 
 
 #: Defaults merged under an embodied user config by :func:`build_rollout_config`.
@@ -180,6 +222,7 @@ DEFAULT_ROLLOUT_CONFIG: dict[str, Any] = {
             },
             "trajectory_postprocessor": None,
         },
+        "serve": DEFAULT_SERVE_CONFIG,
     },
     "env": {
         "group_name": "env",
@@ -271,6 +314,7 @@ DEFAULT_LLM_ROLLOUT_CONFIG: dict[str, Any] = {
             "enable_dummy_data": False,
             "storage": None,
         },
+        "serve": DEFAULT_SERVE_CONFIG,
     },
     "sink": {
         "num_shards": None,
@@ -346,6 +390,68 @@ def validate_rollout_config(cfg: DictConfig) -> None:
         _validate_llm_rollout_config(cfg, mode)
     else:
         _validate_embodied_rollout_config(cfg, mode)
+
+    _validate_serve_config(cfg, kind)
+
+
+def _validate_serve_config(cfg: DictConfig, kind: str) -> None:
+    """Check the ``rollout.serve`` daemon block, which both chains share."""
+    if OmegaConf.select(cfg, "rollout.serve") is None:
+        return
+
+    for key in ("poll_interval_seconds", "status_interval_seconds"):
+        value = OmegaConf.select(cfg, f"rollout.serve.{key}")
+        if value is not None and (
+            not isinstance(value, (int, float)) or float(value) <= 0
+        ):
+            raise RolloutConfigError(
+                f"rollout.serve.{key} must be a positive number, got {value!r}."
+            )
+
+    max_pending = OmegaConf.select(cfg, "rollout.serve.max_pending_tasks", default=0)
+    if not isinstance(max_pending, int) or max_pending < 0:
+        raise RolloutConfigError(
+            "rollout.serve.max_pending_tasks must be a non-negative int, got "
+            f"{max_pending!r}."
+        )
+
+    source_type = OmegaConf.select(
+        cfg, "rollout.serve.task_source.type", default="control_plane"
+    )
+    if source_type not in SUPPORTED_TASK_SOURCES:
+        raise RolloutConfigError(
+            f"rollout.serve.task_source.type must be one of "
+            f"{SUPPORTED_TASK_SOURCES}, got {source_type!r}."
+        )
+    if source_type == "prompt_file":
+        if kind != RolloutKind.LLM:
+            raise RolloutConfigError(
+                "rollout.serve.task_source.type='prompt_file' only applies to "
+                f"rollout.kind={RolloutKind.LLM!r}."
+            )
+        if not OmegaConf.select(cfg, "rollout.serve.task_source.path"):
+            raise RolloutConfigError(
+                "rollout.serve.task_source.path must point at a JSONL prompt file "
+                "when task_source.type='prompt_file'."
+            )
+    if source_type == "eval_rounds":
+        if kind != RolloutKind.EMBODIED:
+            raise RolloutConfigError(
+                "rollout.serve.task_source.type='eval_rounds' only applies to "
+                f"rollout.kind={RolloutKind.EMBODIED!r}."
+            )
+        num_rounds = OmegaConf.select(
+            cfg, "rollout.serve.task_source.num_rounds", default=1
+        )
+        if not isinstance(num_rounds, int) or num_rounds < 1:
+            raise RolloutConfigError(
+                "rollout.serve.task_source.num_rounds must be a positive int, got "
+                f"{num_rounds!r}."
+            )
+        if OmegaConf.select(cfg, "env.eval") is None:
+            raise RolloutConfigError(
+                "env.eval must be provided when task_source.type='eval_rounds'."
+            )
 
 
 def _validate_weight_sync_config(cfg: DictConfig, mode: str) -> None:

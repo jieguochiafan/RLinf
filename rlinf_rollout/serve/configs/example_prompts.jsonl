@@ -1,0 +1,5 @@
+{"prompt": "Explain in one sentence why reinforcement learning needs a rollout system.", "answer": "It generates the experience the learner trains on."}
+{"prompt": "List three differences between on-policy and off-policy learning.", "answer": null}
+{"prompt": "What does staleness mean when a rollout worker lags behind the trainer?", "answer": "The data was produced by an older policy version."}
+{"prompt": "Write a Python function that returns the mean of a list of floats.", "answer": null}
+{"input_ids": [9906, 1917], "prompt": "hello world (pre-tokenized example)", "answer": null}
