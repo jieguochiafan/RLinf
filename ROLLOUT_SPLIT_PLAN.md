@@ -60,17 +60,19 @@ rlinf_rollout/
 │       └── task.py           # RolloutTask, TaskSource ABC
 ├── scheduler/                # vendor 自 rlinf/scheduler/（Ray 基建）
 ├── utils/                    # utils 最小集
-├── data/                     # io_struct（内部表示，对外经 api/v1 转换）
-├── weight_sync/              # bucket/patch syncer + compressor
+├── config/                   # SupportedModel + 自包含 RolloutConfig（schema + 校验）
+├── data/                     # io_struct（内部表示）+ convert.py（→ api/v1 边界转换）
+├── weight_sync/              # bucket/patch syncer + compressor + receiver.py（NCCL 后端）
+├── sinks/                    # TrajectorySink 后端（channel / null）
 ├── envs/                     # 复制自 rlinf/envs/
-├── models/                   # 复制自 rlinf/models/embodiment/
+├── models/                   # 复制自 rlinf/models/（get_model + embodiment/）
 ├── workers/
-│   ├── env/                  # 仅异步路径
+│   ├── env/                  # 仅异步路径（AsyncEnvWorker）
 │   └── rollout/
 │       ├── hf/               # 具身 HF rollout（仅异步）
 │       ├── sglang/  vllm/    # LLM 引擎 worker
 │       └── server/           # OpenAI 兼容 HTTP server / router
-├── postprocess/              # 可选：bootstrap value / adv 预计算插件
+├── postprocess/              # 可选：bootstrap 塑形 + TrajectoryPostprocessor hook
 ├── plugins/                  # 可选：DAgger expert / RLT
 ├── serve/                    # rollout-serve 守护入口
 └── client/                   # 训练侧接入 SDK：push_weights / get_trajectories / submit_tasks
@@ -148,7 +150,7 @@ rlinf_rollout/
   `pip install --no-deps` 后可在任意目录 import。
 
 
-### Phase 2 — 具身链路（仅异步形态）
+### Phase 2 — 具身链路（仅异步形态）✅ 已完成
 
 5. 复制 `rlinf/envs/`、`rlinf/models/embodiment/`（含 `get_model` 相关 wiring）。
 6. 复制 env worker（`env_worker.py` + `async_env_worker.py`）与 HF rollout worker（`huggingface_worker.py` + `async_huggingface_worker.py`），只保留异步路径，并解耦：
@@ -157,6 +159,100 @@ rlinf_rollout/
    - `algorithms.expert` / `rlt` → `plugins/`
    - 轨迹出口 `actor_channel.put` → `TrajectorySink`
    - `setup_weight_sync` → `WeightReceiver`（NCCL 后端实现）
+
+落地情况：
+
+- **vendor（机械复制 + import 前缀重写，358 个文件扫描 / 192 改写）**
+  - `rlinf_rollout/envs/`：`rlinf/envs/` 全量（20 个子包 + `action_utils` / `utils` / `venv` / `wrappers`，
+    含 behavior / metaworld / robotwin / habitat / calvin 的非 py 资产）。
+  - `rlinf_rollout/models/`：`rlinf/models/`（`get_model` 注册表 + `embodiment/` 19 个子包）。
+    删掉 `lingbotvla/sft_builder.py`（SFT-only，且引用主仓也不存在的 `lingbotvla.data.*`）。
+  - `rlinf_rollout/utils/` 追加依赖闭包：`rot6d`、`cuda_graph`、`patcher`、`pytree`、
+    `torch_functionals`、`omega_resolver`。
+  - `rlinf_rollout/data/` 追加：`lerobot_writer`、`lerobot_paths`、
+    `datasets/{item,vlm,world_model}.py`、`datasets/dreamzero/**`；`datasets/__init__.py` 用最小
+    stub 取代主仓的 `create_rl_dataset`（后者属训练侧）。
+  - 唯一新增前向引用：`envs/realworld/franka/franka_env.py` 里 standalone realworld reward worker
+    （`rlinf_rollout.workers.reward.reward_worker`，惰性 import + `TODO(agent)`，进白名单）。
+
+- **配置解耦** `rlinf_rollout/config/`
+  - `models.py`：`SupportedModel`（开放注册表）/ `EMBODIED_MODEL` / `torch_dtype_from_precision`，
+    只取主仓 `rlinf/config.py` 的这三块，不带任何训练侧 builder。
+  - `rollout.py`：`DEFAULT_ROLLOUT_CONFIG` + `build_rollout_config()` + `validate_rollout_config()` +
+    `RolloutConfig`（派生 batch/chunk-step，两个 worker 共用同一份推导）。key 映射表：
+
+    | 训练仓 | rollout 系统 |
+    |---|---|
+    | `actor.model` | `policy.model` |
+    | `actor.group_name` | `rollout.weight_sync.source.group_name` |
+    | `actor.sync_weight_no_wait` | `rollout.weight_sync.no_wait` |
+    | `weight_syncer` | `rollout.weight_sync` |
+    | `runner.only_eval` | `rollout.mode: eval` |
+    | `runner.enable_decoupled_mode` | `rollout.decoupled` |
+    | `runner.ckpt_path` / `expert_ckpt_path` | `policy.ckpt_path` / `rollout.plugins.dagger.expert_ckpt_path` |
+    | `algorithm.loss_type=rlt_ac` / `embodied_dagger`、`adv_type=opd` | `rollout.plugins.{rlt,dagger,opd}.enabled` |
+    | `algorithm.dagger.*` / `rlt_schedule` | `rollout.plugins.dagger.*` / `rollout.plugins.rlt.schedule` |
+    | `algorithm.staleness_threshold` | `rollout.staleness_threshold` |
+    | `algorithm.{gamma,bootstrap_type}` | `rollout.postprocess.bootstrap.{gamma,type}` |
+    | actor world_size（轨迹切分） | `sink.num_shards` |
+
+    `validate_rollout_config` 直接**拒绝** `actor` / `algorithm` / `critic` / `runner` 段并在报错里给出映射提示，
+    使解耦成为硬约束而非约定。
+
+- **postprocess / plugins**
+  - `postprocess/bootstrap.py`：`BootstrapRewardShaper`（reward-model 混合 + 截断步 `gamma*V(s_final)`，
+    `standard` / `done` 两种 bootstrap）与 `estimate_bootstrap_values()`（原 `get_bootstrap_values`）。
+  - `postprocess/base.py`：`TrajectoryPostprocessor` ABC + `load_trajectory_postprocessor("module:attr")`。
+    优势/回报计算**不再内置**，只能经该 hook 由训练侧插件提供；`use_training_pipeline` 的 actor
+    micro-batch 打包路径整体删除。
+  - `plugins/expert.py`（expert 配置构建）、`plugins/rlt/`（route / rollout / transition / expert）；
+    `build_rlt_route` 改读 `rollout.plugins.rlt.schedule`。二者均惰性 import。
+
+- **两个对外接口的实现**
+  - `weight_sync/receiver.py`：`CollectiveWeightReceiver` 实现 `api/v1.WeightReceiver`，
+    src 组名 / root rank / world_size 全部来自 `WeightUpdateRequest.source`（`SourceTopology`），
+    失败经 `WeightUpdateAck(status=FAILED)` 返回而非抛异常。collective 是**接收侧驱动**（pull）：
+    `request.version` 只是「最小期望版本」，`ack.served_version` 才是权威值。
+    `weight_sync/__init__.py` 改为 PEP 562 懒加载，使 receiver 在缺少 `torch.distributed.tensor.DTensor`
+    的 torch 上仍可 import。
+  - `sinks/channel.py`：`ChannelTrajectorySink`（按 `ConsumerSpec` 分片 + 可选 per-partition channel key，
+    round-robin，`flush()` 等待所有 async put）与 `NullTrajectorySink`（eval / 测试）。
+  - `data/convert.py`：内部 `embodied_io_struct` → `api/v1` 的边界转换
+    （`trajectory_to_api` / `chunk_result_to_api`，`forward_inputs` → 自描述 `PolicyInputs`）。
+    默认 `validate=False`：epoch 末尾观测只贡献 reward/done 不贡献 action，各字段步数天然差 1。
+
+- **workers（仅异步）**
+  - `workers/rollout/hf/huggingface_worker.py`：`AsyncMultiStepRolloutWorker`（原 base + async 两个类合一）。
+    常驻 `generate()`；`sync_weights()` / `build_weight_update_request()` 取代
+    `setup_weight_sync` + `sync_model_from_actor`；后台权重同步、staleness 节流、decoupled 路由、
+    DAgger/RLT/OPD 分支保留；epoch 末尾那一次 serve 保持原来的「无 logprobs/versions」语义。
+  - `workers/env/env_worker.py`：`AsyncEnvWorker`。删除 `_init_pipeline_params` /
+    `compute_advantages_and_returns` / `prepare_pipeline_batch` / `pack_pipeline_micro_batches` /
+    `send_rollout_trajectories_pipeline` / `get_actor_split_num`；轨迹经
+    `publish_trajectories()` → `TrajectorySink`（`set_trajectory_sink()` 注入，或由
+    `sink.num_shards` 自动构建 channel sink）；reward worker 交互仍走 channel（组名来自 `reward.group_name`）。
+
+- **测试**（`rlinf_rollout/tests/`，均不需要 Ray / GPU / 模拟器 SDK）
+  - `test_phase2_embodied.py`：envs/models 子包齐备；`get_env_cls` 覆盖 `SupportedEnvType` 全部成员；
+    模型注册表包含全部具身策略；**AST 扫描**证明两个 worker 的代码（跳过 docstring）不含
+    `cfg.actor.` / `cfg.algorithm.` / `cfg.runner.`、不含 `"actor"` 组名与 `actor_channel`、
+    不含 `OmegaConf.select(cfg, "actor.…")`；已删方法确实消失；入口函数只有 async 形态；
+    `RolloutConfig` 默认值 / 派生量 / 7 类非法配置 / 4 个训练段拒绝。
+  - `test_phase2_seams.py`：`BootstrapRewardShaper`（standard/done/disabled/no-auto-reset/reward 混合）、
+    `estimate_bootstrap_values`、postprocess hook 加载与报错、api/v1 转换、两个 sink 的分片与 flush、
+    `CollectiveWeightReceiver`（apply / 握手只跑一次 / FAILED ack / 非 collective 传输拒绝 / describe）。
+  - `test_phase1_vendoring.py` 同步更新：forward-reference 白名单加 reward worker；
+    stale-path 检查改为正则 `(?<![\w.])rlinf\.[A-Za-z_]`，从而不再误报散文里的 “rlinf.”
+    和 vendored `models/embodiment/openvla_oft/rlinf` 子包（其名字来自 `implement_version`）。
+
+  验证（本机 torch 2.4 / ray 2.39）：`pytest rlinf_rollout/tests` = **217 passed, 45 skipped**；
+  `ruff check --preview rlinf_rollout` + `ruff format --check` 全绿；
+  worker 全链路 import 在 shim 掉本机 `ray<2.47` / `DTensor` 位置差异后逐个通过；
+  wheel 构建含 461 个 py + 6 个资产文件、不含 tests。
+
+- `pyproject.toml`：`packages` 扩到 113 项（由测试与目录树比对保持同步）；`package-data` 增加
+  `**/*.json` / `**/*.jsonl`，并显式补 `envs/calvin/calvin_cfg/.hydra/*.yaml`
+  （setuptools 的递归 glob 会跳过点目录，而 `CalvinEnv` 运行时要读它）。
 
 ### Phase 3 — LLM 链路
 
@@ -179,10 +275,13 @@ rlinf_rollout/
 
 - [ ] `pip install -e rlinf_rollout[embodied]` / `[sglang]` 可独立安装，不依赖主仓 `rlinf` 包
       （Phase 1 已验证 core：wheel 构建 + `pip install --no-deps` 后可在任意目录 import，
-      且 `rlinf_rollout` 内不出现 `rlinf.*` import；extras 依赖待 Phase 2/3 实机验证）
+      且 `rlinf_rollout` 内不出现 `rlinf.*` import；Phase 2 wheel 含 461 py + 6 资产、不含 tests；
+      `[embodied]` extras 的模拟器依赖待实机验证）
 - [x] `api/v1` 全部类型带 `SCHEMA_VERSION`，有单元测试锁定字段集合（防止意外破坏兼容）
 - [ ] 具身链路 eval-only 冒烟通过；LLM 链路固定权重生成冒烟通过
-- [ ] rollout/env worker 代码中不再出现 `cfg.actor.` / `cfg.algorithm.` / actor 组名硬编码
+- [x] rollout/env worker 代码中不再出现 `cfg.actor.` / `cfg.algorithm.` / actor 组名硬编码
+      （`test_phase2_embodied.py` 以 AST 扫描锁定，含 `OmegaConf.select` 里的字符串选择器；
+      `validate_rollout_config` 另在运行期拒绝 `actor` / `algorithm` / `critic` / `runner` 配置段）
 - [ ] `rollout-serve` 可独立启动并常驻，客户端 SDK 可 push 权重、拉取轨迹
 
 ## 6. 风险与注意事项

@@ -22,6 +22,7 @@ smoke test needs the real runtime dependencies and skips when they are missing.
 
 import ast
 import importlib
+import re
 import sys
 import tomllib
 from pathlib import Path
@@ -38,8 +39,9 @@ MIN_RAY_VERSION = "2.47.0"
 # phase. Both sites are guarded (``TYPE_CHECKING`` / lazy function-level import)
 # and carry a ``TODO(agent)`` marker.
 FORWARD_REFERENCES = {
-    "rlinf_rollout.envs.realworld.common.camera.lumos_camera",  # Phase 2
+    "rlinf_rollout.envs.realworld.common.camera.lumos_camera",  # optional SDK
     "rlinf_rollout.workers.rollout.sglang.sglang_worker",  # Phase 3
+    "rlinf_rollout.workers.reward.reward_worker",  # standalone realworld reward
 }
 
 # The Phase 1 deliverable: the modules that must exist after vendoring.
@@ -186,7 +188,14 @@ def test_forward_references_are_documented_and_guarded():
 
 
 def test_vendored_code_keeps_no_stale_training_package_paths():
-    """The bulk rewrite must not leave ``rlinf.`` module paths behind."""
+    """The bulk rewrite must not leave ``rlinf.`` module paths behind.
+
+    Matches a dotted module path only: ``rlinf.`` followed by an identifier and
+    not itself preceded by a word character or dot. That excludes prose ending in
+    "rlinf." and the vendored ``models/embodiment/openvla_oft/rlinf`` subpackage,
+    whose name comes from the model's ``implement_version`` value.
+    """
+    stale_path = re.compile(r"(?<![\w.])rlinf\.[A-Za-z_]")
     offenders = []
     for path in _python_sources():
         # The test modules spell out `rlinf.` literals as part of these checks.
@@ -195,7 +204,7 @@ def test_vendored_code_keeps_no_stale_training_package_paths():
         for lineno, line in enumerate(
             path.read_text(encoding="utf-8").splitlines(), start=1
         ):
-            if "rlinf." in line.replace("rlinf_rollout.", ""):
+            if stale_path.search(line.replace("rlinf_rollout.", "")):
                 offenders.append(f"{path.relative_to(PACKAGE_ROOT)}:{lineno}: {line}")
     assert not offenders, "stale training-package paths:\n" + "\n".join(offenders)
 
