@@ -109,10 +109,44 @@ rlinf_rollout/
   并断言 `rlinf_rollout/` 内不出现 `rlinf.*` import；主仓 CI 经
   `tests/unit_tests/test_rlinf_rollout.py` 代跑该套件。
 
-### Phase 1 — 基建复制（机械性，最小改动）
+### Phase 1 — 基建复制（机械性，最小改动）✅ 已完成
 
 3. 复制 `rlinf/scheduler/` → `rlinf_rollout/scheduler/`（全目录）。
 4. 复制 utils 最小集 + `data/io_struct*` + `weight_syncer/`；批量替换 import 前缀 `rlinf.` → `rlinf_rollout.`；确保 `python -c "import rlinf_rollout.scheduler"` 通过。
+
+落地情况：
+
+- `rlinf_rollout/scheduler/`：整体 vendor 自 `rlinf/scheduler/`（channel / cluster / collective /
+  dynamic_scheduler / hardware{accelerators,robots} / manager / placement / worker，共 11 个子包）。
+- `rlinf_rollout/utils/`：`placement`、`data_iter_utils`、`distributed`、`metric_utils`、
+  `nested_dict_process`、`data_process`、`http_client`、`utils`，另按依赖闭包补 `logging`（`get_logger`）
+  与 `timers`（`distributed.ScopedTimer` 依赖 `NamedTimer`）。
+- `rlinf_rollout/data/`：`io_struct.py`、`embodied_io_struct.py`，另补闭包所需 `utils.py`
+  （`batch_pad_to_fixed_len`）。这些是**内部表示**，对外仍经 `api/v1` 转换。
+- `rlinf_rollout/weight_sync/`：vendor 自 `rlinf/hybrid_engines/weight_syncer/`
+  （`base` / `bucket_syncer` / `patch_syncer` / `compressor`），import 路径同时改名
+  `rlinf.hybrid_engines.weight_syncer` → `rlinf_rollout.weight_sync`。
+- import 重写：`rlinf.` → `rlinf_rollout.`（79 个文件，25 个发生改写），随后 `ruff check --preview` +
+  `ruff format` 全绿；主仓 `pyproject.toml` 的 docstring 规则 per-file-ignores 扩展为
+  `!{rlinf,rlinf_rollout}/scheduler/**.py`，让 vendored scheduler 与原版同规则受检。
+- 唯一非机械改动：`Cluster` 的 Ray code-sync（`RLINF_CODE_WORKING_DIR`）原本硬编码 `rlinf` 包名与
+  “repo root 含 pyproject.toml + rlinf/” 布局。改为 `Cluster.PACKAGE_NAME = "rlinf_rollout"`，
+  并接受三种写法：`auto`（由已导入包定位）、包目录绝对路径、含 `pyproject.toml` 的 checkout 根；
+  这样在主仓内和 subtree split 后（`pyproject.toml` 位于包目录内）都成立。
+  `Cluster.SYS_NAME` 保持 `"RLinf"`，以沿用 `RLINF_NODE_RANK` 等既有环境变量名。
+- 前向引用（保持惰性/type-only，带 `TODO(agent)` 标注，由测试收口成白名单）：
+  `scheduler/hardware/robots/franka.py` 的 Lumos 相机（Phase 2 的 `envs`）、
+  `scheduler/dynamic_scheduler/manager.py` 的 `SGLangWorker`（Phase 3 的 `workers`）。
+- `pyproject.toml`：`packages` 列出全部 17 个子包（由测试与目录树比对保持同步）；核心依赖按
+  import 闭包补齐 `packaging` / `pyyaml` / `typing-extensions` / `aiohttp` / `requests` / `pillow`，
+  移除未被使用的 `sortedcontainers`。
+- `rlinf_rollout/tests/test_phase1_vendoring.py`：断言 vendored 模块齐备、全部内部 import 可解析
+  （仅允许白名单前向引用）、无残留 `rlinf.` 路径、`pyproject.toml` 的 `packages` 与目录树一致，
+  并逐个 import 全部 vendored 模块 + 覆盖 code-sync 三种写法与两类报错。
+  验证：`ray 2.56.1 / torch 2.7.0` 环境下 `pytest rlinf_rollout/tests` = **142 passed**；
+  `python -c "import rlinf_rollout.scheduler"` 通过；wheel 构建含 79 个 py 文件、不含 tests，
+  `pip install --no-deps` 后可在任意目录 import。
+
 
 ### Phase 2 — 具身链路（仅异步形态）
 
@@ -144,7 +178,8 @@ rlinf_rollout/
 ## 5. 验收标准
 
 - [ ] `pip install -e rlinf_rollout[embodied]` / `[sglang]` 可独立安装，不依赖主仓 `rlinf` 包
-      （Phase 0 已验证 core：wheel 构建 + `pip install -e --no-deps` 可 import；extras 依赖待 Phase 2/3 实机验证）
+      （Phase 1 已验证 core：wheel 构建 + `pip install --no-deps` 后可在任意目录 import，
+      且 `rlinf_rollout` 内不出现 `rlinf.*` import；extras 依赖待 Phase 2/3 实机验证）
 - [x] `api/v1` 全部类型带 `SCHEMA_VERSION`，有单元测试锁定字段集合（防止意外破坏兼容）
 - [ ] 具身链路 eval-only 冒烟通过；LLM 链路固定权重生成冒烟通过
 - [ ] rollout/env worker 代码中不再出现 `cfg.actor.` / `cfg.algorithm.` / actor 组名硬编码

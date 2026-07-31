@@ -18,14 +18,22 @@ classifiers = [
 ]
 
 # Core dependencies only: Ray-based scheduling plus tensor plumbing. The rollout
-# system never depends on the training-side `rlinf` package.
+# system never depends on the training-side `rlinf` package. Every entry below is
+# imported at module import time by the vendored code (see the import audit in
+# tests/test_phase1_vendoring.py); heavier or hardware-specific packages
+# (megatron, flash_attn, pyzed, pyrealsense2, nvcomp, ...) stay lazy.
 dependencies = [
     "ray[default]>=2.47.0",
     "torch>=2.5.0",
     "numpy",
     "hydra-core",
     "omegaconf",
-    "sortedcontainers",
+    "packaging",
+    "pyyaml",
+    "typing-extensions",
+    "aiohttp",
+    "requests",
+    "pillow",
 ]
 
 [project.optional-dependencies]
@@ -59,11 +67,30 @@ dev = ["pytest", "ruff"]
 # The package directory doubles as the project root, so that `rlinf_rollout` is
 # importable straight from the RLinf checkout and the very same layout keeps
 # working after `git subtree split` moves this directory to a repo root.
-# New sub-packages must be appended to `packages` (Phase 1+).
+# New sub-packages must be appended to `packages` (Phase 2+); the list is kept in
+# sync with the directory tree by `tests/test_phase1_vendoring.py`.
 [tool.setuptools]
 include-package-data = true
 package-dir = { "rlinf_rollout" = "." }
-packages = ["rlinf_rollout", "rlinf_rollout.api", "rlinf_rollout.api.v1"]
+packages = [
+    "rlinf_rollout",
+    "rlinf_rollout.api",
+    "rlinf_rollout.api.v1",
+    "rlinf_rollout.data",
+    "rlinf_rollout.scheduler",
+    "rlinf_rollout.scheduler.channel",
+    "rlinf_rollout.scheduler.cluster",
+    "rlinf_rollout.scheduler.collective",
+    "rlinf_rollout.scheduler.dynamic_scheduler",
+    "rlinf_rollout.scheduler.hardware",
+    "rlinf_rollout.scheduler.hardware.accelerators",
+    "rlinf_rollout.scheduler.hardware.robots",
+    "rlinf_rollout.scheduler.manager",
+    "rlinf_rollout.scheduler.placement",
+    "rlinf_rollout.scheduler.worker",
+    "rlinf_rollout.utils",
+    "rlinf_rollout.weight_sync",
+]
 
 [tool.setuptools.package-data]
 rlinf_rollout = ["**/*.yaml", "**/*.yml"]

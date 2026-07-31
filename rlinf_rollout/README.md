@@ -5,8 +5,9 @@ Standalone rollout system for embodied and LLM policies, extracted from
 execution only — no training loop — so it can be driven by any training
 framework.
 
-Status: **Phase 0** — skeleton plus the frozen `v1` protocol. Scheduler, envs,
-models and workers arrive in Phase 1–3 (see `../ROLLOUT_SPLIT_PLAN.md`).
+Status: **Phase 1** — frozen `v1` protocol plus the vendored infrastructure
+(Ray scheduler, utils, io structs, weight sync). Envs, models and workers arrive
+in Phase 2–3 (see `../ROLLOUT_SPLIT_PLAN.md`).
 
 ## Install
 
@@ -19,6 +20,30 @@ pip install -e "rlinf_rollout[vllm]"     # LLM rollout on vLLM
 
 The package never imports the training-side `rlinf` package; everything it
 needs is vendored under `rlinf_rollout/`.
+
+## Layout
+
+| Directory | Contents | Source |
+|---|---|---|
+| `api/v1/` | frozen protocol (weights in, data out, work in) | new |
+| `scheduler/` | Ray basics: `Cluster`, `Worker`, `WorkerGroup`, `Channel`, collectives, placement, dynamic scheduler, hardware probes | vendored from `rlinf/scheduler/` |
+| `utils/` | placement, data iteration, distributed helpers, metrics, nested-dict ops, HTTP client, logging, timers | vendored from `rlinf/utils/` |
+| `data/` | `io_struct` (LLM) and `embodied_io_struct` (trajectories) — internal representation, converted to `api/v1` at the boundary | vendored from `rlinf/data/` |
+| `weight_sync/` | bucket / patch syncers and compressors | vendored from `rlinf/hybrid_engines/weight_syncer/` |
+
+Two deliberate differences from the vendored originals:
+
+- `Cluster.PACKAGE_NAME` is `rlinf_rollout`, so Ray code sync
+  (`RLINF_CODE_WORKING_DIR`) ships this package. It accepts `auto`, the package
+  directory, or a checkout root — the last two keep working after
+  `git subtree split`, where `pyproject.toml` lives inside the package directory.
+- `Cluster.SYS_NAME` stays `RLinf`, so the scheduler env vars keep their
+  `RLINF_*` names (`RLINF_NODE_RANK`, `RLINF_COMM_NET_DEVICES`, ...).
+
+Two imports point at modules that later phases vendor
+(`rlinf_rollout.envs...lumos_camera`, `rlinf_rollout.workers.rollout.sglang`).
+Both are lazy or type-only and carry a `TODO(agent)` note; the test suite keeps
+that list closed.
 
 ## The `v1` protocol
 
@@ -55,3 +80,10 @@ task = RolloutTask(
 ```bash
 pytest rlinf_rollout/tests
 ```
+
+`test_api_v1_schema.py` locks the protocol; `test_phase1_vendoring.py` checks the
+vendored tree (every internal import resolves, no `rlinf.` paths survive,
+`pyproject.toml` packages match the directory tree) and imports every vendored
+module. The import checks skip when `ray>=2.47` / `torch>=2.5` are unavailable.
+The main repo runs this suite through `tests/unit_tests/test_rlinf_rollout.py`.
+

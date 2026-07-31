@@ -221,8 +221,8 @@ fixable = ["ALL"]
 unfixable = []
 
 [tool.ruff.lint.per-file-ignores]
-# Only enable docstring check for the scheduler module for now.
-"!rlinf/scheduler/**.py" = ["D", "RUF002"]
+# Only enable docstring check for the scheduler module (and its rollout vendor copy) for now.
+"!{rlinf,rlinf_rollout}/scheduler/**.py" = ["D", "RUF002"]
 
 [tool.ruff.lint.pydocstyle]
 convention = "google"
