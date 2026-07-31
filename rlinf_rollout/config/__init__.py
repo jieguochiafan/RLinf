@@ -20,24 +20,34 @@ from rlinf_rollout.config.models import (
     torch_dtype_from_precision,
 )
 from rlinf_rollout.config.rollout import (
+    DEFAULT_LLM_ROLLOUT_CONFIG,
     DEFAULT_ROLLOUT_CONFIG,
     FORBIDDEN_SECTIONS,
+    SUPPORTED_LLM_ROLLOUT_BACKENDS,
+    LLMRolloutConfig,
     RolloutConfig,
     RolloutConfigError,
+    RolloutKind,
     RolloutMode,
     build_rollout_config,
+    rollout_kind,
     validate_rollout_config,
 )
 
 __all__ = [
+    "DEFAULT_LLM_ROLLOUT_CONFIG",
     "DEFAULT_ROLLOUT_CONFIG",
     "EMBODIED_MODEL",
     "FORBIDDEN_SECTIONS",
+    "LLMRolloutConfig",
     "RolloutConfig",
     "RolloutConfigError",
+    "RolloutKind",
     "RolloutMode",
+    "SUPPORTED_LLM_ROLLOUT_BACKENDS",
     "SupportedModel",
     "build_rollout_config",
+    "rollout_kind",
     "torch_dtype_from_precision",
     "validate_rollout_config",
 ]

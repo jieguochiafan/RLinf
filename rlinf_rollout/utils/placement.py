@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import logging
-from enum import Enum, auto
 from typing import Optional
 
 from omegaconf import DictConfig
@@ -24,63 +23,15 @@ from rlinf_rollout.scheduler import (
     PackedPlacementStrategy,
 )
 
-
-class PlacementMode(Enum):
-    """
-    Component placement mode represents the way to place components on GPUs.
-
-    COLLOCATED: All components share the same set of GPUs.
-    DISAGGREGATED: Each component has its own dedicated set of GPUs.
-    HYBRID: Hybrid placement mode that allows components to run on any sets of GPUs.
-    AUTO: Automatically choose the placement mode based on the component placement.
-    """
-
-    COLLOCATED = auto()
-    DISAGGREGATED = auto()
-    HYBRID = auto()
-    AUTO = auto()
-
-
-class RolloutSyncMode(Enum):
-    """
-    Rollout sync mode represents the way to synchronize rollout model weights.
-
-    This mode is only used in reasoning scenarios.
-
-    COLLOCATED: Used when rollout and actor components share the same set of GPUs.
-        No inter-rank communication is required, and synchronization is typically
-        conducted via CUDA IPC for optimal performance.
-
-    DISAGGREGATED: Used when rollout and actor components use different sets of GPUs.
-        Inter-rank communication is required, and synchronization is typically
-        conducted via collective communication operations, such as NCCL.
-
-    A key difference between modes is the rank mapping data structure:
-    - COLLOCATED: rank mapping uses format `dict[int, tuple[int, int]]`
-    - DISAGGREGATED: rank mapping uses format `dict[int, list[tuple[int, int]]]`"""
-
-    COLLOCATED = auto()
-    DISAGGREGATED = auto()
-
-
-def placement_mode_to_rollout_sync_mode(
-    placement_mode: PlacementMode,
-) -> RolloutSyncMode:
-    """Map placement mode to rollout sync mode in general cases.
-
-    In special scenarios, the rollout sync mode is not the same as the placement mode. Thus, rollout sync mode should assigned separately, do not use this function in such scenarios.
-
-    Args:
-        placement_mode (PlacementMode): The placement mode.
-
-    Returns:
-        RolloutSyncMode: The corresponding rollout sync mode.
-    """
-    return (
-        RolloutSyncMode.COLLOCATED
-        if placement_mode == PlacementMode.COLLOCATED
-        else RolloutSyncMode.DISAGGREGATED
-    )
+# The mode enums live in a Ray-free module so that pure-logic consumers
+# (rlinf_rollout.weight_sync.llm) can import them without a cluster runtime. They are
+# re-exported here to keep `from rlinf_rollout.utils.placement import PlacementMode`
+# working, which is how the rest of the vendored tree spells it.
+from rlinf_rollout.utils.placement_modes import (
+    PlacementMode,
+    RolloutSyncMode,
+    placement_mode_to_rollout_sync_mode,
+)
 
 
 class HybridComponentPlacement(ComponentPlacement):

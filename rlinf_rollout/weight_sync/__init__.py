@@ -32,6 +32,13 @@ if TYPE_CHECKING:
         NVCompCompressor,
         PatchCompressor,
     )
+    from .llm import (  # noqa: F401
+        CollocateRankMapper,
+        DisaggRankMapper,
+        EngineWeightSyncSetup,
+        RankMapper,
+        SourceLayout,
+    )
     from .patch_syncer import (  # noqa: F401
         CompressedWeightPatch,
         PatchWeightSyncer,
@@ -46,6 +53,11 @@ _EXPORTS: dict[str, str] = {
     "IdentityCompressor": ".compressor",
     "NVCompCompressor": ".compressor",
     "PatchCompressor": ".compressor",
+    "CollocateRankMapper": ".llm",
+    "DisaggRankMapper": ".llm",
+    "EngineWeightSyncSetup": ".llm",
+    "RankMapper": ".llm",
+    "SourceLayout": ".llm",
     "CompressedWeightPatch": ".patch_syncer",
     "PatchWeightSyncer": ".patch_syncer",
     "WeightPatch": ".patch_syncer",

@@ -36,7 +36,8 @@ from rlinf_rollout.utils.placement import ModelParallelComponentPlacement
 if TYPE_CHECKING:
     from rlinf_rollout.data.io_struct import SeqGroupInfo
 
-    # TODO(agent): Phase 3 vendors the SGLang worker; type-only until then.
+    # Type-only: importing the worker at module scope would pull SGLang in for every
+    # user of the scheduler.
     from rlinf_rollout.workers.rollout.sglang.sglang_worker import SGLangWorker
 
 

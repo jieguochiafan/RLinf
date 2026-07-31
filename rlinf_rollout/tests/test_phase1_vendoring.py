@@ -40,7 +40,6 @@ MIN_RAY_VERSION = "2.47.0"
 # and carry a ``TODO(agent)`` marker.
 FORWARD_REFERENCES = {
     "rlinf_rollout.envs.realworld.common.camera.lumos_camera",  # optional SDK
-    "rlinf_rollout.workers.rollout.sglang.sglang_worker",  # Phase 3
     "rlinf_rollout.workers.reward.reward_worker",  # standalone realworld reward
 }
 

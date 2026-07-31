@@ -52,11 +52,16 @@ sglang = [
     "torch-memory-saver",
     "transformers>=4.51.1,<4.52",
     "uvloop==0.21.0",
+    # The engine workers and the OpenAI-compatible HTTP surface.
+    "fastapi",
+    "uvicorn",
 ]
 vllm = [
     "vllm>=0.8.5,<0.9",
     "transformers>=4.51.1,<4.52",
     "uvloop==0.21.0",
+    "fastapi",
+    "uvicorn",
 ]
 dev = ["pytest", "ruff"]
 
@@ -81,6 +86,11 @@ packages = [
     "rlinf_rollout.data.datasets",
     "rlinf_rollout.data.datasets.dreamzero",
     "rlinf_rollout.data.datasets.dreamzero.data_transforms",
+    "rlinf_rollout.engines",
+    "rlinf_rollout.engines.sglang",
+    "rlinf_rollout.engines.sglang.common",
+    "rlinf_rollout.engines.vllm",
+    "rlinf_rollout.engines.vllm.vllm_0_8_5",
     "rlinf_rollout.envs",
     "rlinf_rollout.envs.behavior",
     "rlinf_rollout.envs.calvin",
@@ -186,6 +196,10 @@ packages = [
     "rlinf_rollout.workers.env",
     "rlinf_rollout.workers.rollout",
     "rlinf_rollout.workers.rollout.hf",
+    "rlinf_rollout.workers.rollout.server",
+    "rlinf_rollout.workers.rollout.sglang",
+    "rlinf_rollout.workers.rollout.sglang_server",
+    "rlinf_rollout.workers.rollout.vllm",
 ]
 
 [tool.setuptools.package-data]

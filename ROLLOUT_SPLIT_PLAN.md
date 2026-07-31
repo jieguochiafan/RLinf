@@ -62,7 +62,9 @@ rlinf_rollout/
 ├── utils/                    # utils 最小集
 ├── config/                   # SupportedModel + 自包含 RolloutConfig（schema + 校验）
 ├── data/                     # io_struct（内部表示）+ convert.py（→ api/v1 边界转换）
+├── engines/                  # sglang / vllm 引擎封装（vendor 自 hybrid_engines/）
 ├── weight_sync/              # bucket/patch syncer + compressor + receiver.py（NCCL 后端）
+                              # + llm.py（SourceTopology → 引擎 rank 配对）
 ├── sinks/                    # TrajectorySink 后端（channel / null）
 ├── envs/                     # 复制自 rlinf/envs/
 ├── models/                   # 复制自 rlinf/models/（get_model + embodiment/）
@@ -254,12 +256,152 @@ rlinf_rollout/
   `**/*.json` / `**/*.jsonl`，并显式补 `envs/calvin/calvin_cfg/.hydra/*.yaml`
   （setuptools 的递归 glob 会跳过点目录，而 `CalvinEnv` 运行时要读它）。
 
-### Phase 3 — LLM 链路
+### Phase 3 — LLM 链路 ✅ 已完成
 
 7. 复制 `rlinf/workers/rollout/` 的 sglang / vllm / sglang_server / server + `rlinf/hybrid_engines/` 的 sglang / vllm 引擎封装：
    - `ModelParallelComponentPlacement` 的 actor 侧字段改由 `WeightUpdateRequest` 内 src 拓扑描述提供
    - 保留 offload / sleep-wake、dynamic_scheduler 扩缩容
    - 保留 OpenAI 兼容 HTTP server 形态
+
+落地情况：
+
+- **引擎封装** `rlinf_rollout/engines/`（vendor 自 `rlinf/hybrid_engines/{sglang,vllm}`）
+  - `engines/sglang/common/`：`io_struct` / `sgl_engine` / `sgl_scheduler` /
+    `tokenizer_manager` / `detokenizer_manager`；`engines/vllm/vllm_0_8_5/`：
+    `executor` / `worker` / `weight_loader`。
+  - 版本分派从 worker 层下移到引擎层：`engines/sglang/__init__.py`（`sglang` 0.4.4–0.5.4 →
+    `Engine` / `io_struct`）、`engines/vllm/__init__.py`（`vllm` ≥0.8.5,<0.9 → `VLLMExecutor`），
+    于 import 时即报版本错，而非等到起引擎才失败。
+  - `Patcher.add_patch` 的替换目标是**字符串**，一并改写为
+    `rlinf_rollout.engines.sglang.common.*`（测试用 AST 取出全部字符串常量断言前缀）。
+
+- **权重同步去 actor 化** `rlinf_rollout/weight_sync/llm.py`
+  - `SourceLayout.from_topology(SourceTopology)`：`parallel_sizes["tp"|"pp"]` / `world_size` /
+    `group_name` 取代 `placement.actor_{tp,pp,world}_size` 与 `cfg.actor.group_name`。
+  - `RankMapper` / `CollocateRankMapper` / `DisaggRankMapper`：算法逐行照搬，仅把入参从
+    placement 换成 `SourceLayout`，并把标识符 `actor_*` 全量改名 `source_*`（测试断言
+    `RankMapper` 的方法签名里不再出现 `placement`，且 LLM 链路代码中不出现 `actor_tp_size` 等）。
+    输出与原实现逐项一致（tp=4→rollout tp=2, world=8 的映射经交叉核对）。
+  - `SourceTopology.rank_map`（键 `"<dp_rank>,<tp_rank>"`，`format_rollout_rank` /
+    `parse_rank_map` 负责编解码）可**完全绕过**推导，供做特殊 resharding 的训练侧直接指定配对。
+  - `EngineWeightSyncSetup`：跨进程（`spawn`）传给引擎的**纯数据**载荷（frozen dataclass，
+    可 pickle，不含 Ray / OmegaConf 对象），字段为 `source` / `rollout_{tp,world}_size` /
+    `sync_mode` / `presharded_weights`（原 `cfg.actor.training_backend != "fsdp"`）/
+    `validate_first_sync`。取代原来直接把 `(placement, 整份训练 cfg)` 塞进引擎进程的做法。
+  - `sgl_scheduler.Scheduler.init_rlinf_worker(parent_address, weight_reload,
+    weight_sync_setup, enforce_eager)` 与 `vllm ... worker.VLLMWorker(weight_sync_setup,
+    parent_address, enforce_eager, ...)`：`self.cfg` / `_actor_group_name` /
+    `actor_weight_rank` / `rollout_sync_mode` 全部消失，改为 `_weight_setup` +
+    `_weight_source_{group_name,rank}`。原 `cfg.runner.resume_dir is not None` 静默关闭首次
+    校验的逻辑**不再内置**：改由调用方显式设 `rollout.validate_weight_first_sync: false`
+    （config 注释与 dataclass docstring 都点明了这条约束）。
+
+- **rollout-only placement** `rlinf_rollout/utils/rollout_placement.py`
+  - `RolloutComponentPlacement`：只要求 `rollout` 组件（`reward` 可选），不再断言 actor GPU 存在；
+    模式由 `rollout.placement_mode`（collocated / disaggregated / auto）**声明**而非由 actor/rollout
+    GPU 是否重叠推断；collocated 的 stride 由
+    `rollout.weight_sync.source.parallel_sizes.tp // rollout.tensor_parallel_size` 得到——
+    这正是「actor 侧字段改由 src 拓扑提供」的落点。对外保留
+    `is_{collocated,disaggregated,auto,pipeline}` / `rollout_{dp,tp,world}_size` /
+    `rollout_sync_mode` / `num_gpus_per_engine`。
+  - 唯一改动 vendored 文件的地方：`PlacementMode` / `RolloutSyncMode` /
+    `placement_mode_to_rollout_sync_mode` 抽到无 Ray 依赖的 `utils/placement_modes.py`，
+    `utils/placement.py` 原地 re-export（既有 `from rlinf_rollout.utils.placement import
+    PlacementMode` 写法不变）。这样 `weight_sync/llm.py` 的纯算术逻辑可以在没有 Ray 的环境里
+    直接单测（测试断言 `placement_modes.py` 只 import `enum`）。
+
+- **配置** `rlinf_rollout/config/rollout.py`
+  - 新增 `rollout.kind`（`embodied` 默认 / `llm`）作为链路开关；`build_rollout_config` /
+    `validate_rollout_config` 据此分派，两条链路共用「拒绝训练段」与 weight-sync 校验。
+    `DEFAULT_LLM_ROLLOUT_CONFIG` 独立于具身默认值，因此 LLM 配置里不会冒出 `policy` /
+    `env` / `plugins` / `postprocess`。key 映射表：
+
+    | 训练仓 | rollout 系统 |
+    |---|---|
+    | `algorithm.sampling_params` | `rollout.sampling_params` |
+    | `algorithm.group_size` | `rollout.group_size` |
+    | `data.rollout_batch_size` | `rollout.batch_size` |
+    | `runner.seq_length` | `rollout.max_model_len` |
+    | `runner.resume_dir is not None` | `rollout.validate_weight_first_sync: false` |
+    | `actor.tokenizer.trust_remote_code` | `rollout.model.trust_remote_code` |
+    | `actor.group_name` | `rollout.weight_sync.source.group_name` |
+    | `actor.training_backend != "fsdp"` | `rollout.weight_sync.source.presharded` |
+    | `placement.actor_{tp,pp}_size` | `rollout.weight_sync.source.parallel_sizes` |
+    | `placement.actor_world_size` | `rollout.weight_sync.source.world_size` |
+    | 由 actor/rollout GPU 重叠推断的模式 | `rollout.placement_mode` |
+    | `rollout_server.online_router` | `rollout.online_router` |
+    | `rollout_server.tracking_rollout` | `rollout.tracking_server` |
+
+  - `LLMRolloutConfig`：派生视图（`total_tasks = batch_size * group_size`、
+    `num_gpus_per_engine`、`trust_remote_code`、`source_presharded`、`only_eval`），
+    并提供 `weight_source_topology()` 直接产出 api/v1 `SourceTopology`；eval 模式调用它会报错
+    （无权重发送方）。校验覆盖 backend 白名单、并行度/批量正整数、`max_new_tokens`、
+    `placement_mode`、`serving_mode`、以及 `source.world_size % source.parallel_sizes.tp == 0`。
+
+- **workers** `rlinf_rollout/workers/rollout/`
+  - `utils.py`：`RunningStatusManager` / `RolloutEngineStats` / `MetaInfoStatsCollector` /
+    打印助手 + `get_rollout_backend_worker`（读 `rollout.rollout_backend` 与
+    `rollout.sglang.serving_mode`）。`RankMapper` 已迁往 `weight_sync/llm.py`。
+  - `sglang/sglang_worker.py`（`SGLangWorker`）：`sync_model_from_actor` → `sync_weights`，
+    新增 `build_weight_sync_setup()`；保留 `Release/ResumeMemoryOccupation` 的 offload、
+    `RolloutScalingScheduler` 扩缩容、`rollout_serverless` 常驻路径。`config_rollout` 覆盖时，
+    派生视图按 `OmegaConf.merge(cfg, {"rollout": config_rollout})` 生成，多引擎组各用自己的
+    weight source 与批量。
+  - `sglang/sglang_worker_server.py`（`SGLangWorkerWithHTTPServer`）：逐字保留
+    `/v1/chat/completions`（含 0.4.x/0.5.x 两套 OpenAI adapter 与 tool-call 400 降级），
+    只把 host/port 改读 `rollout.sglang.server.*`。
+  - `vllm/vllm_worker.py`（`VLLMWorker`）：`sync_model_from_actor` → `sync_weights`；
+    `enable_sleep_mode` + `collective_rpc("offload_model_weights")` 原样保留；
+    worker class 常量指向 `rlinf_rollout.engines.vllm.vllm_0_8_5.worker.VLLMWorker`。
+    顺带修掉两个上游隐患：`_validate_weight_at_first` 里 `print_vllm_outputs(request_output,
+    tokenizer)` 的实参数量不符，以及 detokenize 分支下 `check_input_ids()` 会对 `None` 断言。
+  - `sglang_server/`（`launcher` / `server_worker` / `router_worker`）：纯机械 vendor，
+    本就只消费传入的 `router_server_args`（通常是 `cfg.rollout`），无训练段耦合。
+  - `server/`：`ServerRolloutWorker` 的 `runner.seq_length - max_new_tokens` 改为
+    `rollout.max_model_len - rollout.sampling_params.max_new_tokens`（并显式断言两者关系），
+    storage 配置由 `rollout.tracking_server.storage` 提供（原来硬编码 `None`）；
+    `OnlineRouterWorker` 的 placement 换成 `RolloutComponentPlacement`（只用 `rollout_dp_size`），
+    并修掉 `request.stop is None` 时 `sampling_params` 未定义的分支。
+
+- **仍留在 vendored scheduler 里的训练侧编排**：`dynamic_scheduler` 的
+  `RolloutManager` / `ActorManager` / `SchedulerWorker` 读 `cfg.algorithm.*` / `cfg.actor.*`，
+  它们是 driver 侧的自动扩缩容编排，不在 rollout worker 进程内运行；rollout 侧只用
+  `RolloutScalingScheduler`（仅依赖 worker + channel）。Phase 4 的 `serve/` 入口决定是否
+  把 driver 侧编排一并自包含。同理 `data/io_struct.py` 的 `BatchResizingIterator`
+  （actor 训练用迭代器）仍带 `cfg.actor.seed`，rollout 链路不引用它。
+
+- **测试** `rlinf_rollout/tests/test_phase3_llm.py`（140 项，不需要 Ray / GPU / sglang / vllm）
+  - vendor 完整性：25 个引擎/worker 模块存在、`hybrid_engines/` 已消失、两个引擎的版本闸门、
+    `Patcher` 字符串目标全部指向 vendored 路径、vLLM worker class 常量对应真实文件。
+  - 解耦（对 14 个源文件逐个 AST 扫描，跳过 docstring）：不含 `cfg.{actor,algorithm,runner,data}.`
+    与 `rollout_server.`；不含以 `actor.` / `algorithm.` / `runner.` / `rollout_server.` 开头的
+    字符串选择器；不含 `_actor_group_name` / `actor_weight_rank` / `"actor"`；
+    不含 `ModelParallelComponentPlacement` / `actor_tp_size` / `actor_world_size`。
+  - 跨进程契约（这类漂移只会在起引擎时才暴露，故静态锁定）：`init_rlinf_worker` 的位置实参个数
+    落在 `[必填, 全部]` 区间内；vLLM executor 交给 worker 的 kwargs 字典是
+    `VLLMWorker.__init__` 形参的子集且含 `weight_sync_setup` / `enforce_eager` / `parent_address`。
+  - 行为：LLM 配置默认值/派生量/`SourceTopology` 生成/eval 无 source/4 个训练段拒绝/12 类非法配置；
+    `SourceLayout` 投影与欠定拓扑报错；rank_map 键往返与两种 sync mode 下的满射配对；
+    tp=1 时的 row-major 映射；显式 rank_map 短路；`EngineWeightSyncSetup` 的 describe/报错/可 pickle；
+    `weight_sync` 包导出；`placement_modes` 只 import `enum`；`RolloutComponentPlacement`
+    只读 `rollout`/`reward` 两个组件且 stride 源自 src 拓扑。
+  - 保留项：offload/sleep-wake 与 `RolloutScalingScheduler`、`/v1/chat/completions`、
+    `/v1/completions`、`launch_sglang_router_and_server` 均有断言。
+  - `test_phase1_vendoring.py` 同步：`workers.rollout.sglang.sglang_worker` 从
+    forward-reference 白名单移除（已真实存在），`dynamic_scheduler/manager.py` 的
+    `TODO(agent)` 改为「type-only，避免让 scheduler 的使用者都装上 SGLang」。
+
+  验证（本机 torch 2.4 / ray 2.39 / 无可用 sglang / vllm 0.6.x）：
+  `pytest rlinf_rollout/tests` = **349 passed, 53 skipped**；
+  主仓 `pytest tests/unit_tests/test_rlinf_rollout.py` = 1 passed；
+  `ruff check --preview rlinf_rollout` + `ruff format --check` 全绿（F821 等未定义名检查覆盖全树）；
+  引擎/worker 的新增 `self._weight_*` / `self._enforce_eager` 属性经 AST 核对「有写有读、无孤儿」；
+  wheel 构建含 490 个 py 文件（Phase 2 为 461）、不含 tests，13 个 `engines/` 与 16 个
+  `workers/rollout/` 模块齐备。引擎级真机冒烟（起 SGLang/vLLM、跑权重同步）需 GPU，留待 Phase 4。
+
+- `pyproject.toml`：`packages` 扩到 122 项（新增 5 个 `engines.*` 与 4 个
+  `workers.rollout.*`，由测试与目录树比对保持同步）；`[sglang]` / `[vllm]` extras 补
+  `fastapi` / `uvicorn`（HTTP server 与 router worker 需要）。
 
 ### Phase 4 — 服务化入口 + 客户端 SDK
 
@@ -276,12 +418,15 @@ rlinf_rollout/
 - [ ] `pip install -e rlinf_rollout[embodied]` / `[sglang]` 可独立安装，不依赖主仓 `rlinf` 包
       （Phase 1 已验证 core：wheel 构建 + `pip install --no-deps` 后可在任意目录 import，
       且 `rlinf_rollout` 内不出现 `rlinf.*` import；Phase 2 wheel 含 461 py + 6 资产、不含 tests；
-      `[embodied]` extras 的模拟器依赖待实机验证）
+      Phase 3 wheel 含 490 py、13 个 `engines/` 与 16 个 `workers/rollout/` 模块；
+      `[embodied]` / `[sglang]` / `[vllm]` extras 的引擎与模拟器依赖待实机验证）
 - [x] `api/v1` 全部类型带 `SCHEMA_VERSION`，有单元测试锁定字段集合（防止意外破坏兼容）
 - [ ] 具身链路 eval-only 冒烟通过；LLM 链路固定权重生成冒烟通过
 - [x] rollout/env worker 代码中不再出现 `cfg.actor.` / `cfg.algorithm.` / actor 组名硬编码
-      （`test_phase2_embodied.py` 以 AST 扫描锁定，含 `OmegaConf.select` 里的字符串选择器；
-      `validate_rollout_config` 另在运行期拒绝 `actor` / `algorithm` / `critic` / `runner` 配置段）
+      （`test_phase2_embodied.py` 与 `test_phase3_llm.py` 以 AST 扫描锁定具身与 LLM 两条链路，
+      含 `OmegaConf.select` 里的字符串选择器、`ModelParallelComponentPlacement` 与
+      `actor_{tp,world}_size`；`validate_rollout_config` 另在运行期拒绝
+      `actor` / `algorithm` / `critic` / `runner` 配置段）
 - [ ] `rollout-serve` 可独立启动并常驻，客户端 SDK 可 push 权重、拉取轨迹
 
 ## 6. 风险与注意事项
