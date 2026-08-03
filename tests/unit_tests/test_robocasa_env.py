@@ -1,3 +1,17 @@
+# Copyright 2026 The RLinf Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import annotations
 
 import builtins
@@ -67,9 +81,10 @@ def test_get_env_fns_imports_robocasa_before_robosuite_make(
     fake_robosuite.make = _fake_make
 
     fake_controllers = ModuleType("robosuite.controllers")
-    fake_controllers.load_composite_controller_config = (
-        lambda controller, robot: {"controller": controller, "robot": robot}
-    )
+    fake_controllers.load_composite_controller_config = lambda controller, robot: {
+        "controller": controller,
+        "robot": robot,
+    }
 
     fake_robocasa = ModuleType("robocasa")
 
@@ -105,3 +120,43 @@ def test_robocasa_env_get_mujoco_diagnostics_delegates_to_vector_env() -> None:
     assert env.get_mujoco_diagnostics(max_contacts=7, include_model_names=True) == [
         {"max_contacts": 7, "names": True}
     ]
+
+
+def _robocasa_observation() -> dict[str, np.ndarray]:
+    return {
+        "robot0_agentview_left_image": np.zeros((2, 2, 3), dtype=np.uint8),
+        "robot0_eye_in_hand_image": np.ones((2, 2, 3), dtype=np.uint8),
+        "robot0_agentview_right_image": np.full((2, 2, 3), 2, dtype=np.uint8),
+        "robot0_eef_pos": np.arange(0, 3, dtype=np.float32),
+        "robot0_eef_quat": np.arange(3, 7, dtype=np.float32),
+        "robot0_gripper_qpos": np.arange(7, 9, dtype=np.float32),
+        "robot0_gripper_qvel": np.arange(9, 11, dtype=np.float32),
+        "robot0_base_to_eef_pos": np.arange(11, 14, dtype=np.float32),
+        "robot0_base_to_eef_quat": np.arange(14, 18, dtype=np.float32),
+        "robot0_base_pos": np.arange(18, 21, dtype=np.float32),
+        "robot0_base_quat": np.arange(21, 25, dtype=np.float32),
+    }
+
+
+def test_extract_image_and_state_selects_configured_16d_state() -> None:
+    module = importlib.import_module("rlinf.envs.robocasa.robocasa_env")
+    env = module.RobocasaEnv.__new__(module.RobocasaEnv)
+    env.cfg = OmegaConf.create({"state_space": "16d"})
+
+    result = env._extract_image_and_state([_robocasa_observation()])
+
+    expected = np.array(
+        [11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 7, 8],
+        dtype=np.float32,
+    )
+    np.testing.assert_array_equal(result["state"][0], expected)
+
+
+def test_extract_image_and_state_preserves_configured_25d_state() -> None:
+    module = importlib.import_module("rlinf.envs.robocasa.robocasa_env")
+    env = module.RobocasaEnv.__new__(module.RobocasaEnv)
+    env.cfg = OmegaConf.create({"state_space": "25d"})
+
+    result = env._extract_image_and_state([_robocasa_observation()])
+
+    np.testing.assert_array_equal(result["state"][0], np.arange(25, dtype=np.float32))

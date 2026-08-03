@@ -180,3 +180,68 @@ Model Download
    # export HF_ENDPOINT=https://hf-mirror.com
    pip install huggingface-hub
    hf download RLinf/RLinf-Pi0-RoboCasa --local-dir RLinf-Pi0-RoboCasa
+
+Pi0.5 and RoboCasa365 Compatibility
+-----------------------------------
+
+RLinf supports both the original 25-dimensional RoboCasa state and the
+canonical 16-dimensional state used by Pi0.5 RoboCasa checkpoints. The
+``state_space`` field controls which representation the environment emits.
+The Pi0.5 example selects ``16d`` without changing the existing Pi0 example.
+
+Set the converted checkpoint path and launch the Pi0.5 configuration with:
+
+.. code-block:: bash
+
+   export EMBODIED_PATH=$PWD/examples/embodiment
+   export ROBOCASA_MODEL_PATH=/path/to/model/pi05_robocasa
+   bash examples/embodiment/run_embodiment.sh \
+      robocasa_closedrawer_ppo_openpi_pi05
+
+OpenPI data configuration ``pi05_robocasa_human`` reads the public RoboCasa
+LeRobot schema, while ``pi05_robocasa365_closedrawer`` reads the unified
+RoboCasa365 schema. Compact 16-dimensional state arrays are accepted directly;
+25-dimensional arrays are selected and reordered automatically.
+
+For RoboCasa365 supervised fine-tuning, set ``ROBOCASA_SFT_DATA`` and use
+``examples/sft/config/robocasa_sft_openpi_pi05.yaml`` with
+``examples/sft/train_vla_sft.py``.
+
+An independent evaluator is available for checking the policy against
+RoboCasa's official environment factory, without the RLinf environment runner:
+
+.. code-block:: bash
+
+   python toolkits/standalone_eval_scripts/robocasa/native_openpi_eval.py \
+      --model-path "$ROBOCASA_MODEL_PATH" \
+      --output-dir /tmp/robocasa-native-eval
+
+For subprocess startup failures, set ``ROBOCASA_WORKER_LOG_DIR`` to write one
+diagnostic file per environment process. Child tracebacks are also propagated
+to the parent worker instead of appearing as a silent pipe failure.
+
+Low-cost Reset Randomization
+----------------------------
+
+With ``reset_optimization_enabled: true``, RoboCasa keeps the compiled MuJoCo
+model and render context. ``reset_randomization`` can still vary the drawer
+state and object placements on every reset. It can also permute textures and
+object visual meshes that are already present in the compiled model:
+
+.. code-block:: yaml
+
+   reset_randomization:
+     enabled: true
+     drawer_open_range: [0.65, 1.0]
+     resample_object_placements: true
+     randomize_preloaded_textures: true
+     shuffle_object_visuals: true
+     material_color_jitter: 0.15
+
+This path never loads a new asset or recompiles XML during reset. Texture
+permutation is limited to textures already loaded by the current scene. Object
+visual shuffling changes which preloaded mesh is shown at each object slot but
+keeps the original collision geometry, so it is intended for tasks such as
+``CloseDrawer`` whose success condition does not depend on object interaction.
+Disable ``shuffle_object_visuals`` for manipulation tasks where exact visual and
+collision geometry alignment is required.

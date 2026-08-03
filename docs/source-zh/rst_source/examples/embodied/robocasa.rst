@@ -180,3 +180,60 @@ RoboCasa Kitchen提供了涵盖多个类别的24个原子任务（不包含需�
    # export HF_ENDPOINT=https://hf-mirror.com
    pip install huggingface-hub
    hf download RLinf/RLinf-Pi0-RoboCasa --local-dir RLinf-Pi0-RoboCasa
+
+Pi0.5 与 RoboCasa365 兼容支持
+-----------------------------
+
+RLinf 同时支持原始 RoboCasa 的 25 维状态，以及 Pi0.5 RoboCasa checkpoint
+使用的标准 16 维状态。环境通过 ``state_space`` 选择输出形式。Pi0.5 示例配置
+使用 ``16d``，原有 Pi0 配置的默认行为保持不变。
+
+设置转换后的 checkpoint 路径并启动 Pi0.5 训练：
+
+.. code-block:: bash
+
+   export EMBODIED_PATH=$PWD/examples/embodiment
+   export ROBOCASA_MODEL_PATH=/path/to/model/pi05_robocasa
+   bash examples/embodiment/run_embodiment.sh \
+      robocasa_closedrawer_ppo_openpi_pi05
+
+OpenPI 数据配置 ``pi05_robocasa_human`` 对应公开 RoboCasa LeRobot 格式，
+``pi05_robocasa365_closedrawer`` 对应统一的 RoboCasa365 格式。已经压缩为
+16 维的状态会直接使用；25 维状态会自动选择字段并按 checkpoint 需要的顺序排列。
+
+如需对 RoboCasa365 做监督微调，设置 ``ROBOCASA_SFT_DATA`` 后，使用
+``examples/sft/config/robocasa_sft_openpi_pi05.yaml`` 和
+``examples/sft/train_vla_sft.py`` 启动。
+
+还可以绕过 RLinf 环境 runner，使用 RoboCasa 官方环境工厂做独立评估：
+
+.. code-block:: bash
+
+   python toolkits/standalone_eval_scripts/robocasa/native_openpi_eval.py \
+      --model-path "$ROBOCASA_MODEL_PATH" \
+      --output-dir /tmp/robocasa-native-eval
+
+如果环境子进程启动失败，可以设置 ``ROBOCASA_WORKER_LOG_DIR``，为每个环境进程
+保存独立诊断文件。子进程 traceback 也会回传给父 worker，避免只看到无信息的管道异常。
+
+低开销 Reset 随机化
+--------------------
+
+启用 ``reset_optimization_enabled: true`` 后，RoboCasa 会复用已经编译的
+MuJoCo model 和渲染上下文。``reset_randomization`` 仍然可以在每次 reset 时
+改变抽屉状态和物品位置，也可以轮换当前模型中已经加载的纹理及物品视觉 mesh：
+
+.. code-block:: yaml
+
+   reset_randomization:
+     enabled: true
+     drawer_open_range: [0.65, 1.0]
+     resample_object_placements: true
+     randomize_preloaded_textures: true
+     shuffle_object_visuals: true
+     material_color_jitter: 0.15
+
+该路径不会在 reset 时加载新资产或重新编译 XML。纹理随机化仅在当前场景已经
+加载的纹理之间轮换；物品视觉轮换会改变各物品槽位显示的预加载 mesh，但保留
+原始碰撞几何。因此它适用于成功条件不依赖物品交互的 ``CloseDrawer`` 等任务。
+对于要求视觉和碰撞几何严格一致的操作任务，应关闭 ``shuffle_object_visuals``。

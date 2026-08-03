@@ -13,6 +13,7 @@
 # limitations under the License.
 import dataclasses
 import pathlib
+from typing import Literal
 
 import openpi.models.model as _model
 import openpi.transforms as _transforms
@@ -33,6 +34,7 @@ class LeRobotRobocasaDataConfig(DataConfigFactory):
     action_space: Union[str, Dict] = "12d"
     state_space: Union[str, Dict] = "25d"
     image_space: Union[str, Dict] = "2views"
+    dataset_schema: Literal["public", "unified"] = "public"
     extra_delta_transform: bool = False  # TODO
 
     @override
@@ -51,20 +53,35 @@ class LeRobotRobocasaDataConfig(DataConfigFactory):
         # FIXME: repack_transform is not used in RLinf, neither RL nor SFT,
         # see rlinf/models/embodiment/openpi/__init__.py as a empty repack_transform is used to wrap the model
         # these keys are features in LerobotDataset, so you can use it to make SFT right.
+        if self.dataset_schema == "public":
+            action_sequence_keys = ("actions",)
+            repack_mapping = {
+                "observation/image": "image_left",
+                "observation/wrist_image": "wrist_image",
+                "observation/extra_view_image": "image_right",
+                "observation/state": "state",
+                "actions": "actions",
+                "task_index": "task_index",
+                "prompt": "prompt",
+            }
+        elif self.dataset_schema == "unified":
+            action_sequence_keys = ("action",)
+            repack_mapping = {
+                "observation/image": "observation.images.robot0_agentview_left",
+                "observation/wrist_image": "observation.images.robot0_eye_in_hand",
+                "observation/extra_view_image": "observation.images.robot0_agentview_right",
+                "observation/state": "observation.state",
+                "actions": "action",
+                "task_index": "task_index",
+                "prompt": "prompt",
+            }
+        else:
+            raise ValueError(
+                f"Unsupported RoboCasa dataset schema: {self.dataset_schema!r}"
+            )
+
         repack_transform = _transforms.Group(
-            inputs=[
-                _transforms.RepackTransform(
-                    {
-                        "image_left": "image_left",
-                        "image_right": "image_right",
-                        "wrist_image": "wrist_image",
-                        "state": "state",
-                        "actions": "actions",
-                        "task_index": "task_index",
-                        "prompt": "prompt",
-                    }
-                )
-            ]
+            inputs=[_transforms.RepackTransform(repack_mapping)]
         )
 
         # The data transforms are applied to the data coming from the dataset *and* during inference.
@@ -96,4 +113,5 @@ class LeRobotRobocasaDataConfig(DataConfigFactory):
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
+            action_sequence_keys=action_sequence_keys,
         )

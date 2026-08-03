@@ -20,6 +20,7 @@ Based on metaworld/venv.py implementation, adapted for Robocasa/Robosuite enviro
 import json
 import os
 import time
+import traceback
 from multiprocessing import Pipe, connection
 from multiprocessing.context import Process
 from typing import Any, Callable, Optional, Union
@@ -41,6 +42,8 @@ from rlinf.scheduler.resource_pool.cpu_binding import (
     apply_process_cpu_affinity,
     get_env_core_group_from_env,
 )
+
+_ROBOCASA_WORKER_ERROR_KEY = "__robocasa_worker_error__"
 
 
 def _json_list(value: Any) -> list:
@@ -177,10 +180,47 @@ def _worker(
         env_return[-1] = info
         return tuple(env_return)
 
+    log_dir = os.environ.get("ROBOCASA_WORKER_LOG_DIR")
+    log_file = None
+    if log_dir:
+        try:
+            os.makedirs(log_dir, exist_ok=True)
+            log_file = os.path.join(log_dir, f"worker-{os.getpid()}.log")
+        except OSError:
+            log_file = None
+
+    def _log(message: str) -> None:
+        if log_file is None:
+            return
+        try:
+            with open(log_file, "a", encoding="utf-8") as file:
+                file.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {message}\n")
+        except OSError:
+            pass
+
+    def _send_error(message: str) -> None:
+        _log(message)
+        try:
+            p.send({_ROBOCASA_WORKER_ERROR_KEY: message})
+        except (BrokenPipeError, EOFError, OSError):
+            pass
+
     parent.close()
     if local_env_index >= 0:
         _apply_subproc_env_cpu_affinity(local_env_index)
-    env = env_fn_wrapper.data()
+    _log(
+        "starting environment construction; "
+        f"MUJOCO_GL={os.environ.get('MUJOCO_GL')} "
+        f"MUJOCO_EGL_DEVICE_ID={os.environ.get('MUJOCO_EGL_DEVICE_ID')} "
+        f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')}"
+    )
+    try:
+        env = env_fn_wrapper.data()
+    except BaseException:
+        _send_error("environment construction failed:\n" + traceback.format_exc())
+        p.close()
+        return
+    _log("environment construction complete")
     try:
         while True:
             try:
@@ -294,6 +334,9 @@ def _worker(
                 p.close()
                 raise NotImplementedError(f"Unknown command: {cmd}")
     except KeyboardInterrupt:
+        p.close()
+    except BaseException:
+        _send_error("worker command failed:\n" + traceback.format_exc())
         p.close()
 
 

@@ -64,8 +64,16 @@ def extract_state_dict(data: Dict, state_space: Union[str, List[str]]) -> Dict:
         state_space = get_state_space("25d")
 
     state_dict = {}
+    obs_state = np.asarray(data["observation/state"])
     all_state_ids = get_state_ids(state_space)
-    state_dict["state"] = data["observation/state"][all_state_ids]
+
+    # Offline RoboCasa exports may already store the requested compact state
+    # vector (for example, the canonical 16D state). Avoid applying indices
+    # from the 25D layout a second time in that case.
+    if obs_state.ndim == 1 and obs_state.shape[0] == len(all_state_ids):
+        state_dict["state"] = obs_state
+    else:
+        state_dict["state"] = obs_state[all_state_ids]
 
     return state_dict
 

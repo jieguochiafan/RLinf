@@ -52,6 +52,15 @@ from flax.nnx import traversals
 from openpi.training import utils
 
 
+def _resolve_assets_source(checkpoint_dir: str | pathlib.Path) -> pathlib.Path:
+    """Resolve assets stored beside or inside an OpenPI checkpoint."""
+    checkpoint_path = pathlib.Path(checkpoint_dir)
+    adjacent_assets = checkpoint_path.parent / "assets"
+    if adjacent_assets.exists():
+        return adjacent_assets
+    return checkpoint_path / "assets"
+
+
 def slice_paligemma_state_dict(state_dict, config):
     """Convert PaliGemma JAX parameters to PyTorch format."""
     suffix = "/value" if "img/embedding/kernel/value" in state_dict else ""
@@ -650,7 +659,7 @@ def convert_pi0_checkpoint(
     )
 
     # Copy assets folder if it exists
-    assets_source = pathlib.Path(checkpoint_dir).parent / "assets"
+    assets_source = _resolve_assets_source(checkpoint_dir)
     if assets_source.exists():
         assets_dest = pathlib.Path(output_path) / "assets"
         if assets_dest.exists():

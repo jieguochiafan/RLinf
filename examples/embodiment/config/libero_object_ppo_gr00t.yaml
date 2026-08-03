@@ -18,7 +18,7 @@ cluster:
   component_placement:
     actor,env,rollout: 4-7
   resource_pool:
-    enabled: true
+    enabled: false
     allocation_mode: default
     cpu:
       enabled: false
@@ -139,7 +139,7 @@ env:
     use_fixed_reset_state_ids: True
     use_ordered_reset_state_ids: False
     video_cfg:
-      save_video: False
+      save_video: True
     chunk_step_mode: sync_time_major
     chunk_step_num_shards: 1
   eval:

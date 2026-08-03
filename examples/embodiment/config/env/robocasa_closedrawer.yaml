@@ -44,6 +44,11 @@ reset_randomization:
   # Keep the compiled kitchen model, but vary the task's physical start state.
   drawer_open_range: [0.65, 1.0]
   # Used by RoboCasa tasks that contain movable task objects. CloseDrawer has
-  # no such objects, so its variation comes from drawer and robot joint state.
+  # task objects and counter distractors, so their positions change as well.
   resample_object_placements: true
   placement_sampling_attempts: 3
+  # Reuse textures and object meshes already compiled into MjModel. Texture and
+  # object variants therefore do not trigger XML generation or a hard reset.
+  randomize_preloaded_textures: true
+  shuffle_object_visuals: true
+  material_color_jitter: 0.15

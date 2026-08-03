@@ -157,6 +157,7 @@ class FSDPCfgWorker(FSDPSftWorker):
             model_path=self.cfg.actor.model.model_path,
             batch_size=self.cfg.actor.micro_batch_size * self._world_size,
             repo_id=first_path,
+            data_kwargs=getattr(self.cfg.actor.model, "openpi_data", None),
         )
         data_config = config.data.create(config.assets_dirs, config.model)
 

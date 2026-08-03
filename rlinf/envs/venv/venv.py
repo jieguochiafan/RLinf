@@ -547,6 +547,10 @@ class SubprocEnvWorker(EnvWorker):
         np.ndarray,
     ]:  # noqa:E125
         result = self.parent_remote.recv()
+        if isinstance(result, dict) and "__robocasa_worker_error__" in result:
+            raise RuntimeError(
+                "RoboCasa subprocess failed:\n" + result["__robocasa_worker_error__"]
+            )
         if isinstance(result, tuple):
             if len(result) == 2:
                 obs, info = result
@@ -569,6 +573,10 @@ class SubprocEnvWorker(EnvWorker):
         self.parent_remote.send(["reset", kwargs])
 
         result = self.parent_remote.recv()
+        if isinstance(result, dict) and "__robocasa_worker_error__" in result:
+            raise RuntimeError(
+                "RoboCasa subprocess failed:\n" + result["__robocasa_worker_error__"]
+            )
         if isinstance(result, tuple):
             obs, info = result
             if self.share_memory:
@@ -1572,9 +1580,7 @@ class BaseVectorEnv(object):
         if bin_count < 1:
             raise ValueError(f"bin_count must be >= 1, got {bin_count}")
         if bin_count > len(id):
-            raise ValueError(
-                f"bin_count({bin_count}) must be <= env count({len(id)})"
-            )
+            raise ValueError(f"bin_count({bin_count}) must be <= env count({len(id)})")
         if not self._env_cpu_core_groups:
             raise ValueError(
                 "latency_bin_packing requires CPU core groups. Enable per-env "
@@ -1741,7 +1747,9 @@ class BaseVectorEnv(object):
             "operation": "latency_bin_packing_chunk_step",
             "env_count": len(id),
             "bin_count": bin_count,
-            "bin_groups": [[id[local_pos] for local_pos in group] for group in bin_groups],
+            "bin_groups": [
+                [id[local_pos] for local_pos in group] for group in bin_groups
+            ],
             "bin_loads_predicted_s": predicted_bin_loads,
             "bin_loads_actual_s": bin_actual_loads,
             "group_s": group_end - group_start,

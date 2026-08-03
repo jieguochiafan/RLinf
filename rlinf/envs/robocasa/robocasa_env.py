@@ -29,6 +29,8 @@ from rlinf.envs.robocasa.utils import (
     OBS_KEY_CAMERA_NAME_MAPPING,
     OBS_KEY_ROBOCASA_IMAGE_MAPPING,
     get_image_space,
+    get_state_ids,
+    get_state_space,
 )
 from rlinf.envs.robocasa.venv import RobocasaSubprocEnv
 from rlinf.envs.utils import (
@@ -249,9 +251,9 @@ class RobocasaEnv(gym.Env):
     def _extract_image_and_state(self, obs):
         """Extract images and states from robocasa observations.
 
-        Pi0 expects:
+        OpenPI expects:
         - Three 224x224 images: robot0_agentview_left_image, robot0_eye_in_hand_image, robot0_agentview_right_image
-        - 25D state matching training data (padded to 32D internally by Pi0)
+        - A state vector matching ``cfg.state_space`` (padded internally)
 
         Based on dataset analysis and norm_stats.json, Pi0 expects 16D state:
         [0:3]   robot0_eef_pos (x, y, z) - 3D
@@ -267,6 +269,10 @@ class RobocasaEnv(gym.Env):
         wrist_images = []
         right_images = []
         states = []
+        state_space = get_state_space(self.cfg.state_space)
+        if state_space is None:
+            raise ValueError(f"Unknown RoboCasa state space: {self.cfg.state_space!r}")
+        state_ids = get_state_ids(state_space)
 
         for env_id in range(len(obs)):
             # Get camera images
@@ -287,7 +293,8 @@ class RobocasaEnv(gym.Env):
             wrist_images.append(wrist_img)
             right_images.append(right_img)
 
-            # Construct full 25D state matching Pi0's training format
+            # Construct the canonical 25D state, then select and order the
+            # fields requested by the checkpoint's configured state space.
             state_25d = np.zeros(25, dtype=np.float32)
             state_25d[0:3] = obs[env_id]["robot0_eef_pos"]
             state_25d[3:7] = obs[env_id]["robot0_eef_quat"]
@@ -298,7 +305,7 @@ class RobocasaEnv(gym.Env):
             state_25d[18:21] = obs[env_id]["robot0_base_pos"]
             state_25d[21:25] = obs[env_id]["robot0_base_quat"]
 
-            states.append(state_25d)
+            states.append(state_25d[state_ids])
 
         return {
             "robot0_agentview_left_image": np.array(left_images),
@@ -465,8 +472,7 @@ class RobocasaEnv(gym.Env):
         action_repeat = int(self.cfg.get("action_repeat_per_chunk_step", 1))
         if action_repeat < 1:
             raise ValueError(
-                "action_repeat_per_chunk_step must be >= 1, "
-                f"got {action_repeat}"
+                f"action_repeat_per_chunk_step must be >= 1, got {action_repeat}"
             )
         obs_list = []
         infos_list = []
